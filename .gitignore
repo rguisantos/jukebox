@@ -1,0 +1,6 @@
+distro/binary/
+distro/cache/
+distro/chroot/
+*.iso
+*.img
+*.squashfs

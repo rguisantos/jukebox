@@ -1,0 +1,279 @@
+// Estrutura de dados compartilhada entre Slint e Rust para o catálogo de faixas
+export struct TrackData {
+    id: int,
+    title: string,
+    artist: string,
+    album: string,
+    file-type: string,
+}
+
+component TrackRow inherits Rectangle {
+    in property <int> index;
+    in property <TrackData> track;
+
+    height: 56px;
+    background: mod(index, 2) == 0 ? #0d0e14 : #101118;
+
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        spacing: 16px;
+
+        // Número da faixa
+        Text {
+            text: "\{index + 1}";
+            color: #4b5563;
+            font-size: 15px;
+            font-weight: 700;
+            width: 40px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+
+        // Ícone do tipo de mídia (♫ para áudio, ▶ para vídeo)
+        Text {
+            text: track.file-type == "mp3" || track.file-type == "wav" ? "♫" : "▶";
+            color: track.file-type == "mp3" || track.file-type == "wav" ? #818cf8 : #34d399;
+            font-size: 18px;
+            width: 28px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+
+        // Título da faixa
+        Text {
+            text: track.title;
+            color: #e5e7eb;
+            font-size: 16px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        // Artista
+        Text {
+            text: track.artist;
+            color: #9ca3af;
+            font-size: 14px;
+            vertical-alignment: center;
+            overflow: elide;
+            width: 220px;
+            horizontal-alignment: right;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Jukebox Arcade OS";
+    background: #08080c;
+    preferred-width: 1024px;
+    preferred-height: 768px;
+
+    // Estado sincronizado com a thread de controle Rust
+    in-out property <int> credits: 0;
+    in-out property <[TrackData]> tracks: [];
+    in-out property <bool> scanning: true;
+
+    // Callbacks para comunicação com o core engine Rust
+    callback coin_inserted();
+
+    // Direciona o foco do teclado automaticamente para o handler
+    forward-focus: keyboard-handler;
+
+    keyboard-handler := FocusScope {
+        key-pressed(event) => {
+            // Tecla 'Z' ou 'z' simula o pulso do moedeiro/noteiro
+            if (event.text == "z" || event.text == "Z") {
+                root.coin_inserted();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // =========================================================================
+    // Layout Principal
+    // =========================================================================
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // Barra Superior: Título e Badge de Créditos
+        Rectangle {
+            height: 80px;
+            background: #0a0b10;
+
+            // Título do Sistema
+            Text {
+                x: 32px;
+                text: "JUKEBOX ARCADE OS";
+                color: #e5e7eb;
+                font-size: 22px;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+
+            // Badge de Créditos (Canto Superior Direito)
+            Rectangle {
+                x: parent.width - self.width - 28px;
+                y: (parent.height - self.height) / 2;
+                width: 200px;
+                height: 48px;
+                background: #12131c;
+                border-radius: 10px;
+                border-width: 2px;
+                border-color: #f59e0b;
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    alignment: center;
+                    spacing: 10px;
+
+                    Text {
+                        text: "CRÉDITOS:";
+                        color: #9ca3af;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "\{root.credits}";
+                        color: #fbbf24;
+                        font-size: 22px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Separador visual
+        Rectangle {
+            height: 2px;
+            background: #1e1f2e;
+        }
+
+        // Cabeçalho do Catálogo
+        Rectangle {
+            height: 52px;
+            background: #0c0d13;
+
+            HorizontalLayout {
+                padding-left: 32px;
+                padding-right: 32px;
+                alignment: space-between;
+
+                Text {
+                    text: "CATÁLOGO DE MÚSICAS";
+                    color: #818cf8;
+                    font-size: 15px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.scanning ? "Escaneando..." : "\{root.tracks.length} faixas";
+                    color: #6b7280;
+                    font-size: 14px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Separador
+        Rectangle {
+            height: 1px;
+            background: #1a1b26;
+        }
+
+        // Área de Catálogo: ListView virtualizada (eficiente para milhares de faixas)
+        if root.tracks.length > 0 && !root.scanning : Rectangle {
+            vertical-stretch: 1;
+            background: #08080c;
+
+            ListView {
+                for track[index] in root.tracks : TrackRow {
+                    index: index;
+                    track: track;
+                }
+            }
+        }
+
+        // Estado vazio: Nenhuma música encontrada (pós-scan)
+        if root.tracks.length == 0 && !root.scanning : Rectangle {
+            vertical-stretch: 1;
+            background: #08080c;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 12px;
+
+                Text {
+                    text: "Nenhuma música encontrada";
+                    color: #6b7280;
+                    font-size: 20px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Coloque arquivos MP3/MP4 em /dados/musicas/";
+                    color: #4b5563;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // Estado de escaneamento (loading)
+        if root.scanning : Rectangle {
+            vertical-stretch: 1;
+            background: #08080c;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 16px;
+
+                Text {
+                    text: "♫";
+                    color: #818cf8;
+                    font-size: 48px;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Carregando catálogo...";
+                    color: #9ca3af;
+                    font-size: 18px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Escaneando arquivos de mídia no disco";
+                    color: #4b5563;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // Barra de Rodapé: Instrução ao Operador
+        Rectangle {
+            height: 44px;
+            background: #0a0b10;
+
+            Text {
+                text: "Pressione 'Z' para inserir crédito  ·  Setas ↑↓ para navegar  ·  Enter para selecionar";
+                color: #4b5563;
+                font-size: 13px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}

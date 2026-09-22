@@ -1,0 +1,48 @@
+# ==============================================================================
+# Jukebox OS - Lista Enxuta de Pacotes (Debian 12 Bookworm)
+# Proibido PulseAudio e PipeWire para poupar RAM e CPU (Sempron / C2D)
+# ==============================================================================
+
+# Kernel e Firmware de Hardware Legado (Intel GMA / Radeon HD / Onboard Ethernet)
+linux-image-amd64
+intel-microcode
+amd64-microcode
+firmware-linux-free
+firmware-misc-nonfree
+firmware-amd-graphics
+firmware-realtek
+
+# X11 Mínimo e Servidor Gráfico
+xserver-xorg-core
+xserver-xorg-video-intel
+xserver-xorg-video-ati
+xserver-xorg-video-radeon
+xserver-xorg-input-evdev
+xserver-xorg-input-libinput
+xinit
+x11-xserver-utils
+
+# Gerenciador de Janelas Ultra-Leve e Utilitários de Kiosk
+openbox
+unclutter
+
+# Áudio Nativo ALSA (Sem camadas extras de overhead)
+alsa-utils
+
+# Estabilidade, Blindagem e Watchdog
+overlayroot
+watchdog
+
+# Ferramentas de Sistema, Particionamento e Instalador
+parted
+e2fsprogs
+dosfstools
+rsync
+pciutils
+usbutils
+curl
+sudo
+systemd-sysv
+grub-pc
+grub-efi-amd64-bin
+syslinux-utils

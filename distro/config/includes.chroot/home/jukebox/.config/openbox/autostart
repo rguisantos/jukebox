@@ -1,0 +1,10 @@
+# Oculta o cursor do mouse se ocioso por 1 segundo
+unclutter -idle 1 -root &
+
+# Verificação e inicialização do binário da Jukebox em Rust
+if [ -x "/dados/jukebox_app" ]; then
+    /dados/jukebox_app &
+elif [ -x "/usr/local/bin/jukebox-install-to-disk.sh" ] && [ -f "/run/live/medium/live/filesystem.squashfs" ]; then
+    # Se estiver rodando do pendrive Live, abre o instalador no terminal
+    xterm -fullscreen -bg black -fg green -e /usr/local/bin/jukebox-install-to-disk.sh || true
+fi

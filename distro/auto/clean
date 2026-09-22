@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+# Desmonta com segurança quaisquer pontos remanescentes dentro de chroot antes da remoção
+TARGET_DIR="$(pwd)/chroot"
+if [ -d "$TARGET_DIR" ]; then
+    for m in $(grep "$TARGET_DIR" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r); do
+        umount -lf "$m" 2>/dev/null || true
+    done
+fi
+
+lb clean noauto "$@"
+
+# Garante novo desmonte caso o lb clean tenha deixado algo
+if [ -d "$TARGET_DIR" ]; then
+    for m in $(grep "$TARGET_DIR" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r); do
+        umount -lf "$m" 2>/dev/null || true
+    done
+fi
+
+rm -rf .build chroot binary cache *.iso
+
