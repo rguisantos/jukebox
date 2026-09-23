@@ -44,4 +44,5 @@ lb config noauto \
     --firmware-binary false \
     --firmware-chroot false \
     --compression xz \
+    --initsystem systemd \
     "$@"

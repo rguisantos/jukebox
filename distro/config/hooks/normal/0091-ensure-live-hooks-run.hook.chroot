@@ -1,0 +1,25 @@
+#!/bin/sh
+##
+## Hook-guarda (live-build 1:20250505+deb13u1, Debian 13 "Trixie")
+##
+## POR QUE ESTE ARQUIVO EXISTE:
+## O `lb chroot_hooks` só executa os hooks de config/hooks/live/ se TAMBÉM
+## existir ao menos um hook *.chroot em config/hooks/normal/:
+##
+##     if ls config/hooks/normal/*.chroot && ( ls config/hooks/live/*.chroot ... )
+##     then  ...executa todos os hooks...
+##     fi
+##
+## A árvore gerada pelo `lb config` já traz symlinks em hooks/normal/, mas se
+## esse diretório foi esvaziado no seu projeto, o hook 7000-purge-sysvinit-
+## residue.hook.chroot (Camada 3 do kit) seria silenciosamente IGNORADO.
+## Este guardião garante a pré-condição — e registra no build.log que o
+## mecanismo está ativo. Ele não altera NADA no sistema.
+##
+## Nomenclatura: 0XXX = faixa de preparação (roda antes dos 1XXX padrão).
+
+set -e
+
+echo "[0091-ensure-live-hooks-run] pré-condição de hooks satisfeita — hooks de config/hooks/live/ serão executados."
+
+exit 0
