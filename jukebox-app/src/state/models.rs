@@ -23,6 +23,9 @@ pub struct TrackInfo {
     pub file_path: String,
     /// Tipo de mídia: "mp3", "mp4", "wav", "wmv", "mpeg"
     pub file_type: String,
+    /// Gênero musical da tag ID3 (MÓDULO 8 — filtro do catálogo público).
+    /// String vazia no caminho RequestPlay (a UI não precisa do gênero).
+    pub genre: String,
 }
 
 /// Um disco do catálogo: agrupamento de faixas por (artista, álbum).
@@ -57,6 +60,18 @@ pub struct CoverArt {
     pub height: u32,
 }
 
+/// MÓDULO 8 — Um gênero musical do acervo, como exibido no submenu
+/// "Bloquear Gêneros" do operador: nome (tag ID3), contagem de faixas
+/// e a situação de bloqueio no catálogo público.
+#[derive(Debug, Clone)]
+pub struct GenreInfo {
+    pub name: String,
+    /// Número de faixas do acervo com esse gênero (independente do bloqueio)
+    pub track_count: i64,
+    /// true = gênero bloqueado (invisível no catálogo público)
+    pub blocked: bool,
+}
+
 // =============================================================================
 // MÓDULO 7 — Máquina de estados de foco (controles arcade)
 // -----------------------------------------------------------------------------
@@ -82,11 +97,40 @@ pub const VOLUME_MAX: u32 = 100;
 /// Volume padrão na primeira execução (persistido no banco a partir daí)
 pub const VOLUME_DEFAULT: u32 = 70;
 
-/// Total de linhas do menu do operador (IP, total arrecadado, sync USB)
-pub const OPERATOR_MENU_ITEMS: usize = 3;
+// =============================================================================
+// MÓDULO 8 — Preço dinâmico da música (créditos por reprodução)
+// =============================================================================
 
-/// Índice da linha "Forçar Sincronização USB" no menu do operador
-pub const OPERATOR_MENU_SYNC: usize = 2;
+/// Preço mínimo da música (1 crédito)
+pub const SONG_PRICE_MIN: u32 = 1;
+
+/// Preço máximo da música (10 créditos — limite de segurança do operador)
+pub const SONG_PRICE_MAX: u32 = 10;
+
+// =============================================================================
+// MÓDULO 8 — Menu do operador profissional (6 opções + 2 submenus)
+// =============================================================================
+
+/// Total de linhas do menu principal do operador
+pub const OPERATOR_MENU_ITEMS: usize = 6;
+
+/// Índice da linha "Sincronizar Pendrive" no menu principal
+pub const OPERATOR_MENU_SYNC: usize = 0;
+
+/// Índice da linha "Preço da Música" (abre o submenu de preço)
+pub const OPERATOR_MENU_PRICE: usize = 1;
+
+/// Índice da linha "Bloquear Gêneros" (abre o submenu de gêneros)
+pub const OPERATOR_MENU_GENRES: usize = 2;
+
+/// Índice da linha "Zerar Caixa Parcial"
+pub const OPERATOR_MENU_RESET_PARTIAL: usize = 3;
+
+/// Índice da linha "Zerar Créditos Atuais"
+pub const OPERATOR_MENU_RESET_CREDITS: usize = 4;
+
+/// Índice da linha "Desligar Máquina"
+pub const OPERATOR_MENU_POWEROFF: usize = 5;
 
 /// Estado de foco da interface — uma única fonte de verdade, espelhada
 /// para a propriedade `ui-focus` do Slint (que decide qual camada desenhar).
@@ -98,19 +142,37 @@ pub enum FocusState {
     BrowsingTracks,
     /// Overlay de volume (P abre, W/Q ajustam, U fecha)
     VolumeControl,
-    /// Overlay do menu do operador (X abre, W/Q navegam, O confirma, U fecha)
-    OperatorMenu,
+    /// MÓDULO 8 — Menu principal do operador (X abre, W/Q navegam, O entra, U fecha)
+    OperatorMainMenu,
+    /// MÓDULO 8 — Submenu de preço (W/Q alteram, O/U salvam e voltam)
+    OperatorPriceMenu,
+    /// MÓDULO 8 — Submenu de gêneros (W/Q navegam, O alterna bloqueio, U volta)
+    OperatorGenreMenu,
 }
 
 impl FocusState {
-    /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=3)
+    /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=5)
     pub fn as_i32(self) -> i32 {
         match self {
             FocusState::BrowsingAlbums => 0,
             FocusState::BrowsingTracks => 1,
             FocusState::VolumeControl => 2,
-            FocusState::OperatorMenu => 3,
+            FocusState::OperatorMainMenu => 3,
+            FocusState::OperatorPriceMenu => 4,
+            FocusState::OperatorGenreMenu => 5,
         }
+    }
+
+    /// true para qualquer tela do operador (menu principal ou submenus) —
+    /// usado para fechar o conjunto inteiro quando a sincronização USB
+    /// toma a tela e para decidir se o vídeo XVideo deve ficar oculto.
+    pub fn is_operator(self) -> bool {
+        matches!(
+            self,
+            FocusState::OperatorMainMenu
+                | FocusState::OperatorPriceMenu
+                | FocusState::OperatorGenreMenu
+        )
     }
 }
 
@@ -122,18 +184,36 @@ pub enum Action {
     Noop,
     /// Moeda/noteiro (tecla Z — aceita em qualquer estado)
     AddCredit,
-    /// Tecla O numa faixa: débito de 1 crédito + enfileiramento no player
+    /// Tecla O numa faixa: débito do preço vigente + enfileiramento no player
+    /// (MÓDULO 8: o valor exato é lido do banco pela thread de persistência)
     PlayTrack(TrackInfo),
     /// W/Q no overlay de volume: aplicar o novo valor no playbin
     VolumeChanged(u32),
     /// U no overlay de volume: aplicar e persistir o volume no banco
     VolumeClosed(u32),
-    /// X: abrir o menu do operador (IP + total arrecadado + sync USB)
+    /// X: abrir o menu do operador (stats + gêneros do banco + sync USB)
     OpenOperatorMenu,
-    /// U no menu do operador: fechar (restaurar vídeo se foi ocultado)
+    /// U no menu principal do operador: fechar (restaurar vídeo ocultado)
     CloseOperatorMenu,
     /// O em "Forçar Sincronização USB"
     ForceSync,
+    /// MÓDULO 8 — O em "Preço da Música": abrir o submenu de edição
+    OpenPriceMenu,
+    /// MÓDULO 8 — O/U no submenu de preço: persistir o novo preço e voltar
+    PriceSaved(u32),
+    /// MÓDULO 8 — O em "Bloquear Gêneros": abrir o submenu de gêneros
+    OpenGenreMenu,
+    /// MÓDULO 8 — U no submenu de gêneros: voltar ao menu principal
+    /// (o vídeo permanece oculto — ainda estamos dentro das telas do operador)
+    CloseGenreMenu,
+    /// MÓDULO 8 — O num gênero: alternar bloqueio e recarregar o catálogo
+    ToggleGenreBlock(String),
+    /// MÓDULO 8 — O em "Zerar Caixa Parcial"
+    ResetPartialCoins,
+    /// MÓDULO 8 — O em "Zerar Créditos Atuais"
+    ResetCredits,
+    /// MÓDULO 8 — O em "Desligar Máquina" (sudo systemctl poweroff)
+    PowerOff,
 }
 
 /// Estado global de navegação da interface. Vivem dentro de um
@@ -150,14 +230,23 @@ pub struct AppState {
     pub album_index: usize,
     /// Faixa selecionada no painel do álbum aberto
     pub track_index: usize,
-    /// Linha selecionada no menu do operador (0..OPERATOR_MENU_ITEMS)
+    /// Linha selecionada no menu principal do operador (0..OPERATOR_MENU_ITEMS)
     pub menu_index: usize,
     /// Volume atual (0..=100, persistido no banco ao fechar o overlay)
     pub volume: u32,
+    /// MÓDULO 8 — Preço vigente da música (créditos), sincronizado com o banco
+    pub song_price: u32,
+    /// MÓDULO 8 — Valor em edição no submenu de preço (W/Q alteram, O/U salvam)
+    pub price_value: u32,
+    /// MÓDULO 8 — Gêneros do acervo para o submenu "Bloquear Gêneros"
+    /// (pré-carregados do banco na abertura do menu do operador)
+    pub genres: Vec<GenreInfo>,
+    /// MÓDULO 8 — Gênero selecionado no submenu de gêneros
+    pub genre_index: usize,
 }
 
 impl AppState {
-    pub fn new(volume: u32) -> Self {
+    pub fn new(volume: u32, song_price: u32) -> Self {
         Self {
             focus: FocusState::BrowsingAlbums,
             previous: FocusState::BrowsingAlbums,
@@ -166,6 +255,10 @@ impl AppState {
             track_index: 0,
             menu_index: 0,
             volume: volume.min(VOLUME_MAX),
+            song_price: song_price.clamp(SONG_PRICE_MIN, SONG_PRICE_MAX),
+            price_value: song_price.clamp(SONG_PRICE_MIN, SONG_PRICE_MAX),
+            genres: Vec::new(),
+            genre_index: 0,
         }
     }
 
@@ -199,6 +292,15 @@ impl AppState {
         self.track_index = 0;
         self.focus = FocusState::BrowsingAlbums;
         self.previous = FocusState::BrowsingAlbums;
+    }
+
+    /// MÓDULO 8 — Substitui o catálogo PRESERVANDO o foco atual: usado após
+    /// alternar o bloqueio de um gênero, quando o operador está dentro do
+    /// submenu de gêneros e não pode ser expulso para o carrossel.
+    pub fn replace_catalog_keep_focus(&mut self, albums: Vec<AlbumInfo>) {
+        self.albums = albums;
+        self.album_index = 0;
+        self.track_index = 0;
     }
 
     /// Processa uma tecla crua (case-insensitive: a controladora arcade
@@ -246,7 +348,7 @@ impl AppState {
                 }
                 'x' => {
                     self.previous = FocusState::BrowsingAlbums;
-                    self.focus = FocusState::OperatorMenu;
+                    self.focus = FocusState::OperatorMainMenu;
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
                 }
@@ -285,7 +387,7 @@ impl AppState {
                 }
                 'x' => {
                     self.previous = FocusState::BrowsingTracks;
-                    self.focus = FocusState::OperatorMenu;
+                    self.focus = FocusState::OperatorMainMenu;
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
                 }
@@ -309,7 +411,9 @@ impl AppState {
                 _ => None,
             },
 
-            FocusState::OperatorMenu => match key {
+            // MÓDULO 8 — Menu principal do operador (6 opções + 2 submenus).
+            // W/Q navegam, O entra/confirma, U fecha e volta à tela anterior.
+            FocusState::OperatorMainMenu => match key {
                 'w' => {
                     self.menu_index = self.menu_index.saturating_sub(1);
                     Some(Action::Noop)
@@ -318,19 +422,82 @@ impl AppState {
                     self.menu_index = (self.menu_index + 1).min(OPERATOR_MENU_ITEMS - 1);
                     Some(Action::Noop)
                 }
-                'o' => {
-                    if self.menu_index == OPERATOR_MENU_SYNC {
+                'o' => match self.menu_index {
+                    OPERATOR_MENU_SYNC => {
                         let previous = self.previous;
                         self.focus = previous;
                         Some(Action::ForceSync)
-                    } else {
-                        // Linhas informativas (IP/total) apenas exibem dados
-                        Some(Action::Noop)
                     }
-                }
+                    OPERATOR_MENU_PRICE => {
+                        // Semeia o valor em edição com o preço vigente
+                        self.price_value = self.song_price;
+                        self.focus = FocusState::OperatorPriceMenu;
+                        Some(Action::OpenPriceMenu)
+                    }
+                    OPERATOR_MENU_GENRES => {
+                        self.genre_index = 0;
+                        self.focus = FocusState::OperatorGenreMenu;
+                        Some(Action::OpenGenreMenu)
+                    }
+                    OPERATOR_MENU_RESET_PARTIAL => Some(Action::ResetPartialCoins),
+                    OPERATOR_MENU_RESET_CREDITS => Some(Action::ResetCredits),
+                    OPERATOR_MENU_POWEROFF => Some(Action::PowerOff),
+                    _ => Some(Action::Noop),
+                },
                 'u' => {
                     self.focus = self.previous;
                     Some(Action::CloseOperatorMenu)
+                }
+                _ => None,
+            },
+
+            // MÓDULO 8 — Submenu de preço: W/Q alteram o valor em edição,
+            // O ou U salvam e voltam ao menu principal.
+            FocusState::OperatorPriceMenu => match key {
+                'w' => {
+                    self.price_value = (self.price_value + 1).min(SONG_PRICE_MAX);
+                    Some(Action::Noop)
+                }
+                'q' => {
+                    self.price_value = self.price_value.saturating_sub(1).max(SONG_PRICE_MIN);
+                    Some(Action::Noop)
+                }
+                'o' | 'u' => {
+                    let price = self.price_value;
+                    self.song_price = price;
+                    self.focus = FocusState::OperatorMainMenu;
+                    Some(Action::PriceSaved(price))
+                }
+                _ => None,
+            },
+
+            // MÓDULO 8 — Submenu de gêneros: W/Q navegam na lista, O alterna
+            // o bloqueio (feedback local instantâneo + gravação no banco),
+            // U volta ao menu principal.
+            FocusState::OperatorGenreMenu => match key {
+                'w' => {
+                    if !self.genres.is_empty() {
+                        self.genre_index = self.genre_index.saturating_sub(1);
+                    }
+                    Some(Action::Noop)
+                }
+                'q' => {
+                    if !self.genres.is_empty() {
+                        self.genre_index = (self.genre_index + 1).min(self.genres.len() - 1);
+                    }
+                    Some(Action::Noop)
+                }
+                'o' => match self.genres.get_mut(self.genre_index) {
+                    Some(genre) => {
+                        genre.blocked = !genre.blocked;
+                        let name = genre.name.clone();
+                        Some(Action::ToggleGenreBlock(name))
+                    }
+                    None => Some(Action::Noop),
+                },
+                'u' => {
+                    self.focus = FocusState::OperatorMainMenu;
+                    Some(Action::CloseGenreMenu)
                 }
                 _ => None,
             },

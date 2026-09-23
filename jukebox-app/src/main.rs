@@ -5,16 +5,17 @@
 //!   [UI Slint]  ←invoke_from_event_loop→  bridges de eventos
 //!      │ arcade-key-pressed (E/R/I/W/Q/O/U/P/Z/X case-insensitive)
 //!      ▼
-//!   [AppState] máquina de estados de foco (Módulo 7, state/models.rs)
+//!   [AppState] máquina de estados de foco (Módulos 7/8, state/models.rs)
 //!      │ Action::* → banco / player / USB
 //!      ▼
-//!   [Banco SQLite] — créditos: AddCredit (moedeiro+PIX), RequestPlay,
-//!      SetVolume (persistente) e QueryCollected (menu do operador)
+//!   [Banco SQLite] — créditos: AddCredit (moedeiro+PIX), RequestPlay
+//!      (débito do preço vigente), SetVolume (persistente), stats do
+//!      operador (Módulo 7) e contadores antifraude/preço/gêneros (Módulo 8)
 //!      │ (débito atômico → Enqueue no player)
 //!      ▼
 //!   [Player GStreamer] — playbin/xvimagesink/alsasink + fila (Módulo 3)
 //!   [USB Sync]         — detecta /media/usb, copia, reescaneia (Módulo 4);
-//!      também executa a "Forçar Sincronização" do menu do operador
+//!      também executa a "Sincronizar Pendrive" do menu do operador
 //!   [Capas de Álbum]   — ID3 APIC → miniaturas RGB + cache (Módulo 7)
 //!   [PIX Service]      — Tokio isolado: QR dinâmico + polling (Módulo 5)
 //!   [Scanner]          — indexação inicial + agrupamento por álbum (Mód. 2/7)
@@ -37,7 +38,7 @@ use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
 use media::scanner;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use state::models::{
-    Action, AppState, AlbumInfo, CoverArt, FocusState, TrackInfo, VOLUME_DEFAULT,
+    Action, AppState, AlbumInfo, CoverArt, FocusState, GenreInfo, TrackInfo, VOLUME_DEFAULT,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -54,14 +55,26 @@ const VOLUME_CONFIG_KEY: &str = "volume";
 /// Único dono da conexão SQLite principal → zero corrida de escrita.
 #[derive(Debug)]
 enum DbCommand {
-    /// Moeda (tecla Z) ou PIX confirmado: credita
+    /// Moeda (tecla Z) ou PIX confirmado: credita e alimenta os
+    /// contadores antifraude (caixa parcial + odômetro — Módulo 8)
     AddCredit(u32),
-    /// Tecla O numa faixa: débito atômico de 1 crédito + enfileiramento
+    /// Tecla O numa faixa: débito atômico do preço vigente (Módulo 8)
+    /// + enfileiramento no player
     RequestPlay(TrackData),
     /// Fechamento do overlay de volume: persiste o valor (Módulo 7)
     SetVolume(u32),
-    /// Abertura do menu do operador: total arrecadado do banco (Módulo 7)
-    QueryCollected,
+    /// Abertura do menu do operador: caixa parcial, odômetro, preço e
+    /// gêneros do acervo (Módulo 8 — substitui o QueryCollected do Módulo 7)
+    QueryOperatorStats,
+    /// Submenu de preço: grava o novo preço da música (Módulo 8)
+    SetSongPrice(u32),
+    /// Submenu de gêneros: alterna o bloqueio e recarrega o catálogo
+    /// público com o filtro aplicado (Módulo 8)
+    ToggleGenre(String),
+    /// "Zerar Caixa Parcial": zera o contador de recolhimento (Módulo 8)
+    ResetPartial,
+    /// "Zerar Créditos Atuais": zera os créditos não gastos (Módulo 8)
+    ResetCredits,
 }
 
 /// Geração do toast atual (evita que um timer antigo apague um toast novo)
@@ -85,6 +98,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_credits = db.get_credits().unwrap_or(0);
     log::info!("Créditos persistentes carregados do banco: {}", initial_credits);
 
+    // MÓDULO 8 — Preço da música (créditos por reprodução), persistido no
+    // banco: o bar ajusta uma vez e sobrevive a todos os ciclos de energia
+    let initial_price = db.get_song_price().unwrap_or(1);
+    log::info!("Preço da música carregado do banco: {} crédito(s)", initial_price);
+
     // Volume persistido na tabela chave-valor (Módulo 7): o bar ajusta uma
     // vez e o valor sobrevive a todos os ciclos de energia da máquina
     let initial_volume = db
@@ -101,11 +119,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main_window = MainWindow::new()?;
     main_window.set_credits(initial_credits as i32);
     main_window.set_volume_value(initial_volume as i32);
+    main_window.set_op_song_price(initial_price as i32);
     main_window.set_scanning(true);
 
     // Estado de navegação compartilhado: callbacks da UI (event loop) e
     // bridges de publicação de catálogo — Arc<Mutex> atravessa as threads.
-    let state_arc: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState::new(initial_volume)));
+    let state_arc: Arc<Mutex<AppState>> =
+        Arc::new(Mutex::new(AppState::new(initial_volume, initial_price)));
 
     // =========================================================================
     // 3. Canais de comunicação entre as threads
@@ -122,9 +142,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // 4. Thread do Banco de Dados (único escritor do SQLite principal)
     // =========================================================================
+    // MÓDULO 8: além do player (enfileiramento pós-débito), a thread também
+    // recebe o estado de navegação e a fila de capas — necessários para
+    // recarregar o catálogo público após alternar o bloqueio de um gênero.
     {
         let player_tx = player_cmd_tx.clone();
         let ui_handle = main_window.as_weak();
+        let state_arc = state_arc.clone();
+        let cover_tx = cover_cmd_tx.clone();
 
         thread::spawn(move || {
             log::info!("Thread de persistência do SQLite iniciada.");
@@ -142,13 +167,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             album: track_data.album.to_string(),
                             file_path: track_data.file_path.to_string(),
                             file_type: track_data.file_type.to_string(),
+                            genre: String::new(), // não usado no caminho do play
                         };
 
-                        // Débito atômico: só enfileira se o saldo permitir
-                        match db.spend_credits(1) {
+                        // MÓDULO 8 — Débito atômico pelo preço VIGENTE (lido do
+                        // banco na hora: fonte única de verdade, válida também
+                        // se o operador acabou de mudar o preço no submenu)
+                        let price = db.get_song_price().unwrap_or(1).max(1);
+
+                        match db.spend_credits(price) {
                             Ok(Some(new_total)) => {
                                 log::info!(
-                                    "Crédito debitado (saldo: {}). Enfileirando '{}'.",
+                                    "Créditos debitados: -{} (saldo: {}). Enfileirando '{}'.",
+                                    price,
                                     new_total,
                                     track.title
                                 );
@@ -158,8 +189,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Ok(None) => {
-                                log::warn!("Play negado: créditos insuficientes.");
-                                show_toast(&ui_handle, "Créditos insuficientes", 2);
+                                log::warn!(
+                                    "Play negado: créditos insuficientes (preço: {}).",
+                                    price
+                                );
+                                show_toast(&ui_handle, "Créditos Insuficientes", 2);
                             }
                             Err(e) => {
                                 log::error!("Falha no débito de crédito: {}", e);
@@ -172,21 +206,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             log::error!("Falha ao persistir o volume: {}", e);
                         }
                     }
-                    DbCommand::QueryCollected => match db.get_total_credits_collected() {
-                        Ok(total) => {
-                            log::debug!(
-                                "Menu do operador: total arrecadado = {} créditos.",
-                                total
-                            );
-                            let ui_handle = ui_handle.clone();
+                    DbCommand::QueryOperatorStats => {
+                        // MÓDULO 8 — Painel do operador: odômetro, caixa parcial,
+                        // preço vigente e a lista de gêneros para o submenu.
+                        let partial = db.get_partial_coins().unwrap_or(0);
+                        let absolute = db.get_absolute_coins().unwrap_or(0);
+                        let price = db.get_song_price().unwrap_or(1);
+                        let genres: Vec<GenreInfo> = db.get_genres().unwrap_or_default();
+                        log::debug!(
+                            "Menu do operador: odômetro={}, caixa parcial={}, preço={}, {} gênero(s).",
+                            absolute,
+                            partial,
+                            price,
+                            genres.len()
+                        );
+
+                        let ui_handle = ui_handle.clone();
+                        let state_arc = state_arc.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_handle.upgrade() {
+                                ui.set_op_partial_coins(partial as i32);
+                                ui.set_op_absolute_coins(absolute as i32);
+                                ui.set_op_song_price(price as i32);
+
+                                // Espelha no estado: o submenu de preço semeia
+                                // sua edição com o valor vigente e o submenu de
+                                // gêneros navega na lista recém-carregada
+                                let mut st = lock_state(&state_arc);
+                                st.song_price = price;
+                                st.genres = genres;
+                                mirror_nav(&ui, &st);
+                            }
+                        });
+                    }
+                    DbCommand::SetSongPrice(price) => {
+                        match db.set_song_price(price) {
+                            Ok(()) => {
+                                log::info!("Preço da música atualizado: {} crédito(s).", price);
+                                let ui_for_update = ui_handle.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = ui_for_update.upgrade() {
+                                        ui.set_op_song_price(price as i32);
+                                    }
+                                });
+                                show_toast(
+                                    &ui_handle,
+                                    &format!(
+                                        "Preço atualizado: {} crédito{}",
+                                        price,
+                                        if price == 1 { "" } else { "s" }
+                                    ),
+                                    1,
+                                );
+                            }
+                            Err(e) => {
+                                log::error!("Falha ao gravar o preço da música: {}", e);
+                                show_toast(&ui_handle, "Erro ao salvar o preço", 2);
+                            }
+                        }
+                    }
+                    DbCommand::ToggleGenre(genre) => {
+                        match db.toggle_genre_block(&genre) {
+                            Ok(blocked) => {
+                                log::info!(
+                                    "Gênero '{}' {} pelo operador.",
+                                    genre,
+                                    if blocked { "BLOQUEADO" } else { "liberado" }
+                                );
+                                // Recarrega o catálogo público com o filtro
+                                // aplicado — SEM expulsar o operador do submenu
+                                // (a troca de linha do modelo é instantânea,
+                                // sem animações — nota de performance Mód. 8)
+                                let albums = db.get_albums().unwrap_or_else(|e| {
+                                    log::error!("Falha ao recarregar catálogo: {}", e);
+                                    Vec::new()
+                                });
+                                publish_albums(&ui_handle, &state_arc, &cover_tx, albums, true);
+                            }
+                            Err(e) => {
+                                log::error!("Falha ao alternar bloqueio do gênero: {}", e);
+                                show_toast(&ui_handle, "Erro ao bloquear gênero", 2);
+                            }
+                        }
+                    }
+                    DbCommand::ResetPartial => match db.reset_partial_coins() {
+                        Ok(()) => {
+                            log::info!("Caixa parcial zerado pelo operador (odômetro intacto).");
+                            let ui_for_update = ui_handle.clone();
                             let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(ui) = ui_handle.upgrade() {
-                                    ui.set_op_total_collected(total as i32);
+                                if let Some(ui) = ui_for_update.upgrade() {
+                                    ui.set_op_partial_coins(0);
                                 }
                             });
+                            show_toast(&ui_handle, "Caixa parcial zerado", 1);
                         }
                         Err(e) => {
-                            log::error!("Falha ao consultar total arrecadado: {}", e);
+                            log::error!("Falha ao zerar o caixa parcial: {}", e);
+                            show_toast(&ui_handle, "Erro ao zerar caixa", 2);
+                        }
+                    },
+                    DbCommand::ResetCredits => match db.reset_current_credits() {
+                        Ok(()) => {
+                            log::info!("Créditos atuais zerados pelo operador.");
+                            update_credits_ui(&ui_handle, 0);
+                            show_toast(&ui_handle, "Créditos atuais zerados", 1);
+                        }
+                        Err(e) => {
+                            log::error!("Falha ao zerar os créditos atuais: {}", e);
+                            show_toast(&ui_handle, "Erro ao zerar créditos", 2);
                         }
                     },
                 }
@@ -224,7 +351,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            publish_albums(&ui_handle, &state_arc, &cover_tx, albums);
+            publish_albums(&ui_handle, &state_arc, &cover_tx, albums, false);
         });
     }
 
@@ -310,10 +437,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_usb_new_tracks(0);
 
                                 // A sincronização toma a tela: se o operador
-                                // estava com volume/menu abertos, fecha
+                                // estava com volume/menu abertos, fecha (MÓDULO 8:
+                                // vale para o menu principal E para os submenus)
                                 let mut st = lock_state(&state_arc);
                                 if st.focus == FocusState::VolumeControl
-                                    || st.focus == FocusState::OperatorMenu
+                                    || st.focus.is_operator()
                                 {
                                     st.focus = FocusState::BrowsingAlbums;
                                 }
@@ -342,7 +470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let track_count = albums.iter().map(|a| a.tracks.len()).sum::<usize>();
 
                         // Catálogo agrupado atualizado + reset da navegação
-                        publish_albums(&ui_handle, &state_arc, &cover_tx, albums);
+                        publish_albums(&ui_handle, &state_arc, &cover_tx, albums, false);
 
                         let ui_close = ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -662,6 +790,22 @@ fn mirror_nav(ui: &MainWindow, st: &AppState) {
     ui.set_volume_value(st.volume as i32);
     ui.set_op_menu_index(st.menu_index as i32);
 
+    // MÓDULO 8 — Espelhos dos submenus do operador
+    ui.set_op_price_edit(st.price_value as i32);
+    ui.set_op_genre_index(st.genre_index as i32);
+    if st.focus == FocusState::OperatorGenreMenu {
+        let rows: Vec<GenreData> = st
+            .genres
+            .iter()
+            .map(|g| GenreData {
+                name: g.name.clone().into(),
+                blocked: g.blocked,
+                count: g.track_count as i32,
+            })
+            .collect();
+        ui.set_op_genres(ModelRc::new(VecModel::from(rows)));
+    }
+
     if let Some(album) = st.current_album() {
         ui.set_current_album_title(album.title.clone().into());
         ui.set_current_album_artist(album.artist.clone().into());
@@ -721,7 +865,9 @@ fn handle_ui_action(
         Action::OpenOperatorMenu => {
             // IP calculado na hora (dhcp pode mudar entre aberturas do menu)
             ui.set_op_ip(query_local_ip().into());
-            let _ = db_tx.send(DbCommand::QueryCollected);
+            // MÓDULO 8 — Stats do operador (odômetro, caixa parcial, preço) e
+            // lista de gêneros vêm do banco pela thread de persistência
+            let _ = db_tx.send(DbCommand::QueryOperatorStats);
             // O diálogo cobre a área do vídeo XVideo: esconde o vídeo para
             // o menu ficar visível (mesma regra do overlay USB)
             let _ = player_tx.send(PlayerCommand::HideVideo);
@@ -735,6 +881,63 @@ fn handle_ui_action(
             let _ = player_tx.send(PlayerCommand::RestoreVideo);
             if let Err(e) = usb_tx.send(UsbSyncCommand::ForceSync) {
                 log::error!("Erro ao solicitar sincronização forçada: {}", e);
+            }
+        }
+
+        // ---- MÓDULO 8 — Submenus e operações do operador ----
+        Action::OpenPriceMenu => {
+            // A máquina já semeou price_value com o preço vigente;
+            // o mirror_nav publica o valor no submenu. Nenhum I/O.
+        }
+        Action::PriceSaved(price) => {
+            // Persiste o novo preço (a thread do banco confirma com toast)
+            if let Err(e) = db_tx.send(DbCommand::SetSongPrice(price)) {
+                log::error!("Erro ao enviar novo preço ao banco: {}", e);
+            }
+        }
+        Action::OpenGenreMenu => {
+            // Gêneros pré-carregados na abertura do menu (QueryOperatorStats);
+            // o mirror_nav publica a lista no submenu. Nenhum I/O aqui.
+        }
+        Action::CloseGenreMenu => {
+            // Continua dentro das telas do operador: o vídeo permanece
+            // oculto até o U final do menu principal
+        }
+        Action::ToggleGenreBlock(genre) => {
+            // Grava o bloqueio e recarrega o catálogo público (a thread do
+            // banco chama publish_albums com foco preservado)
+            if let Err(e) = db_tx.send(DbCommand::ToggleGenre(genre)) {
+                log::error!("Erro ao enviar bloqueio de gênero ao banco: {}", e);
+            }
+        }
+        Action::ResetPartialCoins => {
+            if let Err(e) = db_tx.send(DbCommand::ResetPartial) {
+                log::error!("Erro ao enviar zeramento do caixa parcial: {}", e);
+            }
+        }
+        Action::ResetCredits => {
+            if let Err(e) = db_tx.send(DbCommand::ResetCredits) {
+                log::error!("Erro ao enviar zeramento de créditos: {}", e);
+            }
+        }
+        Action::PowerOff => {
+            // A distro concede sudo sem senha ao usuário jukebox
+            // (/etc/sudoers.d/jukebox) — o systemctl desliga a máquina de
+            // forma limpa (unmount do overlay, sync do disco)
+            log::info!("Operador solicitou o desligamento da máquina.");
+            match std::process::Command::new("sudo")
+                .arg("systemctl")
+                .arg("poweroff")
+                .spawn()
+            {
+                Ok(child) => {
+                    log::info!("Comando de poweroff disparado (pid {}).", child.id());
+                    show_toast(&ui.as_weak(), "Desligando a máquina...", 0);
+                }
+                Err(e) => {
+                    log::error!("Falha ao disparar o poweroff: {}", e);
+                    show_toast(&ui.as_weak(), "Não foi possível desligar", 2);
+                }
             }
         }
     }
@@ -776,12 +979,16 @@ fn album_info_to_data(a: &AlbumInfo) -> AlbumData {
 
 /// Publica o catálogo agrupado na UI (thread-safe: agenda no event loop),
 /// reseta a navegação da máquina de estados e dispara a varredura de capas.
-/// Chamada pelo scanner inicial e após cada sincronização USB.
+/// Chamada pelo scanner inicial, após cada sincronização USB (reset_nav =
+/// false) e ao alternar o bloqueio de um gênero no menu do operador
+/// (reset_nav = true → MÓDULO 8: preserva o foco para não expulsar o
+/// operador do submenu de gêneros enquanto ele trabalha na lista).
 fn publish_albums(
     ui_handle: &slint::Weak<MainWindow>,
     state_arc: &Arc<Mutex<AppState>>,
     cover_tx: &mpsc::Sender<CoverCommand>,
     albums: Vec<AlbumInfo>,
+    keep_focus: bool,
 ) {
     let album_count = albums.len();
     // Cópia para o serviço de capas (o original vai para o estado)
@@ -794,7 +1001,11 @@ fn publish_albums(
 
         let rows: Vec<AlbumData> = {
             let mut st = lock_state(&state_arc);
-            st.replace_catalog(albums);
+            if keep_focus {
+                st.replace_catalog_keep_focus(albums);
+            } else {
+                st.replace_catalog(albums);
+            }
             let rows = st.albums.iter().map(album_info_to_data).collect();
             // Limpa o painel de faixas do disco anterior
             ui.set_current_album_tracks(ModelRc::new(VecModel::from(Vec::<TrackData>::new())));
@@ -889,27 +1100,38 @@ fn update_credits_ui(ui_handle: &slint::Weak<MainWindow>, new_total: u32) {
 
 /// Exibe um toast por 3,5s. kind: 0=info 1=sucesso 2=erro.
 /// Um contador de geração impede que timers antigos apaguem toasts novos.
+/// MÓDULO 8: a pintura das propriedades agora ocorre DENTRO do event loop —
+/// chamadas vindas de outras threads (ex.: débito negado na thread do banco)
+/// antes eram silenciosamente descartadas pelo upgrade() fora da thread da UI.
 fn show_toast(ui_handle: &slint::Weak<MainWindow>, message: &str, kind: i32) {
     let generation = TOAST_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    if let Some(ui) = ui_handle.upgrade() {
+    let message = message.to_string();
+
+    let ui_for_show = ui_handle.clone();
+    let queued = slint::invoke_from_event_loop(move || {
+        let Some(ui) = ui_for_show.upgrade() else { return };
         ui.set_toast_message(message.into());
         ui.set_toast_kind(kind);
         ui.set_toast_visible(true);
+    });
 
-        let ui_handle = ui_handle.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(3500));
-            let ui_handle = ui_handle.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                // Somente esconde se nenhum toast mais novo foi exibido
-                if TOAST_GENERATION.load(Ordering::SeqCst) == generation {
-                    if let Some(ui) = ui_handle.upgrade() {
-                        ui.set_toast_visible(false);
-                    }
-                }
-            });
-        });
+    if queued.is_err() {
+        return; // event loop já encerrou — nada a fazer
     }
+
+    let ui_for_hide = ui_handle.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(3500));
+        let ui_for_hide = ui_for_hide.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            // Somente esconde se nenhum toast mais novo foi exibido
+            if TOAST_GENERATION.load(Ordering::SeqCst) == generation {
+                if let Some(ui) = ui_for_hide.upgrade() {
+                    ui.set_toast_visible(false);
+                }
+            }
+        });
+    });
 }
 
 /// Converte um buffer RGB (QR do PIX, capas de álbum) em textura do Slint

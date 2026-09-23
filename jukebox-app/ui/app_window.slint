@@ -1,5 +1,5 @@
 // =============================================================================
-// JUKEBOX ARCADE OS — Interface principal (Slint) — MÓDULO 7
+// JUKEBOX ARCADE OS — Interface principal (Slint) — MÓDULOS 7 e 8
 // -----------------------------------------------------------------------------
 // Layout 1024x768 para kiosk de bar — navegação 100% por controles arcade
 // (controladora USB "Zero Delay" vista como teclado: E/R/I/W/Q/O/U/P/Z/X).
@@ -20,14 +20,17 @@
 //   Overlays flutuantes (desenhados por cima de tudo):
 //     · Barra de volume (P abre; W/Q ajusta; U fecha) — faixa do topo
 //     · Menu do operador (X abre; W/Q navega; O confirma; U fecha):
-//       IP da máquina, total de créditos arrecadados e sync USB forçada
+//       MÓDULO 8 — painel de stats (odômetro, caixa parcial, preço) +
+//       6 opções (sync, preço, gêneros, zerar caixa, zerar créditos,
+//       desligar) + submenus de Preço (W/Q/O-U) e Gêneros (W/Q/O/U)
 //     · Sincronização USB (Módulo 4, tela cheia)
 //     · Toast de notificações (PIX, erros, fila cheia...)
 //
 //   A máquina de estados de foco vive em Rust (state/models.rs — AppState)
 //   e é espelhada aqui pela propriedade `ui-focus`:
-//     0 = BrowsingAlbums · 1 = BrowsingTracks
-//     2 = VolumeControl  · 3 = OperatorMenu
+//     0 = BrowsingAlbums     · 1 = BrowsingTracks
+//     2 = VolumeControl      · 3 = OperatorMainMenu (Módulo 8)
+//     4 = OperatorPriceMenu  · 5 = OperatorGenreMenu  (Módulo 8)
 //   O Slint é RENDERIZADOR PURO do estado: nenhuma decisão de navegação é
 //   tomada aqui — apenas camadas condicionais e feedback visual.
 //
@@ -61,6 +64,15 @@ export struct AlbumData {
     has-cover: bool,
     cover: image,
     tracks: [TrackData],
+}
+
+// MÓDULO 8 — Um gênero musical do acervo para o submenu "Bloquear Gêneros"
+// do operador: nome (tag ID3), contagem de faixas e situação de bloqueio
+// (gêneros bloqueados não aparecem no catálogo público do carrossel).
+export struct GenreData {
+    name: string,
+    blocked: bool,
+    count: int,
 }
 
 // =============================================================================
@@ -281,7 +293,8 @@ component AlbumCard inherits Rectangle {
 }
 
 // =============================================================================
-// MÓDULO 7 — Linha do menu do operador (IP / total arrecadado / sync USB)
+// MÓDULO 8 — Linha do menu do operador (sync, preço, gêneros, zeragens,
+// desligar). `danger` pinta o valor de vermelho (operações destrutivas).
 // =============================================================================
 component OperatorMenuRow inherits Rectangle {
     in property <int> index;
@@ -289,11 +302,14 @@ component OperatorMenuRow inherits Rectangle {
     in property <string> label;
     in property <string> value;
     in property <bool> actionable; // linha executável (O confirma)
+    in property <bool> danger;    // operação destrutiva (valor em vermelho)
 
     height: 64px;
     background: root.index == root.selected-index ? #1c2033 : #101118;
     border-width: root.index == root.selected-index ? 2px : 1px;
-    border-color: root.index == root.selected-index ? #f59e0b : #1e2438;
+    border-color: root.index == root.selected-index
+        ? (root.danger ? #ef4444 : #f59e0b)
+        : #1e2438;
     border-radius: 10px;
 
     // Barra de acento à esquerda quando selecionada
@@ -302,7 +318,9 @@ component OperatorMenuRow inherits Rectangle {
         width: 4px;
         height: parent.height - 20px;
         border-radius: 2px;
-        background: root.index == root.selected-index ? #f59e0b : transparent;
+        background: root.index == root.selected-index
+            ? (root.danger ? #ef4444 : #f59e0b)
+            : transparent;
     }
 
     HorizontalLayout {
@@ -321,12 +339,82 @@ component OperatorMenuRow inherits Rectangle {
 
         Text {
             text: root.value;
-            color: root.actionable ? #34d399 : #fbbf24;
+            color: root.danger ? #f87171
+                 : (root.actionable ? #34d399 : #fbbf24);
             font-size: 15px;
             font-weight: 800;
             vertical-alignment: center;
             overflow: elide;
-            width: 240px;
+            width: 250px;
+            horizontal-alignment: right;
+        }
+    }
+}
+
+// =============================================================================
+// MÓDULO 8 — Linha de gênero do submenu "Bloquear Gêneros"
+// [✓] = liberado no catálogo · [✕] = bloqueado (invisível para o freguês)
+// =============================================================================
+component GenreRow inherits Rectangle {
+    in property <int> index;
+    in property <GenreData> genre;
+    in property <bool> is-selected;
+
+    height: 56px;
+    background: root.is-selected ? #1c2033 : (mod(root.index, 2) == 0 ? #0d0e14 : #101118);
+
+    // Barra de acento à esquerda quando selecionada
+    Rectangle {
+        x: 0; y: 0;
+        width: 4px; height: parent.height;
+        background: root.is-selected ? #f59e0b : transparent;
+    }
+
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        spacing: 16px;
+
+        // Indicador de bloqueio (troca instantânea, sem animação)
+        Text {
+            text: root.genre.blocked ? "[✕]" : "[✓]";
+            color: root.genre.blocked ? #f87171 : #34d399;
+            font-size: 17px;
+            font-weight: 800;
+            width: 56px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+
+        // Nome do gênero (tag ID3 das faixas do acervo)
+        Text {
+            text: root.genre.name;
+            color: root.is-selected ? #f8fafc : (root.genre.blocked ? #6b7280 : #e5e7eb);
+            font-size: 16px;
+            font-weight: root.is-selected ? 700 : 600;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        // Contagem de faixas do acervo (mesmo bloqueado — dado do operador)
+        Text {
+            text: "\{root.genre.count} faixas";
+            color: #6b7280;
+            font-size: 13px;
+            vertical-alignment: center;
+            width: 110px;
+            horizontal-alignment: right;
+        }
+
+        // Situação no catálogo público
+        Text {
+            text: root.genre.blocked ? "BLOQUEADO" : "LIVRE";
+            color: root.genre.blocked ? #f87171 : #34d399;
+            font-size: 12px;
+            font-weight: 800;
+            vertical-alignment: center;
+            width: 110px;
             horizontal-alignment: right;
         }
     }
@@ -350,8 +438,9 @@ export component MainWindow inherits Window {
     in-out property <bool> scanning: true;
 
     // MÓDULO 7 — Espelho da máquina de estados de foco (state/models.rs):
-    //   0 = BrowsingAlbums · 1 = BrowsingTracks
-    //   2 = VolumeControl  · 3 = OperatorMenu
+    //   0 = BrowsingAlbums     · 1 = BrowsingTracks
+    //   2 = VolumeControl      · 3 = OperatorMainMenu (Módulo 8)
+    //   4 = OperatorPriceMenu  · 5 = OperatorGenreMenu  (Módulo 8)
     in-out property <int> ui-focus: 0;
 
     // Catálogo aninhado (Model de Álbuns, cada um com Model de Músicas)
@@ -368,10 +457,18 @@ export component MainWindow inherits Window {
     // Overlay de volume (2 = VolumeControl)
     in-out property <int> volume-value: 70;
 
-    // Menu do operador (3 = OperatorMenu)
+    // Menu do operador (3/4/5 = telas do Módulo 8)
     in-out property <int> op-menu-index: 0;
     in-out property <string> op-ip: "";
-    in-out property <int> op-total-collected: 0;
+    // MÓDULO 8 — Painel de stats do operador (header do menu principal)
+    in-out property <int> op-absolute-coins: 0;   // odômetro (nunca zera)
+    in-out property <int> op-partial-coins: 0;    // caixa atual (zerável)
+    in-out property <int> op-song-price: 1;       // preço vigente (créditos)
+    // MÓDULO 8 — Submenu de preço (valor em edição, W/Q alteram)
+    in-out property <int> op-price-edit: 1;
+    // MÓDULO 8 — Submenu de gêneros (lista + linha selecionada)
+    in-out property <[GenreData]> op-genres: [];
+    in-out property <int> op-genre-index: 0;
 
     // Player e fila (Módulo 3)
     in property <bool> np-active: false;
@@ -1049,12 +1146,19 @@ export component MainWindow inherits Window {
                                 }
                             }
 
+                            // Preço visível ao freguês (MÓDULO 8): com preço
+                            // dinâmico, mostra o custo da música em créditos
+                            // e o equivalente em R$ (1 crédito = R$ 2,00 PIX)
                             Text {
-                                text: "R$ 2,00 = 1 CRÉDITO";
+                                text: root.op-song-price == 1
+                                    ? "R$ 2,00 = 1 CRÉDITO"
+                                    : "MÚSICA = \{root.op-song-price} CRÉDITOS (R$ \{root.op-song-price * 2},00)";
                                 color: #fbbf24;
-                                font-size: 15px;
+                                font-size: root.op-song-price == 1 ? 15px : 12px;
                                 font-weight: 800;
                                 horizontal-alignment: center;
+                                overflow: elide;
+                                width: 224px;
                             }
 
                             Text {
@@ -1187,11 +1291,13 @@ export component MainWindow inherits Window {
     }
 
     // =========================================================================
-    // MÓDULO 7 — OVERLAY: menu do operador (ui-focus 3)
-    // X abre · W/Q navegam · O confirma · U fecha.
-    // Mostra: IP da máquina, total de créditos arrecadados (banco) e a ação
-    // "Forçar Sincronização USB". O diálogo cobre a área do vídeo XVideo —
-    // o Rust envia HideVideo ao abrir e RestoreVideo ao fechar.
+    // MÓDULO 8 — OVERLAY: menu do operador (ui-focus 3) — versão profissional
+    // X abre · W/Q navegam · O entra/confirma · U fecha.
+    // Header: odômetro (nunca zera) | caixa atual (zerável) | preço vigente.
+    // 6 opções: sincronizar pendrive, preço da música (submenu), bloquear
+    // gêneros (submenu), zerar caixa parcial, zerar créditos, desligar.
+    // O diálogo cobre a área do vídeo XVideo — o Rust envia HideVideo ao
+    // abrir e RestoreVideo ao fechar (submenus mantêm o vídeo oculto).
     // =========================================================================
     if root.ui-focus == 3 : Rectangle {
         x: 0; y: 0;
@@ -1205,8 +1311,8 @@ export component MainWindow inherits Window {
         Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: 620px;
-            height: 440px;
+            width: 660px;
+            height: 660px;
             background: #0d0e14;
             border-radius: 16px;
             border-width: 2px;
@@ -1215,8 +1321,8 @@ export component MainWindow inherits Window {
             drop-shadow-color: #000000a0;
 
             VerticalLayout {
-                padding: 32px;
-                spacing: 14px;
+                padding: 24px;
+                spacing: 12px;
 
                 Text {
                     text: "MENU DO OPERADOR";
@@ -1226,36 +1332,378 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                 }
 
+                // ---- Painel de stats: Odômetro | Caixa Atual | Preço ----
+                Rectangle {
+                    height: 52px;
+                    background: #12131c;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: #1e2438;
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+
+                        // Odômetro absoluto (contadores antifraude)
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+
+                            Text {
+                                text: "ODÔMETRO:";
+                                color: #64748b;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: "\{root.op-absolute-coins}";
+                                color: #fbbf24;
+                                font-size: 20px;
+                                font-weight: 800;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            width: 1px;
+                            background: #1e2438;
+                        }
+
+                        // Caixa parcial (zerado a cada recolhimento)
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+
+                            Text {
+                                text: "CAIXA ATUAL:";
+                                color: #64748b;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: "\{root.op-partial-coins}";
+                                color: #34d399;
+                                font-size: 20px;
+                                font-weight: 800;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            width: 1px;
+                            background: #1e2438;
+                        }
+
+                        // Preço vigente da música
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+
+                            Text {
+                                text: "PREÇO:";
+                                color: #64748b;
+                                font-size: 12px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: root.op-song-price == 1
+                                    ? "1 CRÉDITO"
+                                    : "\{root.op-song-price} CRÉDITOS";
+                                color: #38bdf8;
+                                font-size: 20px;
+                                font-weight: 800;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
                 Rectangle { height: 1px; background: #1e2438; }
 
+                // ---- 6 opções do menu ----
                 OperatorMenuRow {
                     index: 0;
                     selected-index: root.op-menu-index;
-                    label: "IP DA MÁQUINA";
-                    value: root.op-ip != "" ? root.op-ip : "consultando...";
-                    actionable: false;
+                    label: "⇅  SINCRONIZAR PENDRIVE";
+                    value: "iniciar agora";
+                    actionable: true;
+                    danger: false;
                 }
 
                 OperatorMenuRow {
                     index: 1;
                     selected-index: root.op-menu-index;
-                    label: "TOTAL ARRECADADO";
-                    value: "\{root.op-total-collected} créditos";
-                    actionable: false;
+                    label: "PREÇO DA MÚSICA";
+                    value: root.op-song-price == 1
+                        ? "1 crédito"
+                        : "\{root.op-song-price} créditos";
+                    actionable: true;
+                    danger: false;
                 }
 
                 OperatorMenuRow {
                     index: 2;
                     selected-index: root.op-menu-index;
-                    label: "⇅  FORÇAR SINCRONIZAÇÃO USB";
-                    value: "iniciar agora";
+                    label: "BLOQUEAR GÊNEROS";
+                    value: "abrir lista";
                     actionable: true;
+                    danger: false;
+                }
+
+                OperatorMenuRow {
+                    index: 3;
+                    selected-index: root.op-menu-index;
+                    label: "✕  ZERAR CAIXA PARCIAL";
+                    value: "\{root.op-partial-coins} créditos";
+                    actionable: true;
+                    danger: true;
+                }
+
+                OperatorMenuRow {
+                    index: 4;
+                    selected-index: root.op-menu-index;
+                    label: "✕  ZERAR CRÉDITOS ATUAIS";
+                    value: "\{root.credits} créditos";
+                    actionable: true;
+                    danger: true;
+                }
+
+                OperatorMenuRow {
+                    index: 5;
+                    selected-index: root.op-menu-index;
+                    label: "DESLIGAR MÁQUINA";
+                    value: "desligar";
+                    actionable: true;
+                    danger: true;
+                }
+
+                Rectangle { height: 1px; background: #1e2438; }
+
+                // Rodapé: IP da máquina (acesso remoto do operador) + mapa de teclas
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    Text {
+                        text: root.op-ip != "" ? "IP: \{root.op-ip}" : "IP: consultando...";
+                        color: #64748b;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "W/Q seleciona   ·   O confirma   ·   U fecha";
+                        color: #64748b;
+                        font-size: 12px;
+                        horizontal-alignment: right;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // MÓDULO 8 — OVERLAY: submenu de preço (ui-focus 4)
+    // W aumenta · Q diminui · O ou U salva e volta.
+    // Mostra o valor em edição e o equivalente em R$ (1 crédito = R$ 2,00,
+    // mesmo valor do QR PIX — VALOR_PIX do Módulo 5).
+    // =========================================================================
+    if root.ui-focus == 4 : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000e6;
+
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 480px;
+            height: 420px;
+            background: #0d0e14;
+            border-radius: 16px;
+            border-width: 2px;
+            border-color: #f59e0b;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #000000a0;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 14px;
+
+                Text {
+                    text: "PREÇO DA MÚSICA";
+                    color: #f59e0b;
+                    font-size: 20px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                }
+
+                // Valor em edição (troca instantânea, sem animação)
+                Rectangle {
+                    height: 150px;
+                    background: #12131c;
+                    border-radius: 14px;
+                    border-width: 2px;
+                    border-color: #38bdf8;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+
+                        Text {
+                            text: "\{root.op-price-edit}";
+                            color: #fbbf24;
+                            font-size: 64px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: root.op-price-edit == 1 ? "CRÉDITO" : "CRÉDITOS";
+                            color: #9ca3af;
+                            font-size: 14px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "= R$ \{root.op-price-edit * 2},00 por música";
+                    color: #34d399;
+                    font-size: 16px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
                 }
 
                 Rectangle { height: 1px; background: #1e2438; }
 
                 Text {
-                    text: "W/Q seleciona   ·   O confirma   ·   U fecha";
+                    text: "W aumenta   ·   Q diminui";
+                    color: #64748b;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "O ou U salva e volta";
+                    color: #64748b;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // MÓDULO 8 — OVERLAY: submenu de gêneros (ui-focus 5)
+    // W/Q navegam · O alterna o bloqueio [✓]/[✕] · U volta.
+    // Gêneros bloqueados somem do catálogo público (carrossel) na hora —
+    // recarga do modelo instantânea, sem animações (nota de performance).
+    // =========================================================================
+    if root.ui-focus == 5 : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000e6;
+
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 700px;
+            height: 600px;
+            background: #0d0e14;
+            border-radius: 16px;
+            border-width: 2px;
+            border-color: #f59e0b;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: #000000a0;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 12px;
+
+                // Cabeçalho: título + contagem de gêneros do acervo
+                HorizontalLayout {
+                    spacing: 16px;
+
+                    Text {
+                        text: "BLOQUEAR GÊNEROS";
+                        color: #f59e0b;
+                        font-size: 20px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    Text {
+                        text: "\{root.op-genres.length} gêneros";
+                        color: #6b7280;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle { height: 1px; background: #1e2438; }
+
+                // Estado vazio (acervo sem faixas indexadas)
+                if root.op-genres.length == 0 : Rectangle {
+                    vertical-stretch: 1;
+                    background: #08080c;
+                    border-radius: 10px;
+
+                    Text {
+                        text: "Nenhum gênero no catálogo";
+                        color: #475569;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Lista virtualizada de gêneros (56px por linha)
+                if root.op-genres.length > 0 : Rectangle {
+                    vertical-stretch: 1;
+                    background: #08080c;
+                    border-radius: 10px;
+                    clip: true;
+
+                    genre-list := ListView {
+                        for genre[index] in root.op-genres : GenreRow {
+                            index: index;
+                            genre: genre;
+                            is-selected: index == root.op-genre-index;
+                        }
+
+                        // Espelha a seleção para reagir a mudanças dela
+                        property <int> sel: root.op-genre-index;
+
+                        // Mantém a linha selecionada visível ao navegar
+                        changed sel => {
+                            if (self.sel * 56px < -self.viewport-y) {
+                                self.viewport-y = 0px - self.sel * 56px;
+                            } else if ((self.sel + 1) * 56px > -self.viewport-y + self.height) {
+                                self.viewport-y = self.height - (self.sel + 1) * 56px;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #1e2438; }
+
+                Text {
+                    text: "O alterna o bloqueio   ·   U volta";
                     color: #64748b;
                     font-size: 13px;
                     horizontal-alignment: center;

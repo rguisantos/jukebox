@@ -154,6 +154,8 @@ fn extract_track_info(path: &Path) -> TrackInfo {
                     .to_string(),
                 artist: tag.artist().unwrap_or("Artista Desconhecido").to_string(),
                 album: tag.album().unwrap_or("Álbum Desconhecido").to_string(),
+                // MÓDULO 8: gênero da tag ID3 alimenta o bloqueio de gêneros
+                genre: tag.genre().unwrap_or("Desconhecido").to_string(),
                 file_path,
                 file_type: extension.clone(),
             };
@@ -168,6 +170,7 @@ fn extract_track_info(path: &Path) -> TrackInfo {
         title,
         artist,
         album: String::from("Sem Álbum"),
+        genre: String::from("Desconhecido"),
         file_path,
         file_type: extension,
     }

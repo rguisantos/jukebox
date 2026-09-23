@@ -1,4 +1,6 @@
-use crate::state::models::{album_initial, fnv64, AlbumInfo, TrackInfo};
+use crate::state::models::{
+    album_initial, fnv64, AlbumInfo, GenreInfo, SONG_PRICE_MAX, SONG_PRICE_MIN, TrackInfo,
+};
 use rusqlite::{params, Connection, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -67,7 +69,8 @@ impl Database {
             [],
         )?;
 
-        // Tabela de faixas de mídia indexadas pelo scanner
+        // Tabela de faixas de mídia indexadas pelo scanner. O gênero (Módulo 8)
+        // alimenta o bloqueio de gêneros no catálogo público.
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS tracks (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +78,8 @@ impl Database {
                 artist    TEXT    NOT NULL DEFAULT 'Artista Desconhecido',
                 album     TEXT    NOT NULL DEFAULT 'Sem Álbum',
                 file_path TEXT    NOT NULL UNIQUE,
-                file_type TEXT    NOT NULL
+                file_type TEXT    NOT NULL,
+                genre     TEXT    NOT NULL DEFAULT 'Desconhecido'
             );",
             [],
         )?;
@@ -86,13 +90,79 @@ impl Database {
             [],
         )?;
 
+        // MÓDULO 8 — Migração de bases criadas pelos Módulos 1–7: adiciona a
+        // coluna `genre` e zera a tabela para forçar a re-indexação completa
+        // (as tags ID3 de gênero só são lidas pelo scanner; sem o wipe, todo o
+        // acervo antigo ficaria eternamente em "Desconhecido"). Os arquivos
+        // em /dados/musicas continuam no disco — o próximo scan os recataloga.
+        // SQLite não tem "ADD COLUMN IF NOT EXISTS": checa via PRAGMA.
+        if !self.has_tracks_genre_column()? {
+            match self.conn.execute(
+                "ALTER TABLE tracks ADD COLUMN genre TEXT NOT NULL DEFAULT 'Desconhecido';",
+                [],
+            ) {
+                Ok(_) => {
+                    log::warn!(
+                        "Migração Módulo 8: coluna `genre` criada — catálogo será re-indexado do zero."
+                    );
+                    self.conn.execute("DELETE FROM tracks;", [])?;
+                }
+                // Janela de corrida minúscula (outra conexão criou a coluna no
+                // intervalo entre a checagem e o ALTER): segue se a coluna existe
+                Err(_) if self.has_tracks_genre_column().unwrap_or(false) => {
+                    log::info!("Migração Módulo 8: coluna `genre` já criada por outra conexão.");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // MÓDULO 8 — Gêneros bloqueados pelo operador (não aparecem no catálogo)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS blocked_genres (
+                genre TEXT PRIMARY KEY
+            );",
+            [],
+        )?;
+
         // Garante que a chave 'credits' exista com valor inicial 0
         self.conn.execute(
             "INSERT OR IGNORE INTO system_state (key, value) VALUES ('credits', 0);",
             [],
         )?;
 
+        // MÓDULO 8 — Caixa parcial (o operador zera ao recolher o dinheiro)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO system_state (key, value) VALUES ('partial_coins', 0);",
+            [],
+        )?;
+
+        // MÓDULO 8 — Odômetro absoluto (NUNCA zera). Ao migrar uma base dos
+        // Módulos 1–7, herda o histórico da auditoria de créditos para o
+        // contador não nascer zerado numa máquina que já operou no bar.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO system_state (key, value)
+             SELECT 'absolute_coins', COALESCE(SUM(amount), 0)
+             FROM credits_audit WHERE amount > 0;",
+            [],
+        )?;
+
+        // MÓDULO 8 — Preço da música em créditos (padrão 1)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO system_state (key, value) VALUES ('song_price', 1);",
+            [],
+        )?;
+
         Ok(())
+    }
+
+    /// Verifica se a tabela `tracks` já possui a coluna `genre` (Módulo 8)
+    fn has_tracks_genre_column(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(tracks);")?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names.iter().any(|name| name == "genre"))
     }
 
     // =========================================================================
@@ -108,12 +178,25 @@ impl Database {
         Ok(credits.max(0) as u32)
     }
 
-    /// Incrementa créditos de forma atômica e registra na auditoria
+    /// Incrementa créditos de forma atômica e registra na auditoria.
+    /// MÓDULO 8: toda entrada (moeda ou PIX) alimenta também os contadores
+    /// antifraude — o caixa parcial (zerado pelo operador no recolhimento)
+    /// e o odômetro absoluto (nunca zerado, para conferência patrimonial).
     pub fn increment_credits(&mut self, amount: u32) -> Result<u32> {
         let tx = self.conn.transaction()?;
 
         tx.execute(
             "UPDATE system_state SET value = value + ?1 WHERE key = 'credits';",
+            params![amount as i64],
+        )?;
+
+        tx.execute(
+            "UPDATE system_state SET value = value + ?1 WHERE key = 'partial_coins';",
+            params![amount as i64],
+        )?;
+
+        tx.execute(
+            "UPDATE system_state SET value = value + ?1 WHERE key = 'absolute_coins';",
             params![amount as i64],
         )?;
 
@@ -183,19 +266,21 @@ impl Database {
     /// Em caso de conflito (arquivo já indexado), atualiza os metadados.
     pub fn upsert_track(&mut self, track: &TrackInfo) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tracks (title, artist, album, file_path, file_type)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO tracks (title, artist, album, file_path, file_type, genre)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(file_path) DO UPDATE SET
                 title     = excluded.title,
                 artist    = excluded.artist,
                 album     = excluded.album,
-                file_type = excluded.file_type;",
+                file_type = excluded.file_type,
+                genre     = excluded.genre;",
             params![
                 track.title,
                 track.artist,
                 track.album,
                 track.file_path,
                 track.file_type,
+                track.genre,
             ],
         )?;
         Ok(())
@@ -211,11 +296,13 @@ impl Database {
         Ok(paths)
     }
 
-    /// Retorna todas as faixas cadastradas, ordenadas por artista e título
+    /// Retorna todas as faixas do catálogo público, ordenadas por artista e
+    /// título. MÓDULO 8: gêneros bloqueados ficam de fora da consulta.
     pub fn get_all_tracks(&self) -> Result<Vec<TrackInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, artist, album, file_path, file_type
+            "SELECT id, title, artist, album, file_path, file_type, genre
              FROM tracks
+             WHERE genre NOT IN (SELECT genre FROM blocked_genres)
              ORDER BY artist ASC, title ASC;",
         )?;
 
@@ -228,6 +315,7 @@ impl Database {
                     album: row.get(3)?,
                     file_path: row.get(4)?,
                     file_type: row.get(5)?,
+                    genre: row.get(6)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -247,8 +335,9 @@ impl Database {
     /// carrossel em ordem alfabética de artista.
     pub fn get_albums(&self) -> Result<Vec<AlbumInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, artist, album, file_path, file_type
+            "SELECT id, title, artist, album, file_path, file_type, genre
              FROM tracks
+             WHERE genre NOT IN (SELECT genre FROM blocked_genres)
              ORDER BY artist ASC, album ASC, title ASC;",
         )?;
 
@@ -261,6 +350,7 @@ impl Database {
                     album: row.get(3)?,
                     file_path: row.get(4)?,
                     file_type: row.get(5)?,
+                    genre: row.get(6)?,
                 })
             })?
             .filter_map(|r| r.ok());
@@ -295,20 +385,116 @@ impl Database {
     }
 
     // =========================================================================
-    // MÓDULO 7 — Menu do operador e configurações persistentes
+    // MÓDULO 8 — Contadores antifraude, preço dinâmico e bloqueio de gêneros
     // =========================================================================
 
-    /// Total de créditos ARRECADADOS na história da máquina: soma de todas
-    /// as entradas positivas da auditoria (moedas + PIX). Débitos por play
-    /// (valores negativos) não entram na conta — é o número do fechamento
-    /// de caixa, exibido no menu do operador (tecla X).
-    pub fn get_total_credits_collected(&self) -> Result<i64> {
-        let total: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM credits_audit WHERE amount > 0;",
+    /// Lê um contador da tabela chave-valor (0 se a chave ainda não existir).
+    /// Distingue "chave ausente" (Ok(0)) de erro real de I/O (Err).
+    fn read_counter(&self, key: &str) -> Result<i64> {
+        match self.conn.query_row(
+            "SELECT value FROM system_state WHERE key = ?1;",
+            params![key],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(value) => Ok(value.max(0)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Caixa parcial: créditos inseridos desde o último recolhimento do
+    /// operador (zerado pela opção "Zerar Caixa Parcial" do menu).
+    pub fn get_partial_coins(&self) -> Result<i64> {
+        self.read_counter("partial_coins")
+    }
+
+    /// Odômetro absoluto: total histórico de créditos inseridos — NUNCA zera
+    /// (proteção patrimonial: conferência com o caixa parcial de cada período).
+    pub fn get_absolute_coins(&self) -> Result<i64> {
+        self.read_counter("absolute_coins")
+    }
+
+    /// Zera o caixa parcial (após o operador esvaziar o moedeiro/gaveta).
+    /// O odômetro absoluto permanece intacto.
+    pub fn reset_partial_coins(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE system_state SET value = 0 WHERE key = 'partial_coins';",
             [],
-            |row| row.get(0),
         )?;
-        Ok(total.max(0))
+        Ok(())
+    }
+
+    /// Zera os créditos inseridos e ainda não gastos na máquina (créditos
+    /// "abandonados" pelo freguês). O caixa parcial e o odômetro não mudam:
+    /// o dinheiro já foi contado na entrada.
+    pub fn reset_current_credits(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE system_state SET value = 0 WHERE key = 'credits';",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Preço atual da música em créditos (padrão 1, limitado a 1..=10)
+    pub fn get_song_price(&self) -> Result<u32> {
+        let price = self.read_counter("song_price")?;
+        Ok(price.clamp(SONG_PRICE_MIN as i64, SONG_PRICE_MAX as i64) as u32)
+    }
+
+    /// Define o preço da música em créditos (persistente entre reinícios)
+    pub fn set_song_price(&self, price: u32) -> Result<()> {
+        let clamped = price.clamp(SONG_PRICE_MIN, SONG_PRICE_MAX);
+        self.conn.execute(
+            "INSERT INTO system_state (key, value) VALUES ('song_price', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![clamped as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Lista todos os gêneros do acervo com a contagem de faixas e a situação
+    /// de bloqueio — alimenta o submenu "Bloquear Gêneros" do operador.
+    pub fn get_genres(&self) -> Result<Vec<GenreInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT genre,
+                    COUNT(*) AS total,
+                    EXISTS(SELECT 1 FROM blocked_genres bg WHERE bg.genre = tracks.genre)
+             FROM tracks
+             GROUP BY genre
+             ORDER BY genre COLLATE NOCASE ASC;",
+        )?;
+
+        let genres = stmt
+            .query_map([], |row| {
+                Ok(GenreInfo {
+                    name: row.get(0)?,
+                    track_count: row.get(1)?,
+                    blocked: row.get(2)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(genres)
+    }
+
+    /// Alterna o bloqueio de um gênero. Retorna o novo estado
+    /// (true = bloqueado, false = liberado no catálogo público).
+    pub fn toggle_genre_block(&self, genre: &str) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM blocked_genres WHERE genre = ?1;",
+            params![genre],
+        )?;
+
+        if removed > 0 {
+            Ok(false)
+        } else {
+            self.conn.execute(
+                "INSERT INTO blocked_genres (genre) VALUES (?1);",
+                params![genre],
+            )?;
+            Ok(true)
+        }
     }
 
     /// Lê um valor inteiro da tabela chave-valor (None se a chave não existe)
