@@ -25,9 +25,31 @@ x11-xserver-utils
 # Gerenciador de Janelas Ultra-Leve e Utilitários de Kiosk
 openbox
 unclutter
+# xmessage: caixa de erro textual quando o binário do app não é encontrado
+x11-utils
 
 # Áudio Nativo ALSA (Sem camadas extras de overhead)
 alsa-utils
+
+# ==============================================================================
+# MÓDULO 3 — Runtime GStreamer para o player (playbin)
+# Debian 12 Bookworm = GStreamer 1.22. Binário compilado contra os bindings
+# gstreamer-rs 0.22 (compatível com >= 1.20).
+# ==============================================================================
+# Núcleo + elementos base: playbin, decodebin, audioconvert, videoconvert, typefind
+gstreamer1.0-plugins-base
+# Demuxers e parsers essenciais: MP4/MOV (qtdemux), Matroska, ID3, audioparsers
+gstreamer1.0-plugins-good
+# xvimagesink/ximagesink: saída de vídeo via XVideo (composição SEM OpenGL —
+# caminho clássico e barato para GPUs legadas do Sempron/Core2Duo)
+gstreamer1.0-x
+# alsasink: saída de áudio direto no ALSA (sem PulseAudio/PipeWire)
+gstreamer1.0-alsa
+# Decodificadores libav: MP3, AAC, H.264 (MP4), WMV — cobre todos os formatos
+# aceitos pelo scanner (.mp3/.mp4/.wav/.wmv/.mpeg)
+gstreamer1.0-libav
+# gst-inspect-1.0 / gst-launch-1.0 para diagnóstico em campo
+gstreamer1.0-tools
 
 # Estabilidade, Blindagem e Watchdog
 overlayroot

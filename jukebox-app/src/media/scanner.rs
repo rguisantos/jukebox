@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::state::models::TrackInfo;
+use id3::TagLike;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -15,7 +16,7 @@ const PROD_MEDIA_DIR: &str = "/dados/musicas";
 const DEV_MEDIA_DIR: &str = "./dados/musicas";
 
 /// Resolve o diretório correto de mídia (produção ou desenvolvimento)
-fn resolve_media_dir() -> PathBuf {
+pub fn resolve_media_dir() -> PathBuf {
     let prod = Path::new(PROD_MEDIA_DIR);
     if prod.exists() && prod.is_dir() {
         prod.to_path_buf()

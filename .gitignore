@@ -4,3 +4,8 @@ distro/chroot/
 *.iso
 *.img
 *.squashfs
+# Build Rust (artefatos de compilação — nunca versionar)
+jukebox-app/target/
+
+# Logs de sessão X11 do kiosk (gerados em runtime)
+/dados/

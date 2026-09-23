@@ -24,6 +24,7 @@ chmod 775 /dados
 
 # Permissões dos scripts executáveis
 chmod +x /usr/local/bin/jukebox-install-to-disk.sh || true
+chmod +x /usr/local/sbin/jukebox-usb-mount.sh || true
 chmod +x /usr/local/bin/jukebox-maintenance || true
 chmod +x /home/jukebox/.xinitrc || true
 chown -R jukebox:jukebox /home/jukebox

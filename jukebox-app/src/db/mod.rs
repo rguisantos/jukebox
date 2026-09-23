@@ -121,11 +121,57 @@ impl Database {
             params![amount as i64],
         )?;
 
-        let mut stmt = tx.prepare("SELECT value FROM system_state WHERE key = 'credits';")?;
-        let new_credits: i64 = stmt.query_row([], |row| row.get(0))?;
+        let new_credits: i64 = {
+            let mut stmt = tx.prepare("SELECT value FROM system_state WHERE key = 'credits';")?;
+            stmt.query_row([], |row| row.get(0))?
+        };
 
         tx.commit()?;
         Ok(new_credits.max(0) as u32)
+    }
+
+    /// Debita créditos de forma atômica (SELECT + UPDATE dentro de uma transação).
+    /// Retorna:
+    ///   - Ok(Some(novo_saldo)) quando o débito foi efetuado com sucesso;
+    ///   - Ok(None)             quando o saldo é insuficiente (nada é alterado);
+    ///   - Err(...)             em falha grave de I/O no SQLite.
+    /// O débito é registrado na tabela de auditoria com valor negativo,
+    /// permitindo o fechamento de caixa preciso pelo operador.
+    pub fn spend_credits(&mut self, amount: u32) -> Result<Option<u32>> {
+        let tx = self.conn.transaction()?;
+
+        // Leitura do saldo atual DENTRO da transação: garante atomicidade mesmo
+        // com a thread do PIX creditando simultaneamente (write serializado).
+        let current: i64 = tx.query_row(
+            "SELECT value FROM system_state WHERE key = 'credits';",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if current < amount as i64 {
+            // Saldo insuficiente: a transação cai fora do escopo e sofre
+            // rollback automático — nenhum dado é gravado.
+            return Ok(None);
+        }
+
+        tx.execute(
+            "UPDATE system_state SET value = value - ?1 WHERE key = 'credits';",
+            params![amount as i64],
+        )?;
+
+        // Auditoria negativa: -1 crédito por faixa tocada (fechamento de caixa)
+        tx.execute(
+            "INSERT INTO credits_audit (amount) VALUES (?1);",
+            params![-(amount as i64)],
+        )?;
+
+        let new_credits: i64 = {
+            let mut stmt = tx.prepare("SELECT value FROM system_state WHERE key = 'credits';")?;
+            stmt.query_row([], |row| row.get(0))?
+        };
+
+        tx.commit()?;
+        Ok(Some(new_credits.max(0) as u32))
     }
 
     // =========================================================================

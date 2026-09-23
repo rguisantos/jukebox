@@ -1,28 +1,70 @@
-// Estrutura de dados compartilhada entre Slint e Rust para o catálogo de faixas
+// =============================================================================
+// JUKEBOX ARCADE OS — Interface principal (Slint)
+// -----------------------------------------------------------------------------
+// Layout 1024x768 para kiosk de bar (navegação 100% por teclado):
+//
+//   ┌──────────────────────────────────────────┬──────────────┐
+//   │  HEADER: título + badge de créditos      │              │
+//   ├──────────────────────────────────────────┤  TOCANDO     │
+//   │                                          │  AGORA       │
+//   │   CATÁLOGO (ListView virtualizada)       ├──────────────┤
+//   │   ou ÁREA DE VÍDEO (XVideo embutido)     │  A SEGUIR    │
+//   │   (o GStreamer pinta direto na janela    │  (fila)      │
+//   │    X11 nesta região — vide player.rs)    ├──────────────┤
+//   │                                          │  PAGUE COM   │
+//   │                                          │  PIX (QR)    │
+//   ├──────────────────────────────────────────┤              │
+//   │  FOOTER: instruções do operador          │              │
+//   └──────────────────────────────────────────┴──────────────┘
+//
+//   + Overlay USB (tela cheia, Módulo 4) e Toast flutuante (Módulo 5)
+// =============================================================================
+
+import { ListView, Spinner } from "std-widgets.slint";
+
+// Estrutura compartilhada entre Slint e Rust (catálogo e fila)
 export struct TrackData {
     id: int,
     title: string,
     artist: string,
     album: string,
     file-type: string,
+    // Caminho no disco — invisível na UI, usado pelo player ao tocar
+    file-path: string,
 }
 
+// =============================================================================
+// Linha do catálogo (56px — altura referência para a navegação por teclado)
+// =============================================================================
 component TrackRow inherits Rectangle {
     in property <int> index;
     in property <TrackData> track;
+    in property <bool> is-selected;
+    in property <bool> is-playing;
+    in property <bool> has-focus-list; // catálogo visível (vídeo não tocando)
+
+    // Dispara quando o operador toca/clica na linha (a MainWindow conecta)
+    callback activated(int);
 
     height: 56px;
-    background: mod(index, 2) == 0 ? #0d0e14 : #101118;
+    background: is-selected && has-focus-list ? #1c2033 : (mod(index, 2) == 0 ? #0d0e14 : #101118);
+
+    // Barra de acento à esquerda quando selecionada
+    Rectangle {
+        x: 0; y: 0;
+        width: 4px; height: parent.height;
+        background: is-selected && has-focus-list ? #818cf8 : transparent;
+    }
 
     HorizontalLayout {
         padding-left: 24px;
         padding-right: 24px;
         spacing: 16px;
 
-        // Número da faixa
+        // Número da faixa (ou indicador "tocando")
         Text {
-            text: "\{index + 1}";
-            color: #4b5563;
+            text: is-playing ? "♪" : "\{index + 1}";
+            color: is-playing ? #34d399 : (is-selected && has-focus-list ? #a5b4fc : #4b5563);
             font-size: 15px;
             font-weight: 700;
             width: 40px;
@@ -30,7 +72,7 @@ component TrackRow inherits Rectangle {
             horizontal-alignment: center;
         }
 
-        // Ícone do tipo de mídia (♫ para áudio, ▶ para vídeo)
+        // Ícone do tipo de mídia (♫ áudio / ▶ vídeo)
         Text {
             text: track.file-type == "mp3" || track.file-type == "wav" ? "♫" : "▶";
             color: track.file-type == "mp3" || track.file-type == "wav" ? #818cf8 : #34d399;
@@ -40,12 +82,12 @@ component TrackRow inherits Rectangle {
             horizontal-alignment: center;
         }
 
-        // Título da faixa
+        // Título
         Text {
             text: track.title;
-            color: #e5e7eb;
+            color: is-playing ? #6ee7b7 : (is-selected && has-focus-list ? #f8fafc : #e5e7eb);
             font-size: 16px;
-            font-weight: 600;
+            font-weight: is-playing || (is-selected && has-focus-list) ? 700 : 600;
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;
@@ -58,34 +100,145 @@ component TrackRow inherits Rectangle {
             font-size: 14px;
             vertical-alignment: center;
             overflow: elide;
-            width: 220px;
+            width: 200px;
             horizontal-alignment: right;
+        }
+    }
+
+    // Toque/clique também seleciona e executa (telas de toque de bar)
+    TouchArea {
+        clicked => {
+            root.activated(root.index);
         }
     }
 }
 
+// =============================================================================
+// Linha compacta da fila "A seguir"
+// =============================================================================
+component QueueRow inherits Rectangle {
+    in property <int> index;
+    in property <TrackData> track;
+
+    height: 40px;
+    background: mod(index, 2) == 0 ? #0d0e14 : #101118;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 10px;
+
+        Text {
+            text: "\{index + 1}";
+            color: #4b5563;
+            font-size: 13px;
+            font-weight: 700;
+            width: 22px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: track.file-type == "mp3" || track.file-type == "wav" ? "♫" : "▶";
+            color: track.file-type == "mp3" || track.file-type == "wav" ? #6366f1 : #10b981;
+            font-size: 13px;
+            width: 18px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: track.title;
+            color: #cbd5e1;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// =============================================================================
+// Janela principal
+// =============================================================================
 export component MainWindow inherits Window {
     title: "Jukebox Arcade OS";
     background: #08080c;
     preferred-width: 1024px;
     preferred-height: 768px;
 
-    // Estado sincronizado com a thread de controle Rust
+    // =========================================================================
+    // Estado sincronizado com as threads de controle Rust
+    // =========================================================================
+
+    // Créditos e catálogo (Módulos 1 e 2)
     in-out property <int> credits: 0;
     in-out property <[TrackData]> tracks: [];
     in-out property <bool> scanning: true;
+    in-out property <int> selected-index: 0;
 
-    // Callbacks para comunicação com o core engine Rust
-    callback coin_inserted();
+    // Player e fila (Módulo 3)
+    in property <bool> np-active: false;
+    in property <int> np-track-id: -1;
+    in property <string> np-title: "";
+    in property <string> np-artist: "";
+    in property <bool> np-video: false;
+    in property <[TrackData]> queue-tracks: [];
 
-    // Direciona o foco do teclado automaticamente para o handler
+    // PIX (Módulo 5)
+    in property <image> pix-qr-image;
+    in property <bool> pix-loading: true;
+    in property <bool> pix-offline: false;
+    in property <string> pix-error-text: "";
+
+    // Toast flutuante (kind: 0=informação 1=sucesso 2=erro)
+    in property <bool> toast-visible: false;
+    in property <string> toast-message: "";
+    in property <int> toast-kind: 0;
+
+    // Overlay de sincronização USB (Módulo 4) — state: 1=sincronizando 2=concluído 3=falha
+    in property <bool> usb-overlay-visible: false;
+    in property <int> usb-state: 1;
+    in property <int> usb-total: 0;
+    in property <int> usb-copied: 0;
+    in property <int> usb-new-tracks: 0;
+    in property <string> usb-current-file: "";
+    in property <string> usb-error-text: "";
+
+    // =========================================================================
+    // Callbacks -> core engine Rust
+    // =========================================================================
+    callback coin-inserted();                                // tecla Z (moedeiro)
+    callback track-activated(int);                           // Enter/clique numa faixa
+    callback pix-retry();                                    // botão tentar novamente
+    callback usb-close();                                    // fechar overlay USB
+    callback video-geometry-changed(length, length, length, length); // x,y,w,h da área de vídeo
+
+    // Direciona o foco do teclado para o handler global
     forward-focus: keyboard-handler;
 
     keyboard-handler := FocusScope {
         key-pressed(event) => {
-            // Tecla 'Z' ou 'z' simula o pulso do moedeiro/noteiro
+            // Tecla 'Z'/'z' simula o pulso do moedeiro/noteiro
             if (event.text == "z" || event.text == "Z") {
-                root.coin_inserted();
+                root.coin-inserted();
+                return accept;
+            }
+            // Navegação do catálogo (setas chegam como texto Unicode)
+            if (event.text == Key.UpArrow) {
+                root.selected-index = max(0, root.selected-index - 1);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.selected-index = min(root.tracks.length - 1, root.selected-index + 1);
+                return accept;
+            }
+            // Enter: seleciona a faixa marcada (débito + enfileiramento no Rust)
+            if (event.text == Key.Return) {
+                if (root.selected-index >= 0 && root.selected-index < root.tracks.length) {
+                    root.track-activated(root.selected-index);
+                }
                 return accept;
             }
             return reject;
@@ -93,19 +246,19 @@ export component MainWindow inherits Window {
     }
 
     // =========================================================================
-    // Layout Principal
+    // Layout principal
     // =========================================================================
-
     VerticalLayout {
         padding: 0px;
         spacing: 0px;
 
-        // Barra Superior: Título e Badge de Créditos
+        // ------------------------------------------------------------------
+        // Barra superior: título + badge de créditos
+        // ------------------------------------------------------------------
         Rectangle {
             height: 80px;
             background: #0a0b10;
 
-            // Título do Sistema
             Text {
                 x: 32px;
                 text: "JUKEBOX ARCADE OS";
@@ -115,7 +268,6 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
 
-            // Badge de Créditos (Canto Superior Direito)
             Rectangle {
                 x: parent.width - self.width - 28px;
                 y: (parent.height - self.height) / 2;
@@ -151,128 +303,629 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Separador visual
-        Rectangle {
-            height: 2px;
-            background: #1e1f2e;
-        }
+        Rectangle { height: 2px; background: #1e1f2e; }
 
-        // Cabeçalho do Catálogo
-        Rectangle {
-            height: 52px;
-            background: #0c0d13;
-
-            HorizontalLayout {
-                padding-left: 32px;
-                padding-right: 32px;
-                alignment: space-between;
-
-                Text {
-                    text: "CATÁLOGO DE MÚSICAS";
-                    color: #818cf8;
-                    font-size: 15px;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: root.scanning ? "Escaneando..." : "\{root.tracks.length} faixas";
-                    color: #6b7280;
-                    font-size: 14px;
-                    vertical-alignment: center;
-                }
-            }
-        }
-
-        // Separador
-        Rectangle {
-            height: 1px;
-            background: #1a1b26;
-        }
-
-        // Área de Catálogo: ListView virtualizada (eficiente para milhares de faixas)
-        if root.tracks.length > 0 && !root.scanning : Rectangle {
+        // ------------------------------------------------------------------
+        // Corpo: catálogo/vídeo (esquerda) + painel lateral (direita)
+        // ------------------------------------------------------------------
+        HorizontalLayout {
+            padding: 0px;
+            spacing: 0px;
             vertical-stretch: 1;
-            background: #08080c;
 
-            ListView {
-                for track[index] in root.tracks : TrackRow {
-                    index: index;
-                    track: track;
+            // ============================ ESQUERDA =========================
+            Rectangle {
+                horizontal-stretch: 1;
+
+                // CAMADA DE FUNDO: área de vídeo — sempre presente para
+                // reportar geometria ao GStreamer (GstVideoOverlay). O vídeo
+                // é composto pelo X11 ACIMA de qualquer desenho do Slint.
+                video-area := Rectangle {
+                    background: #000000;
+
+                    // Espelha o estado do player nesta propriedade local
+                    // para disparar o callback de geometria também quando
+                    // a área de vídeo acaba de surgir
+                    property <bool> video-active: root.np-video;
+                    changed video-active => {
+                        if (self.video-active) {
+                            root.video-geometry-changed(self.x, self.y, self.width, self.height);
+                        }
+                    }
+                    changed x => {
+                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
+                    }
+                    changed y => {
+                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
+                    }
+                    changed width => {
+                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
+                    }
+                    changed height => {
+                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
+                    }
+
+                    // Fim de vídeo: mensagem discreta antes do catálogo voltar
+                    Text {
+                        text: "▶  REPRODUZINDO VÍDEO";
+                        color: #334155;
+                        font-size: 16px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // CAMADA 2: cabeçalho + catálogo (ocultos durante vídeo)
+                if !root.np-video : Rectangle {
+                    VerticalLayout {
+                        padding: 0px;
+                        spacing: 0px;
+
+                        // Cabeçalho do catálogo
+                        Rectangle {
+                            height: 52px;
+                            background: #0c0d13;
+
+                            HorizontalLayout {
+                                padding-left: 32px;
+                                padding-right: 32px;
+                                alignment: space-between;
+
+                                Text {
+                                    text: "CATÁLOGO DE MÚSICAS";
+                                    color: #818cf8;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    text: root.scanning
+                                        ? "Escaneando..."
+                                        : "\{root.tracks.length} faixas";
+                                    color: #6b7280;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #1a1b26; }
+
+                        // Catálogo virtualizado
+                        if root.tracks.length > 0 && !root.scanning : Rectangle {
+                            vertical-stretch: 1;
+                            background: #08080c;
+
+                            catalog-list := ListView {
+                                for track[index] in root.tracks : TrackRow {
+                                    index: index;
+                                    track: track;
+                                    is-selected: index == root.selected-index;
+                                    is-playing: track.id == root.np-track-id;
+                                    has-focus-list: true;
+                                    activated(i) => {
+                                        root.selected-index = i;
+                                        root.track-activated(i);
+                                    }
+                                }
+
+                                // Espelha a seleção para reagir a mudanças dela
+                                property <int> sel: root.selected-index;
+
+                                // Mantém a linha selecionada visível ao navegar por teclado
+                                changed sel => {
+                                    if (self.sel * 56px < -self.viewport-y) {
+                                        // Seleção acima da área visível: sobe
+                                        self.viewport-y = 0px - self.sel * 56px;
+                                    } else if ((self.sel + 1) * 56px > -self.viewport-y + self.height) {
+                                        // Seleção abaixo da área visível: desce
+                                        self.viewport-y = self.height - (self.sel + 1) * 56px;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Estado vazio
+                        if root.tracks.length == 0 && !root.scanning : Rectangle {
+                            vertical-stretch: 1;
+                            background: #08080c;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 12px;
+
+                                Text {
+                                    text: "Nenhuma música encontrada";
+                                    color: #6b7280;
+                                    font-size: 20px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                }
+
+                                Text {
+                                    text: "Insira um pendrive para sincronizar";
+                                    color: #4b5563;
+                                    font-size: 15px;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Estado de escaneamento inicial
+                        if root.scanning : Rectangle {
+                            vertical-stretch: 1;
+                            background: #08080c;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 16px;
+
+                                Text {
+                                    text: "♫";
+                                    color: #818cf8;
+                                    font-size: 48px;
+                                    horizontal-alignment: center;
+                                }
+
+                                Text {
+                                    text: "Carregando catálogo...";
+                                    color: #9ca3af;
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { width: 2px; background: #1e1f2e; }
+
+            // ============================ DIREITA ==========================
+            Rectangle {
+                width: 310px;
+                background: #0a0b10;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+
+                    // ---- TOCANDO AGORA -------------------------------------
+                    Rectangle {
+                        height: 116px;
+                        background: #12131c;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #1e2438;
+
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 6px;
+
+                            Text {
+                                text: "♪ TOCANDO AGORA";
+                                color: #34d399;
+                                font-size: 12px;
+                                font-weight: 800;
+                            }
+
+                            Text {
+                                text: root.np-active ? root.np-title : "—";
+                                color: root.np-active ? #f8fafc : #475569;
+                                font-size: 16px;
+                                font-weight: 700;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.np-active ? root.np-artist : "Fila vazia";
+                                color: root.np-active ? #94a3b8 : #475569;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.np-video ? "▶ VÍDEO" : "♫ ÁUDIO";
+                                color: root.np-video ? #34d399 : #64748b;
+                                font-size: 11px;
+                                font-weight: 700;
+                            }
+                        }
+                    }
+
+                    // ---- FILA: A SEGUIR ------------------------------------
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: #0d0e14;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #1e2438;
+                        clip: true;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "A SEGUIR  ·  \{root.queue-tracks.length}";
+                                color: #818cf8;
+                                font-size: 12px;
+                                font-weight: 800;
+                            }
+
+                            if root.queue-tracks.length == 0 : Text {
+                                text: "Toque Enter em uma música\npara adicioná-la à fila";
+                                color: #475569;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+
+                            if root.queue-tracks.length > 0 : ListView {
+                                for track[index] in root.queue-tracks : QueueRow {
+                                    index: index;
+                                    track: track;
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- PAINEL PIX ----------------------------------------
+                    Rectangle {
+                        height: 346px;
+                        background: #0d1117;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #164e63;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            Text {
+                                text: "PAGUE COM PIX";
+                                color: #2dd4bf;
+                                font-size: 14px;
+                                font-weight: 800;
+                                horizontal-alignment: center;
+                            }
+
+                            // Moldura do QR (fundo branco p/ contraste máximo)
+                            Rectangle {
+                                width: 248px;
+                                height: 248px;
+                                background: #ffffff;
+                                border-radius: 8px;
+
+                                // Estado: QR pronto
+                                if !root.pix-loading && !root.pix-offline : Image {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 232px;
+                                    height: 232px;
+                                    source: root.pix-qr-image;
+                                    image-fit: ImageFit.contain;
+                                }
+
+                                // Estado: gerando QR (spinner nativo animado)
+                                if root.pix-loading : Rectangle {
+                                    x: 0; y: 0;
+                                    width: parent.width;
+                                    height: parent.height;
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 10px;
+
+                                        Spinner {
+                                            width: 42px;
+                                            height: 42px;
+                                        }
+
+                                        Text {
+                                            text: "GERANDO\nQR CODE...";
+                                            color: #0f766e;
+                                            font-size: 14px;
+                                            font-weight: 800;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                // Estado: sem conexão + botão de retry
+                                if root.pix-offline && !root.pix-loading : Rectangle {
+                                    x: 0; y: 0;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    background: #f8fafc;
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: "SEM CONEXÃO";
+                                            color: #b91c1c;
+                                            font-size: 15px;
+                                            font-weight: 800;
+                                            horizontal-alignment: center;
+                                        }
+
+                                        Text {
+                                            text: root.pix-error-text == ""
+                                                ? "Verifique a internet"
+                                                : root.pix-error-text;
+                                            color: #64748b;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            overflow: elide;
+                                            width: 220px;
+                                        }
+
+                                        retry-button := Rectangle {
+                                            width: 150px;
+                                            height: 34px;
+                                            background: retry-mouse.has-hover ? #0d9488 : #14b8a6;
+                                            border-radius: 8px;
+
+                                            retry-mouse := TouchArea {
+                                                clicked => { root.pix-retry(); }
+                                            }
+
+                                            Text {
+                                                text: "TENTAR NOVAMENTE";
+                                                color: #ffffff;
+                                                font-size: 11px;
+                                                font-weight: 800;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "R$ 2,00 = 1 CRÉDITO";
+                                color: #fbbf24;
+                                font-size: 15px;
+                                font-weight: 800;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: "Aponte a câmera do app\ndo seu banco para o código";
+                                color: #64748b;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Estado vazio: Nenhuma música encontrada (pós-scan)
-        if root.tracks.length == 0 && !root.scanning : Rectangle {
-            vertical-stretch: 1;
-            background: #08080c;
-
-            VerticalLayout {
-                alignment: center;
-                spacing: 12px;
-
-                Text {
-                    text: "Nenhuma música encontrada";
-                    color: #6b7280;
-                    font-size: 20px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: "Coloque arquivos MP3/MP4 em /dados/musicas/";
-                    color: #4b5563;
-                    font-size: 15px;
-                    horizontal-alignment: center;
-                }
-            }
-        }
-
-        // Estado de escaneamento (loading)
-        if root.scanning : Rectangle {
-            vertical-stretch: 1;
-            background: #08080c;
-
-            VerticalLayout {
-                alignment: center;
-                spacing: 16px;
-
-                Text {
-                    text: "♫";
-                    color: #818cf8;
-                    font-size: 48px;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: "Carregando catálogo...";
-                    color: #9ca3af;
-                    font-size: 18px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: "Escaneando arquivos de mídia no disco";
-                    color: #4b5563;
-                    font-size: 14px;
-                    horizontal-alignment: center;
-                }
-            }
-        }
-
-        // Barra de Rodapé: Instrução ao Operador
+        // ------------------------------------------------------------------
+        // Rodapé: instruções do operador
+        // ------------------------------------------------------------------
         Rectangle {
             height: 44px;
             background: #0a0b10;
 
             Text {
-                text: "Pressione 'Z' para inserir crédito  ·  Setas ↑↓ para navegar  ·  Enter para selecionar";
+                text: "'Z' insere crédito   ·   ↑↓ navega   ·   Enter toca   ·   PIX ao lado";
                 color: #4b5563;
                 font-size: 13px;
                 vertical-alignment: center;
                 horizontal-alignment: center;
+            }
+        }
+    }
+
+    // =========================================================================
+    // OVERLAY: Toast flutuante (notificações PIX, erros, fila cheia...)
+    // =========================================================================
+    if root.toast-visible : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 92px;
+        height: 56px;
+        width: toast-text.preferred-width + 56px;
+        border-radius: 14px;
+        background: root.toast-kind == 1 ? #065f46 : (root.toast-kind == 2 ? #7f1d1d : #312e81);
+        drop-shadow-blur: 14px;
+        drop-shadow-color: #00000080;
+        drop-shadow-offset-y: 3px;
+
+        HorizontalLayout {
+            padding-left: 20px;
+            padding-right: 20px;
+            alignment: center;
+
+            toast-text := Text {
+                text: root.toast-message;
+                color: #f8fafc;
+                font-size: 16px;
+                font-weight: 800;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    // =========================================================================
+    // OVERLAY: Sincronização USB (tela cheia — Módulo 4)
+    // =========================================================================
+    if root.usb-overlay-visible : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000e6;
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 520px;
+            height: 400px;
+            background: #0d0e14;
+            border-radius: 16px;
+            border-width: 2px;
+            border-color: root.usb-state == 3 ? #ef4444 : #818cf8;
+
+            VerticalLayout {
+                padding: 32px;
+                spacing: 18px;
+                alignment: start;
+
+                // ---- Estado 1: sincronizando ----
+                if root.usb-state == 1 : VerticalLayout {
+                    spacing: 14px;
+                    alignment: start;
+
+                    Text {
+                        text: "⇅  SINCRONIZANDO MÍDIA";
+                        color: #818cf8;
+                        font-size: 22px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: "\{root.usb-copied} de \{root.usb-total} arquivos";
+                        color: #e5e7eb;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                    }
+
+                    // Barra de progresso
+                    Rectangle {
+                        height: 18px;
+                        border-radius: 9px;
+                        background: #1e293b;
+
+                        Rectangle {
+                            x: 3px;
+                            y: 3px;
+                            height: 12px;
+                            width: max(12px, (parent.width - 6px)
+                                * (root.usb-copied * 100 / max(1, root.usb-total)) / 100);
+                            border-radius: 6px;
+                            background: #6366f1;
+                        }
+                    }
+
+                    Text {
+                        text: root.usb-current-file;
+                        color: #64748b;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        overflow: elide;
+                        width: parent.width - 32px;
+                    }
+
+                    Text {
+                        text: "NÃO REMOVA O PENDRIVE";
+                        color: #fbbf24;
+                        font-size: 14px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                // ---- Estado 2: concluído ----
+                if root.usb-state == 2 : VerticalLayout {
+                    spacing: 14px;
+                    alignment: start;
+
+                    Text {
+                        text: "✓  SINCRONIZAÇÃO CONCLUÍDA";
+                        color: #34d399;
+                        font-size: 22px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: "\{root.usb-copied} arquivos sincronizados";
+                        color: #e5e7eb;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: "\{root.usb-new-tracks} novas faixas no catálogo";
+                        color: #94a3b8;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                    }
+
+                    ok-button := Rectangle {
+                        width: 180px;
+                        height: 44px;
+                        background: ok-mouse.has-hover ? #059669 : #10b981;
+                        border-radius: 10px;
+
+                        ok-mouse := TouchArea {
+                            clicked => { root.usb-close(); }
+                        }
+
+                        Text {
+                            text: "CONCLUIR";
+                            color: #ffffff;
+                            font-size: 14px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // ---- Estado 3: falha ----
+                if root.usb-state == 3 : VerticalLayout {
+                    spacing: 14px;
+                    alignment: start;
+
+                    Text {
+                        text: "✕  FALHA NA SINCRONIZAÇÃO";
+                        color: #f87171;
+                        font-size: 22px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: root.usb-error-text == ""
+                            ? "Erro de leitura ou escrita no disco"
+                            : root.usb-error-text;
+                        color: #94a3b8;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        overflow: elide;
+                        width: parent.width - 32px;
+                    }
+
+                    close-button := Rectangle {
+                        width: 180px;
+                        height: 44px;
+                        background: close-mouse.has-hover ? #b91c1c : #ef4444;
+                        border-radius: 10px;
+
+                        close-mouse := TouchArea {
+                            clicked => { root.usb-close(); }
+                        }
+
+                        Text {
+                            text: "FECHAR";
+                            color: #ffffff;
+                            font-size: 14px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
             }
         }
     }

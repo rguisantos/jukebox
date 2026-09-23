@@ -7,10 +7,21 @@ description = "High-performance embedded Jukebox software optimized for legacy x
 
 [dependencies]
 # GUI Framework
-slint = { version = "1.8", default-features = false, features = ["backend-x11", "renderer-femtovg", "compat-1-2"] }
+# Fixado em 1.8.0 (a partir do 1.9 o suporte a X11 mudou de novo).
+# backend-winit-x11 = backend X11 puro via winit, SEM Wayland (binário menor);
+# o renderer FemtoVG (OpenGL) vem embutido como renderer padrão deste backend.
+# Correção em relação ao Cargo.toml original: os nomes "backend-x11" e
+# "renderer-femtovg" não existem no slint 1.8.0 (eram de versões antigas).
+slint = { version = "=1.8.0", default-features = false, features = ["std", "backend-winit-x11", "renderer-femtovg", "compat-1-2", "raw-window-handle-06"] }
+
+# Acesso ao handle bruto da janela X11 (XID) — necessário para embutir o
+# vídeo do GStreamer na janela do Slint via GstVideoOverlay (Módulo 3).
+# Mesma versão que o slint usa internamente (unificada pelo cargo).
+raw-window-handle = "0.6"
 
 # Asynchronous Runtime (Configurado estritamente para eficiência em Single-Core)
-tokio = { version = "1.40", default-features = false, features = ["rt", "sync", "macros", "time"] }
+# 'net' e 'io-util' são exigidos pelo reqwest (polling PIX) dentro do runtime Tokio.
+tokio = { version = "1.40", default-features = false, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
 
 # Banco de Dados SQLite embutido
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -18,12 +29,35 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Leitor de tags ID3 (metadados de arquivos MP3)
 id3 = "1.14"
 
+# =============================================================================
+# MÓDULO 3 — Player de Mídia (GStreamer)
+# Playbin + xvimagesink (saída de vídeo via XVideo, sem composição OpenGL)
+# + alsasink (áudio direto no ALSA, sem PulseAudio/PipeWire).
+# Versão 0.22 exige GStreamer >= 1.20 (Debian 12 Bookworm roda 1.22).
+# =============================================================================
+gstreamer = "0.22"
+gstreamer-video = "0.22"
+
+# =============================================================================
+# MÓDULO 5 — Integração PIX (QR Code Dinâmico + Polling de Status)
+# reqwest com rustls (TLS puro em Rust): elimina dependência do OpenSSL nativo
+# na máquina legada. Sem features padrão para manter o binário enxuto.
+# =============================================================================
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Geração do QR Code a partir do payload EMV ("PIX Copia e Cola").
+# Sem features padrão: renderizamos os módulos manualmente em buffer RGB,
+# que é convertido em textura via slint::Image::load_from_rgb8().
+qrcode = { version = "0.14", default-features = false }
+
 # Utilitários de Comunicação e Logging
 log = "0.4"
 env_logger = "0.11"
 
 [build-dependencies]
-slint-build = "1.8"
+slint-build = "=1.8.0"
 
 # Otimizações estritas para hardware legado (AMD Sempron 145 / Core 2 Duo)
 [profile.release]
