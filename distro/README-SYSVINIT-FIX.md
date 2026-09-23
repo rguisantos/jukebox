@@ -107,42 +107,18 @@ distro/                                        # raiz do build (lb build roda aq
     ├── archives/
     │   └── 00-block-sysvinit.pref.chroot      # CAMADA 1 — pinagem APT
     ├── package-lists/
-    │   ├── live.list.chroot                   # CAMADA 2a — backend concreto (commitada; ver §2.1)
+    │   ├── 00-init-systemd.list.chroot        # CAMADA 2a — backend concreto
     │   └── 99-remove-sysvinit.list.chroot     # CAMADA 2b — troca ativa
     └── hooks/
         ├── normal/
         │   └── 0091-ensure-live-hooks-run.hook.chroot  # guarda: pré-condição de execução
         └── live/
-            ├── 01-setup-kiosk.hook.chroot             # (existente) setup do kiosk — roda antes da purga
             └── 7000-purge-sysvinit-residue.hook.chroot  # CAMADA 3 — purga + verificação
 ```
 
 Todos os caminhos acima são relativos à **raiz do build** (`distro/`), espelhando
-exatamente a árvore que o `lb config` espera.
-
-### 2.1 Variação aplicada neste repositório (jukebox) — `live.list.chroot` commitada
-
-Neste repo, a Camada 2a usa o **nome canônico** `config/package-lists/live.list.chroot`
-(em vez de um `00-init-systemd.list.chroot`) por um motivo específico do histórico do
-projeto: **o vetor do envenenamento sistemático era exatamente esse arquivo, em estado
-local obsoleto.**
-
-A cadeia do problema (verificada no código do live-build `1:20250505+deb13u1` e no
-`auto/clean` deste repo):
-
-1. o `lb config` **só gera** `live.list.chroot` se ele **não existir** (guarda
-   `if [ ! -e ... ]` em `/usr/lib/live/build/config`);
-2. o `lb clean` / `auto/clean` **nunca** remove `config/package-lists/`;
-3. o `.gitignore` antigo escondia o arquivo (lista gerada) — logo, um `live.list.chroot`
-   da era bookworm/sysvinit (com `live-config-sysvinit` + `sysvinit-core`) sobrevivia a
-   **todos** os rebuilds e injetava o backend errado em toda transação do APT no trixie.
-
-Commitando a versão correta (backend systemd), o build fica determinístico: fresh
-clone produz a mesma árvore, `git status` denuncia qualquer alteração local, e o
-`lb config` respeita o arquivo versionado. Junto disso, o `auto/config` agora declara
-`--initsystem systemd` explicitamente (documenta a intenção do kiosk e protege contra
-mudança de default em versões futuras do live-build) e o `.gitignore` ganhou as
-exceções de versionamento para os arquivos do kit.
+exatamente a árvore que o `lb config` espera — é só copiar por cima (nenhum arquivo
+existente seu é sobrescrito; são todos arquivos novos, com nomes exclusivos do kit).
 
 ---
 
@@ -186,9 +162,6 @@ base normal do sistema (`killall5`, `pidof` etc.).
   satisfeita por um pacote **real** — o resolvedor jamais precisa escolher provedor
   para o virtual. Entradas duplicadas (se `live-boot`/`live-config` já estiverem nos
   seus manifestos) são inofensivas para o APT.
-  *Neste repo, esse papel é exercido pelo `live.list.chroot` commitado (§2.1), com o
-  mesmo conteúdo que o live-build geraria para os defaults do projeto — e a lista
-  `jukebox.list.chroot` já traz `systemd-sysv` explicitamente.*
 - **`99-remove-sysvinit.list.chroot`** — entradas com hífen **final**
   (`live-config-sysvinit-`, `sysvinit-core-`, …). Cada passe do live-build executa
   **um único** `apt-get install` com todos os pacotes de todas as listas (via
@@ -228,23 +201,14 @@ cobrem antes/durante/depois.
 
 ## 4. Como aplicar no seu projeto
 
-**Neste repositório (jukebox):** os arquivos já estão no branch `fix/sysvinit-backend`
-— basta fazer merge/checkout do branch e, na máquina onde os builds falhavam,
-restaurar o estado versionado dos arquivos locais que estavam fora do git:
-
 ```bash
-git checkout main && git merge fix/sysvinit-backend   # ou o merge via PR
-cd distro/
-# remove qualquer resquício local de listas geradas (o live.list.chroot versionado assume):
-git checkout -- config/package-lists/ 2>/dev/null || true
-git clean -fdn config/package-lists/   # -n = simular; confira antes de rodar sem -n
-git clean -fd config/package-lists/    # remove live.list.chroot local obsoleto, se houver
-./tools/audit-sysvinit.sh
-```
+# a partir da raiz do SEU repositório (aquele que contém distro/)
+cp -a download/distro/config/*    distro/config/
+cp -a download/distro/tools       distro/
 
-**Em outro projeto live-build:** copie a árvore do kit (config/ e tools/) por cima
-da raiz do build, dê permissão de execução aos hooks em `config/hooks/{live,normal}/`
-e ao `tools/audit-sysvinit.sh`.
+chmod +x distro/config/hooks/live/7000-purge-sysvinit-residue.hook.chroot
+chmod +x distro/tools/audit-sysvinit.sh
+```
 
 Depois, **audite os seus manifestos existentes** (item 2 do plano — garantir que
 nenhum pacote legado esteja listado direta ou indiretamente):
@@ -326,11 +290,51 @@ dpkg -l live-config-systemd live-config-sysvinit 2>/dev/null
 
 ## 7. Se ainda quebrar (troubleshooting)
 
-1. **`Package 'live-config-sysvinit' has no installation candidate` no meio do
-   build** → algum manifesto seu lista o pacote (ou um pacote de terceiros depende
-   dele sem alternativa). O auditor (item 4) aponta o arquivo; remova a entrada ou
-   ajuste o `.pref` (uma dependência dura sem alternativa não pode ser bloqueada —
-   precisa ser removida da árvore de pacotes).
+1. **`E: Package 'live-config-sysvinit' has no installation candidate` no
+   meio do build** (assinatura típica: o passe *install* conclui e o *live*
+   falha logo em seguida) → **isso é o pin FUNCIONANDO.** A mensagem mudou de
+   `pkgProblemResolver::Resolve generated breaks` (conflito no resolvedor) para
+   `no installation candidate` (pacote bloqueado) — ou seja, a Camada 1 está
+   ativa e o APT se recusa a instalar o backend errado. O problema agora é que
+   **algo ainda PEDE `live-config-sysvinit` explicitamente** na transação — e
+   não são as listas versionadas (verificado por simulação: as listas do kit,
+   com o pin ativo, resolvem limpas). As fontes, em ordem de probabilidade:
+
+   a. **Lista local não-rastreada `config/package-lists/*.list.chroot_live`**
+      — resto dos experimentos com exclude lists. Só o passe *live* lê esse
+      sufixo (o *install* lê `.list.chroot_install`), **por isso o install
+      pass passa e o live falha**. E o `.gitignore` típico do live-build
+      (`distro/config/package-lists/*`) torna o arquivo **invisível ao
+      `git status`** — você não o vê nem depois de mergear o fix.
+   b. **`chroot/root/packages.chroot` stale** — o live-build monta a linha de
+      comando do `apt-get` a partir desse arquivo com **append (`>>`)**, e ele
+      só é removido após um passe **bem-sucedido** (ou com `lb clean
+      --chroot`/`--all`). Após um build falho ele sobrevive, acumula conteúdo
+      de runs anteriores e reinjeta pedidos velhos no próximo build — mesmo
+      que as listas atuais estejam limpas.
+   c. **Chroot sujo (build sem `lb clean --all`)** — o seu log denuncia:
+      se o passe *install* mostra pacotes `is already the newest version` e
+      `0 newly installed`, o chroot não foi reconstruído (num build limpo,
+      o install pass baixa centenas de pacotes). `lb clean` sem flags **não**
+      remove o chroot — só os stagefiles; quem remove é `--chroot`/`--all`
+      (ou o `auto/clean` que faz `rm -rf chroot`).
+
+   Recuperação na máquina que builda:
+
+   ```bash
+   cd distro/
+   sh tools/audit-sysvinit.sh               # blocos [A]/[A2]/[E] apontam o arquivo exato
+   ls -la config/package-lists/             # confira: só devem existir as listas versionadas
+   git clean -fdn config/package-lists/     # -n simula; confira a lista e rode sem -n
+   lb clean --all                           # nuke total: chroot, caches, stagefiles
+   sudo lb build                            # ou ./build_iso.sh (agora roda o pré-voo)
+   ```
+
+   A partir do commit que introduziu o **pré-voo** no `build_iso.sh`, essa
+   auditoria roda automaticamente **antes** do `lb build` (após o clean) — o
+   build aborta em segundos se houver veneno, em vez de falhar depois de
+   minutos de debootstrap.
+
 2. **Hook da Camada 3 não aparece no build.log** → o live-build só executa
    `config/hooks/live/*.chroot` se também existir ao menos um hook em
    `config/hooks/normal/*.chroot` (condição do `chroot_hooks`). O kit já traz o

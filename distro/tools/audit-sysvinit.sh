@@ -17,10 +17,22 @@
 #       includes e arquivos APT do config/ (listas, pref, apt.conf, hooks,
 #       includes.chroot*). Entradas DIRETAS em listas quebram o build quando
 #       combinadas com a pinagem (pacote sem candidato) e precisam sair.
+#       Linhas de comentário são ignoradas (referências históricas ok).
+#   [A2] Enumera TODOS os arquivos de lista em config/package-lists/ (qualquer
+#       sufixo: .list, .list.chroot, .list.chroot_install, .list.chroot_live...)
+#       e marca os não-rastreados pelo git — o .gitignore típico do live-build
+#       (distro/config/package-lists/*) os torna INVISÍVEIS ao git status, e um
+#       *.list.chroot_live obsoleto envenena SÓ o passe "live" (o passe
+#       "install" não o lê — por isso um build pode passar do install e falhar
+#       no live com "no installation candidate").
 #   [B] Presença e conteúdo das 3 camadas do kit de correção
 #       (pref.chroot, listas, hook).
 #   [C] Pré-condição de execução de hooks do live-build: é necessário ao
 #       menos um hook em config/hooks/normal/*.chroot.
+#   [E] chroot/root/packages.chroot (se existir): transação acumulada de
+#       passes anteriores — o live-build usa APPEND (>>) e o arquivo só é
+#       removido após um passe BEM-SUCEDIDO ou com lb clean --chroot/--all.
+#       Um pedido positivo sysvinit aí quebra o próximo build.
 #   [D] Com --chroot: pacotes sysvinit efetivamente instalados no chroot.
 #
 # Saída: relatório no stdout; exit 0 = limpo, exit 1 = achados que exigem
@@ -29,8 +41,12 @@
 
 BAD_PKGS="live-config-sysvinit sysvinit-core initscripts insserv startpar sysv-rc"
 
+# Padrão grep para os nomes completos (usado em [A] e [E])
+PATTERN=$(printf '%s' "${BAD_PKGS}" | tr ' ' '|')
+
 # Arquivos do kit de correção que LEGITIMAMENTE mencionam esses nomes
-WHITELIST="00-block-sysvinit.pref.chroot 00-init-systemd.list.chroot 99-remove-sysvinit.list.chroot 7000-purge-sysvinit-residue.hook.chroot README-SYSVINIT-FIX.md"
+# (kit genérico + variação do repo jukebox)
+WHITELIST="00-block-sysvinit.pref.chroot 00-init-systemd.list.chroot 99-remove-sysvinit.list.chroot 7000-purge-sysvinit-residue.hook.chroot 0091-ensure-live-hooks-run.hook.chroot live.list.chroot 01-setup-kiosk.hook.chroot README-SYSVINIT-FIX.md"
 
 FAILURES=0
 
@@ -78,7 +94,6 @@ say ""
 # ---------------------------------------------------------------------------
 say "[A] Manifestos e configurações — referências à cadeia SysVinit:"
 
-PATTERN=$(printf '%s' "${BAD_PKGS}" | tr ' ' '|')
 FOUND=0
 
 if [ ! -d "${CONFIG_DIR}" ]; then
@@ -113,6 +128,50 @@ EOF
         else
                 ok "nenhuma referência direta nos manifestos (fora o kit de correção)"
         fi
+fi
+say ""
+
+# ---------------------------------------------------------------------------
+# [A2] Enumeração de listas + detecção de não-rastreadas (git)
+# ---------------------------------------------------------------------------
+say "[A2] Arquivos de lista em config/package-lists/ (rastreamento git):"
+PL_DIR="${CONFIG_DIR}/package-lists"
+if [ -d "${PL_DIR}" ]; then
+        # estamos num repo git? (o config/ pode ser usado standalone)
+        IN_GIT=0
+        if command -v git >/dev/null 2>&1 && \
+           git -C "${BUILD_ROOT}" rev-parse --git-dir >/dev/null 2>&1
+        then
+                IN_GIT=1
+        fi
+
+        UNTRACKED=0
+        for LIST_FILE in "${PL_DIR}"/*; do
+                [ -f "${LIST_FILE}" ] || continue
+                LIST_BASE=$(basename -- "${LIST_FILE}")
+                if [ "${IN_GIT}" -eq 1 ]; then
+                        if git -C "${BUILD_ROOT}" ls-files --error-unmatch "config/package-lists/${LIST_BASE}" >/dev/null 2>&1 \
+                           || git -C "${BUILD_ROOT}" ls-files --error-unmatch "distro/config/package-lists/${LIST_BASE}" >/dev/null 2>&1; then
+                                say "  [ rastreado ] ${LIST_BASE}"
+                        else
+                                say "  [NÃO-RASTREADO] ${LIST_BASE}   <== invisível ao git status (gitignore); confira se é intencional"
+                                UNTRACKED=$((UNTRACKED + 1))
+                        fi
+                else
+                        say "  [   lista    ] ${LIST_BASE}"
+                fi
+        done
+
+        if [ "${UNTRACKED}" -gt 0 ]; then
+                warn "${UNTRACKED} lista(s) não-rastreada(s) — o .gitignore do live-build as esconde do git status."
+                say "        Um *.list.chroot_live/leftover envenena SÓ o passe 'live' (o passe 'install'"
+                say "        não o lê) — cenário clássico de: install pass OK + 'no installation candidate'"
+                say "        no live pass. Revise/apague: git clean -fdn config/package-lists/"
+        else
+                [ "${IN_GIT}" -eq 1 ] && ok "todas as listas são rastreadas pelo git (nenhuma oculta)"
+        fi
+else
+        warn "diretório config/package-lists/ não encontrado"
 fi
 say ""
 
@@ -184,6 +243,31 @@ else
         say "        novamente ou restaure os symlinks padrão em config/hooks/normal/."
 fi
 say ""
+
+# ---------------------------------------------------------------------------
+# [E] chroot/root/packages.chroot — transação acumulada (append-only)
+# ---------------------------------------------------------------------------
+PKGS_TX="${BUILD_ROOT}/chroot/root/packages.chroot"
+if [ -f "${PKGS_TX}" ]; then
+        say "[E] chroot/root/packages.chroot existe (transação de passe anterior acumulada por >>):"
+        TX_POISON=$(grep -nw -E "${PATTERN}" "${PKGS_TX}" 2>/dev/null | grep -v -- '-$' || true)
+        if [ -n "${TX_POISON}" ]; then
+                # heredoc (não pipe): while no MESMO shell, para bad() incrementar FAILURES
+                while IFS= read -r TX_LINE; do
+                        [ -n "${TX_LINE}" ] || continue
+                        bad "pedido positivo no arquivo de transação: ${TX_LINE}"
+                done <<EOF
+${TX_POISON}
+EOF
+                say "  Ação: este arquivo sobrevive a runs falhos (só é removido após um passe"
+                say "  bem-sucedido ou com lb clean --chroot/--all). Rode 'lb clean --all' antes"
+                say "  de refazer o build (ou remova o arquivo manualmente)."
+        else
+                warn "arquivo de transação presente mas sem pedidos sysvinit — será reaproveitado"
+                warn "pelo próximo passe (append >>); se o build anterior falhou, rode 'lb clean --all'."
+        fi
+        say ""
+fi
 
 # ---------------------------------------------------------------------------
 # [D] Chroot parcial (opcional, --chroot)

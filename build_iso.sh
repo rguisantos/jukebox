@@ -138,6 +138,24 @@ clean_chroot_mounts
 ${SUDO} lb clean
 clean_chroot_mounts
 
+# --- Pré-voo anti-sysvinit ---------------------------------------------------------------
+# Audita manifestos, listas NÃO-rastreadas (o .gitignore do live-build as
+# esconde do git status — um *.list.chroot_live obsoleto envenena SÓ o passe
+# "live": o install pass passa e o live quebra com "no installation
+# candidate") e restos de builds anteriores (chroot/root/packages.chroot é
+# append-only e sobrevive a runs falhos). Falha ANTES de gastar 10-30 min
+# no lb build. Roda como usuário comum (git precisa das credenciais/owner
+# corretas do repo — root daria "dubious ownership" e pularia a checagem).
+if [[ -f tools/audit-sysvinit.sh ]]; then
+    info "Pré-voo: auditoria anti-sysvinit (tools/audit-sysvinit.sh)…"
+    if ! "${AS_USER[@]}" sh tools/audit-sysvinit.sh ./config; then
+        erro "Pré-voo anti-sysvinit REPROVADO (veja os [FAIL] acima). Corrija os pontos apontados e rode de novo — prosseguir produziria um build quebrado."
+    fi
+    ok "Pré-voo limpo."
+else
+    info "AVISO: tools/audit-sysvinit.sh ausente — pré-voo pulado (branch fix/sysvinit-backend traz o script)."
+fi
+
 info "Rodando lb build (baixa os pacotes oficiais do Debian e monta a ISO;"
 info "na primeira vez leva 10 a 30 min dependendo da conexão)…"
 ${SUDO} lb build
