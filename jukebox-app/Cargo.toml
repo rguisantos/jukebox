@@ -52,6 +52,14 @@ serde_json = "1.0"
 # que é convertido em textura via slint::Image::load_from_rgb8().
 qrcode = { version = "0.14", default-features = false }
 
+# =============================================================================
+# MÓDULO 7 — Capas de álbum (navegação por discos)
+# Decodifica as artes embutidas nos MP3 (frame ID3 APIC) e gera miniaturas
+# 256x256 com cache em /dados/capas. Features mínimas (só jpeg/png, sem
+# rayon/parallel) — a crate já entra no build via slint/femtovg, custo zero.
+# =============================================================================
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 # Utilitários de Comunicação e Logging
 log = "0.4"
 env_logger = "0.11"

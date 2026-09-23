@@ -1,3 +1,12 @@
+//! Modelos de dados e máquina de estados da interface (Módulo 7).
+//!
+//! O catálogo é agrupado em álbuns (`AlbumInfo`), cada um com suas faixas
+//! (`TrackInfo`) — estrutura aninhada que alimenta o carrossel de capas e o
+//! painel de faixas do Slint. A navegação por controles arcade é regida por
+//! `AppState`: uma máquina de estados de foco PURA (nenhum I/O, nenhum canal)
+//! — as teclas entram, ações semânticas (`Action`) saem, e o `main.rs`
+//! executa os efeitos colaterais (banco, player, USB, UI).
+
 /// Informações de uma faixa de mídia indexada no catálogo do Jukebox.
 /// Utilizado como struct intermediária entre o banco de dados e a interface Slint.
 #[derive(Debug, Clone)]
@@ -14,4 +23,340 @@ pub struct TrackInfo {
     pub file_path: String,
     /// Tipo de mídia: "mp3", "mp4", "wav", "wmv", "mpeg"
     pub file_type: String,
+}
+
+/// Um disco do catálogo: agrupamento de faixas por (artista, álbum).
+/// Base da navegação em duas camadas do Módulo 7 — primeiro escolhe-se o
+/// disco no carrossel de capas, depois a faixa dentro dele.
+#[derive(Debug, Clone)]
+pub struct AlbumInfo {
+    /// Chave de agrupamento estável ("artista|álbum") — também indexa as capas
+    pub key: String,
+    /// Título do álbum
+    pub title: String,
+    /// Artista/banda
+    pub artist: String,
+    /// Primeira letra do título (maiúscula) — usada no placeholder da capa
+    /// quando o arquivo não traz arte embutida
+    pub initial: String,
+    /// 0..=5: índice da paleta de cores do placeholder (derivado da chave,
+    /// estável entre reinicializações para a cor nunca "mudar sozinha")
+    pub palette: u32,
+    /// Faixas do disco (já ordenadas por título pela consulta SQL)
+    pub tracks: Vec<TrackInfo>,
+}
+
+/// Miniatura de capa de álbum, já decodificada e redimensionada para RGB
+/// puro — pronta para virar textura do Slint no event loop (o buffer cru
+/// atravessa os canais mpsc porque `slint::Image` não é Send).
+#[derive(Debug, Clone)]
+pub struct CoverArt {
+    /// Pixels RGB intercalados (3 bytes por pixel)
+    pub rgb: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+// =============================================================================
+// MÓDULO 7 — Máquina de estados de foco (controles arcade)
+// -----------------------------------------------------------------------------
+// Mapeamento da controladora "Zero Delay" do gabinete (vista pelo sistema
+// como teclado USB comum — maiúscula ou minúscula, daí a normalização):
+//
+//   E = esquerda (capa anterior)      R = direita (próxima capa)
+//   I = escolhe a capa (abre faixas)  W = cima (sobe lista/menu)
+//   Q = baixo (desce lista/menu)      O = seleciona música (1 crédito)
+//   U = cancela/volta                 P = barra de volume
+//   Z = insere crédito (moedeiro)     X = menu do operador
+//
+// A tecla Z é aceita em QUALQUER estado: moeda inserida com overlay aberto
+// também precisa ser registrada (dinheiro não se recusa).
+// =============================================================================
+
+/// Passo do volume por pressionamento de W/Q dentro do overlay (em %)
+pub const VOLUME_STEP: u32 = 5;
+
+/// Volume máximo exibido na barra (100% = playbin volume 1.0)
+pub const VOLUME_MAX: u32 = 100;
+
+/// Volume padrão na primeira execução (persistido no banco a partir daí)
+pub const VOLUME_DEFAULT: u32 = 70;
+
+/// Total de linhas do menu do operador (IP, total arrecadado, sync USB)
+pub const OPERATOR_MENU_ITEMS: usize = 3;
+
+/// Índice da linha "Forçar Sincronização USB" no menu do operador
+pub const OPERATOR_MENU_SYNC: usize = 2;
+
+/// Estado de foco da interface — uma única fonte de verdade, espelhada
+/// para a propriedade `ui-focus` do Slint (que decide qual camada desenhar).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusState {
+    /// Camada 1 — carrossel de capas (E/R navegam, I abre o disco)
+    BrowsingAlbums,
+    /// Camada 2 — faixas do álbum aberto (W/Q navegam, O toca, U volta)
+    BrowsingTracks,
+    /// Overlay de volume (P abre, W/Q ajustam, U fecha)
+    VolumeControl,
+    /// Overlay do menu do operador (X abre, W/Q navegam, O confirma, U fecha)
+    OperatorMenu,
+}
+
+impl FocusState {
+    /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=3)
+    pub fn as_i32(self) -> i32 {
+        match self {
+            FocusState::BrowsingAlbums => 0,
+            FocusState::BrowsingTracks => 1,
+            FocusState::VolumeControl => 2,
+            FocusState::OperatorMenu => 3,
+        }
+    }
+}
+
+/// Efeitos que a máquina de estados pede ao resto do sistema.
+/// A máquina permanece pura: nenhum canal, banco ou UI é tocado aqui dentro.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Tecla reconhecida, porém sem efeito adicional (ex.: E já na 1ª capa)
+    Noop,
+    /// Moeda/noteiro (tecla Z — aceita em qualquer estado)
+    AddCredit,
+    /// Tecla O numa faixa: débito de 1 crédito + enfileiramento no player
+    PlayTrack(TrackInfo),
+    /// W/Q no overlay de volume: aplicar o novo valor no playbin
+    VolumeChanged(u32),
+    /// U no overlay de volume: aplicar e persistir o volume no banco
+    VolumeClosed(u32),
+    /// X: abrir o menu do operador (IP + total arrecadado + sync USB)
+    OpenOperatorMenu,
+    /// U no menu do operador: fechar (restaurar vídeo se foi ocultado)
+    CloseOperatorMenu,
+    /// O em "Forçar Sincronização USB"
+    ForceSync,
+}
+
+/// Estado global de navegação da interface. Vivem dentro de um
+/// `Arc<Mutex<AppState>>` compartilhado entre os callbacks da UI (thread do
+/// event loop) e as bridges que publicam catálogo/fecham overlays.
+pub struct AppState {
+    /// Estado de foco atual (decide qual camada da UI está ativa)
+    pub focus: FocusState,
+    /// Estado anterior à abertura de um overlay (U volta para ele)
+    pub previous: FocusState,
+    /// Catálogo agrupado por álbum (substituído a cada sincronização)
+    pub albums: Vec<AlbumInfo>,
+    /// Disco selecionado no carrossel
+    pub album_index: usize,
+    /// Faixa selecionada no painel do álbum aberto
+    pub track_index: usize,
+    /// Linha selecionada no menu do operador (0..OPERATOR_MENU_ITEMS)
+    pub menu_index: usize,
+    /// Volume atual (0..=100, persistido no banco ao fechar o overlay)
+    pub volume: u32,
+}
+
+impl AppState {
+    pub fn new(volume: u32) -> Self {
+        Self {
+            focus: FocusState::BrowsingAlbums,
+            previous: FocusState::BrowsingAlbums,
+            albums: Vec::new(),
+            album_index: 0,
+            track_index: 0,
+            menu_index: 0,
+            volume: volume.min(VOLUME_MAX),
+        }
+    }
+
+    /// Álbum atualmente selecionado no carrossel (None se catálogo vazio)
+    pub fn current_album(&self) -> Option<&AlbumInfo> {
+        self.albums.get(self.album_index)
+    }
+
+    /// Número de faixas do álbum aberto (0 se não houver álbum)
+    pub fn track_count(&self) -> usize {
+        self.current_album().map(|a| a.tracks.len()).unwrap_or(0)
+    }
+
+    /// Abre o álbum selecionado (tecla I ou clique na capa).
+    /// Só é possível quando o disco tem ao menos uma faixa.
+    pub fn open_current_album(&mut self) -> bool {
+        if self.track_count() > 0 {
+            self.focus = FocusState::BrowsingTracks;
+            self.track_index = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Substitui o catálogo completo (scanner inicial ou pós-sync USB) e
+    /// reinicia a navegação: os índices antigos podem não existir mais.
+    pub fn replace_catalog(&mut self, albums: Vec<AlbumInfo>) {
+        self.albums = albums;
+        self.album_index = 0;
+        self.track_index = 0;
+        self.focus = FocusState::BrowsingAlbums;
+        self.previous = FocusState::BrowsingAlbums;
+    }
+
+    /// Processa uma tecla crua (case-insensitive: a controladora arcade
+    /// gera maiúsculas ou minúsculas conforme o modo do firmware).
+    ///
+    /// Retorna:
+    ///   - `Some(action)` — tecla consumida pelo estado de foco atual;
+    ///   - `None`         — tecla irrelevante aqui (o evento é rejeitado
+    ///                      e segue para o resto do sistema, se houver).
+    pub fn handle_key(&mut self, raw: &str) -> Option<Action> {
+        let lowered = raw.trim().to_lowercase();
+        let mut chars = lowered.chars();
+        let key = chars.next()?;
+        if chars.next().is_some() {
+            return None; // textos multi-caractere não são teclas arcade
+        }
+
+        // A moeda entra em qualquer estado — nunca recuse dinheiro
+        if key == 'z' {
+            return Some(Action::AddCredit);
+        }
+
+        match self.focus {
+            FocusState::BrowsingAlbums => match key {
+                'e' => {
+                    if !self.albums.is_empty() {
+                        self.album_index = self.album_index.saturating_sub(1);
+                    }
+                    Some(Action::Noop)
+                }
+                'r' => {
+                    if !self.albums.is_empty() {
+                        self.album_index = (self.album_index + 1).min(self.albums.len() - 1);
+                    }
+                    Some(Action::Noop)
+                }
+                'i' => {
+                    self.open_current_album();
+                    Some(Action::Noop)
+                }
+                'p' => {
+                    self.previous = FocusState::BrowsingAlbums;
+                    self.focus = FocusState::VolumeControl;
+                    Some(Action::Noop)
+                }
+                'x' => {
+                    self.previous = FocusState::BrowsingAlbums;
+                    self.focus = FocusState::OperatorMenu;
+                    self.menu_index = 0;
+                    Some(Action::OpenOperatorMenu)
+                }
+                _ => None,
+            },
+
+            FocusState::BrowsingTracks => match key {
+                'w' => {
+                    self.track_index = self.track_index.saturating_sub(1);
+                    Some(Action::Noop)
+                }
+                'q' => {
+                    if self.track_count() > 0 {
+                        self.track_index = (self.track_index + 1).min(self.track_count() - 1);
+                    }
+                    Some(Action::Noop)
+                }
+                'o' => {
+                    let track = self
+                        .current_album()
+                        .and_then(|a| a.tracks.get(self.track_index))
+                        .cloned();
+                    match track {
+                        Some(t) => Some(Action::PlayTrack(t)),
+                        None => Some(Action::Noop),
+                    }
+                }
+                'u' => {
+                    self.focus = FocusState::BrowsingAlbums;
+                    Some(Action::Noop)
+                }
+                'p' => {
+                    self.previous = FocusState::BrowsingTracks;
+                    self.focus = FocusState::VolumeControl;
+                    Some(Action::Noop)
+                }
+                'x' => {
+                    self.previous = FocusState::BrowsingTracks;
+                    self.focus = FocusState::OperatorMenu;
+                    self.menu_index = 0;
+                    Some(Action::OpenOperatorMenu)
+                }
+                _ => None,
+            },
+
+            FocusState::VolumeControl => match key {
+                'w' => {
+                    self.volume = (self.volume + VOLUME_STEP).min(VOLUME_MAX);
+                    Some(Action::VolumeChanged(self.volume))
+                }
+                'q' => {
+                    self.volume = self.volume.saturating_sub(VOLUME_STEP);
+                    Some(Action::VolumeChanged(self.volume))
+                }
+                'u' => {
+                    let volume = self.volume;
+                    self.focus = self.previous;
+                    Some(Action::VolumeClosed(volume))
+                }
+                _ => None,
+            },
+
+            FocusState::OperatorMenu => match key {
+                'w' => {
+                    self.menu_index = self.menu_index.saturating_sub(1);
+                    Some(Action::Noop)
+                }
+                'q' => {
+                    self.menu_index = (self.menu_index + 1).min(OPERATOR_MENU_ITEMS - 1);
+                    Some(Action::Noop)
+                }
+                'o' => {
+                    if self.menu_index == OPERATOR_MENU_SYNC {
+                        let previous = self.previous;
+                        self.focus = previous;
+                        Some(Action::ForceSync)
+                    } else {
+                        // Linhas informativas (IP/total) apenas exibem dados
+                        Some(Action::Noop)
+                    }
+                }
+                'u' => {
+                    self.focus = self.previous;
+                    Some(Action::CloseOperatorMenu)
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Hash FNV-1a 64-bit — determina a cor do placeholder da capa e o nome do
+/// arquivo de cache de capas (estável entre execuções: a capa nunca "muda
+/// de cor" nem é extraída duas vezes do mesmo disco).
+pub fn fnv64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Primeira letra alfanumérica do título (maiúscula) para o placeholder
+/// da capa quando o arquivo não traz arte embutida no ID3.
+pub fn album_initial(title: &str) -> String {
+    title
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .and_then(|c| c.to_uppercase().next())
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".to_string())
 }

@@ -1,5 +1,6 @@
-use crate::state::models::TrackInfo;
+use crate::state::models::{album_initial, fnv64, AlbumInfo, TrackInfo};
 use rusqlite::{params, Connection, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -233,5 +234,99 @@ impl Database {
             .collect();
 
         Ok(tracks)
+    }
+
+    // =========================================================================
+    // MÓDULO 7 — Catálogo agrupado por álbum (navegação por capas)
+    // =========================================================================
+
+    /// Retorna o catálogo inteiro agrupado por (artista, álbum), pronto para
+    /// o carrossel de capas: um `AlbumInfo` por disco, cada um com suas
+    /// faixas ordenadas por título. O agrupamento preserva a ordem da
+    /// consulta (artista → álbum → título), então os discos aparecem no
+    /// carrossel em ordem alfabética de artista.
+    pub fn get_albums(&self) -> Result<Vec<AlbumInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, artist, album, file_path, file_type
+             FROM tracks
+             ORDER BY artist ASC, album ASC, title ASC;",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TrackInfo {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    artist: row.get(2)?,
+                    album: row.get(3)?,
+                    file_path: row.get(4)?,
+                    file_type: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok());
+
+        let mut albums: Vec<AlbumInfo> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+
+        for track in rows {
+            let key = format!("{}|{}", track.artist, track.album);
+
+            match index.get(&key) {
+                // Disco já começado: apenas anexa a faixa (chave idêntica,
+                // mesmo artista/álbum — não há como divergir)
+                Some(&position) => albums[position].tracks.push(track),
+                None => {
+                    let initial = album_initial(&track.album);
+                    let palette = (fnv64(&key) % 6) as u32;
+                    index.insert(key.clone(), albums.len());
+                    albums.push(AlbumInfo {
+                        title: track.album.clone(),
+                        artist: track.artist.clone(),
+                        key,
+                        initial,
+                        palette,
+                        tracks: vec![track],
+                    });
+                }
+            }
+        }
+
+        Ok(albums)
+    }
+
+    // =========================================================================
+    // MÓDULO 7 — Menu do operador e configurações persistentes
+    // =========================================================================
+
+    /// Total de créditos ARRECADADOS na história da máquina: soma de todas
+    /// as entradas positivas da auditoria (moedas + PIX). Débitos por play
+    /// (valores negativos) não entram na conta — é o número do fechamento
+    /// de caixa, exibido no menu do operador (tecla X).
+    pub fn get_total_credits_collected(&self) -> Result<i64> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM credits_audit WHERE amount > 0;",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0))
+    }
+
+    /// Lê um valor inteiro da tabela chave-valor (None se a chave não existe)
+    pub fn get_config_i64(&self, key: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM system_state WHERE key = ?1;")?;
+        let mut rows = stmt.query(params![key])?;
+        Ok(rows.next()?.map(|row| row.get::<_, i64>(0)).transpose()?)
+    }
+
+    /// Grava um valor inteiro na tabela chave-valor (upsert atômico)
+    pub fn set_config_i64(&self, key: &str, value: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO system_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }

@@ -56,6 +56,10 @@ pub enum PlayerCommand {
     RestoreVideo,
     /// Enfileira uma faixa (o débito de crédito já foi feito pela UI/DB)
     Enqueue(TrackInfo),
+    /// MÓDULO 7: ajusta o volume do playbin (0.0–1.0, escala linear de
+    /// amplitude — o main.rs já aplica a curva cúbica de percepção antes
+    /// de enviar). Sobrevive à troca de faixa: o elemento playbin é reutilizado
+    SetVolume(f64),
     /// Para tudo e limpa a fila (reservado ao modo de manutenção)
     #[allow(dead_code)]
     Stop,
@@ -322,6 +326,13 @@ impl Player {
                 self.queue.clear();
                 self.current = None;
                 let _ = self.event_tx.send(PlayerEvent::QueueFinished);
+            }
+            PlayerCommand::SetVolume(volume) => {
+                // Clamp defensivo: a propriedade do playbin aceita > 1.0,
+                // mas amplificar além de 100% distorce em alto-falantes de bar
+                let clamped = volume.clamp(0.0, 1.0);
+                self.playbin.set_property("volume", clamped);
+                log::debug!("Player: volume ajustado para {:.2}.", clamped);
             }
         }
     }

@@ -3,15 +3,26 @@
 //! Mapa das threads (arquitetura de canais mpsc — a UI nunca bloqueia):
 //!
 //!   [UI Slint]  ←invoke_from_event_loop→  bridges de eventos
-//!      │ callbacks (Z / Enter / retry / fechar USB / geometria de vídeo)
+//!      │ arcade-key-pressed (E/R/I/W/Q/O/U/P/Z/X case-insensitive)
 //!      ▼
-//!   [Banco SQLite] — créditos: AddCredit (moedeiro+PIX) e RequestPlay
+//!   [AppState] máquina de estados de foco (Módulo 7, state/models.rs)
+//!      │ Action::* → banco / player / USB
+//!      ▼
+//!   [Banco SQLite] — créditos: AddCredit (moedeiro+PIX), RequestPlay,
+//!      SetVolume (persistente) e QueryCollected (menu do operador)
 //!      │ (débito atômico → Enqueue no player)
 //!      ▼
 //!   [Player GStreamer] — playbin/xvimagesink/alsasink + fila (Módulo 3)
-//!   [USB Sync]         — detecta /media/usb, copia, reescaneia (Módulo 4)
+//!   [USB Sync]         — detecta /media/usb, copia, reescaneia (Módulo 4);
+//!      também executa a "Forçar Sincronização" do menu do operador
+//!   [Capas de Álbum]   — ID3 APIC → miniaturas RGB + cache (Módulo 7)
 //!   [PIX Service]      — Tokio isolado: QR dinâmico + polling (Módulo 5)
-//!   [Scanner]          — indexação inicial do catálogo (Módulo 2)
+//!   [Scanner]          — indexação inicial + agrupamento por álbum (Mód. 2/7)
+//!
+//! A navegação é 100% regida pela máquina de estados em `state/models.rs`:
+//! este arquivo captura as teclas, pede a transição à máquina e espelha o
+//! estado resultante nas propriedades do Slint (`mirror_nav` — o Slint é
+//! renderizador puro, sem lógica de navegação própria).
 
 mod db;
 mod finance;
@@ -20,18 +31,24 @@ mod state;
 
 use db::Database;
 use finance::pix::{PixConfig, PixService, PixUiEvent};
+use media::covers::{self, CoverCommand, CoverEvent};
 use media::player::{self, PlayerCommand, PlayerEvent};
-use media::usb_sync::{self, UsbSyncEvent};
+use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
 use media::scanner;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use state::models::TrackInfo;
+use state::models::{
+    Action, AppState, AlbumInfo, CoverArt, FocusState, TrackInfo, VOLUME_DEFAULT,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 // Carrega as structs geradas a partir do arquivo ui/app_window.slint
 slint::include_modules!();
+
+/// Chave da tabela chave-valor onde o volume persiste entre reinicializações
+const VOLUME_CONFIG_KEY: &str = "volume";
 
 /// Comandos despachados da UI/PIX para a thread do banco de dados.
 /// Único dono da conexão SQLite principal → zero corrida de escrita.
@@ -39,8 +56,12 @@ slint::include_modules!();
 enum DbCommand {
     /// Moeda (tecla Z) ou PIX confirmado: credita
     AddCredit(u32),
-    /// Enter numa faixa: débito atômico de 1 crédito + enfileiramento no player
+    /// Tecla O numa faixa: débito atômico de 1 crédito + enfileiramento
     RequestPlay(TrackData),
+    /// Fechamento do overlay de volume: persiste o valor (Módulo 7)
+    SetVolume(u32),
+    /// Abertura do menu do operador: total arrecadado do banco (Módulo 7)
+    QueryCollected,
 }
 
 /// Geração do toast atual (evita que um timer antigo apague um toast novo)
@@ -64,12 +85,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_credits = db.get_credits().unwrap_or(0);
     log::info!("Créditos persistentes carregados do banco: {}", initial_credits);
 
+    // Volume persistido na tabela chave-valor (Módulo 7): o bar ajusta uma
+    // vez e o valor sobrevive a todos os ciclos de energia da máquina
+    let initial_volume = db
+        .get_config_i64(VOLUME_CONFIG_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v.clamp(0, 100) as u32)
+        .unwrap_or(VOLUME_DEFAULT);
+    log::info!("Volume persistido carregado do banco: {}%", initial_volume);
+
     // =========================================================================
-    // 2. Interface Slint
+    // 2. Interface Slint + máquina de estados de foco (Módulo 7)
     // =========================================================================
     let main_window = MainWindow::new()?;
     main_window.set_credits(initial_credits as i32);
+    main_window.set_volume_value(initial_volume as i32);
     main_window.set_scanning(true);
+
+    // Estado de navegação compartilhado: callbacks da UI (event loop) e
+    // bridges de publicação de catálogo — Arc<Mutex> atravessa as threads.
+    let state_arc: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState::new(initial_volume)));
 
     // =========================================================================
     // 3. Canais de comunicação entre as threads
@@ -77,8 +113,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (db_tx, db_rx) = mpsc::channel::<DbCommand>();
     let (player_cmd_tx, player_cmd_rx) = mpsc::channel::<PlayerCommand>();
     let (player_event_tx, player_event_rx) = mpsc::channel::<PlayerEvent>();
+    let (usb_cmd_tx, usb_cmd_rx) = mpsc::channel::<UsbSyncCommand>();
     let (usb_event_tx, usb_event_rx) = mpsc::channel::<UsbSyncEvent>();
     let (pix_event_tx, pix_event_rx) = mpsc::channel::<PixUiEvent>();
+    let (cover_cmd_tx, cover_cmd_rx) = mpsc::channel::<CoverCommand>();
+    let (cover_event_tx, cover_event_rx) = mpsc::channel::<CoverEvent>();
 
     // =========================================================================
     // 4. Thread do Banco de Dados (único escritor do SQLite principal)
@@ -128,16 +167,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    DbCommand::SetVolume(volume) => {
+                        if let Err(e) = db.set_config_i64(VOLUME_CONFIG_KEY, volume as i64) {
+                            log::error!("Falha ao persistir o volume: {}", e);
+                        }
+                    }
+                    DbCommand::QueryCollected => match db.get_total_credits_collected() {
+                        Ok(total) => {
+                            log::debug!(
+                                "Menu do operador: total arrecadado = {} créditos.",
+                                total
+                            );
+                            let ui_handle = ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_handle.upgrade() {
+                                    ui.set_op_total_collected(total as i32);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Falha ao consultar total arrecadado: {}", e);
+                        }
+                    },
                 }
             }
         });
     }
 
     // =========================================================================
-    // 5. Thread do Scanner inicial (Módulo 2 — conexão SQLite própria em WAL)
+    // 5. Thread do Scanner inicial (Módulo 2 + agrupamento por álbum do 7)
     // =========================================================================
     {
         let ui_handle = main_window.as_weak();
+        let state_arc = state_arc.clone();
+        let cover_tx = cover_cmd_tx.clone();
+
         thread::spawn(move || {
             log::info!("Thread do scanner de mídia iniciada.");
             let mut scanner_db = match Database::open() {
@@ -148,8 +212,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let tracks = scanner::scan_media_directory(&mut scanner_db);
-            publish_catalog(&ui_handle, &tracks);
+            let _ = scanner::scan_media_directory(&mut scanner_db);
+
+            // Catálogo já sai agrupado por (artista, álbum) — pronto para o
+            // carrossel de capas do Módulo 7
+            let albums = match scanner_db.get_albums() {
+                Ok(albums) => albums,
+                Err(err) => {
+                    log::error!("Scanner: falha ao agrupar catálogo por álbum: {}", err);
+                    Vec::new()
+                }
+            };
+
+            publish_albums(&ui_handle, &state_arc, &cover_tx, albums);
         });
     }
 
@@ -157,6 +232,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Player GStreamer (Módulo 3) + bridge de eventos → UI
     // =========================================================================
     player::spawn(player_cmd_rx, player_event_tx);
+
+    // Volume inicial aplicado assim que o player sobe (o playbin mantém o
+    // volume entre faixas — basta definir uma vez)
+    let _ = player_cmd_tx.send(PlayerCommand::SetVolume(volume_to_linear(initial_volume)));
 
     {
         let ui_handle = main_window.as_weak();
@@ -203,13 +282,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // =========================================================================
-    // 7. Sincronização USB (Módulo 4) + bridge de eventos → UI
+    // 7. Sincronização USB (Módulo 4 + ForceSync do 7) + bridge → UI
     // =========================================================================
-    usb_sync::spawn(usb_event_tx);
+    usb_sync::spawn(usb_cmd_rx, usb_event_tx);
 
     {
         let ui_handle = main_window.as_weak();
         let player_tx = player_cmd_tx.clone();
+        let state_arc = state_arc.clone();
+        let cover_tx = cover_cmd_tx.clone();
 
         thread::spawn(move || {
             while let Ok(event) = usb_event_rx.recv() {
@@ -219,6 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // escondê-lo é pré-requisito para o popup ficar visível
                         let _ = player_tx.send(PlayerCommand::HideVideo);
                         let ui_handle = ui_handle.clone();
+                        let state_arc = state_arc.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(ui) = ui_handle.upgrade() {
                                 ui.set_usb_overlay_visible(true);
@@ -226,6 +308,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_usb_total(total as i32);
                                 ui.set_usb_copied(0);
                                 ui.set_usb_new_tracks(0);
+
+                                // A sincronização toma a tela: se o operador
+                                // estava com volume/menu abertos, fecha
+                                let mut st = lock_state(&state_arc);
+                                if st.focus == FocusState::VolumeControl
+                                    || st.focus == FocusState::OperatorMenu
+                                {
+                                    st.focus = FocusState::BrowsingAlbums;
+                                }
+                                mirror_nav(&ui, &st);
                             }
                         });
                     }
@@ -240,16 +332,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    UsbSyncEvent::Finished { copied, skipped, catalog } => {
+                    UsbSyncEvent::Finished { copied, skipped, albums } => {
                         log::info!(
                             "UI: sync USB concluído ({} copiados, {} pulados).",
                             copied,
                             skipped
                         );
 
-                        // Catálogo atualizado no lugar (mesma thread do evento)
-                        let track_count = catalog.len();
-                        publish_catalog(&ui_handle, &catalog);
+                        let track_count = albums.iter().map(|a| a.tracks.len()).sum::<usize>();
+
+                        // Catálogo agrupado atualizado + reset da navegação
+                        publish_albums(&ui_handle, &state_arc, &cover_tx, albums);
 
                         let ui_close = ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -257,7 +350,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_usb_state(2);
                                 ui.set_usb_copied(copied as i32);
                                 ui.set_usb_new_tracks(track_count as i32);
-                                ui.set_selected_index(0);
                             }
                         });
 
@@ -288,14 +380,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
+                    UsbSyncEvent::NoMedia { reason } => {
+                        // "Forçar Sincronização" sem pendrive: só um toast
+                        let ui_handle = ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            show_toast(&ui_handle, &reason, 2);
+                        });
+                    }
                 }
             }
         });
     }
 
     // =========================================================================
-    // 8. Serviço PIX (Módulo 5) + bridge de eventos → UI
+    // 8. Capas de álbum (Módulo 7) + PIX (Módulo 5) — bridges → UI
     // =========================================================================
+    covers::spawn(cover_cmd_rx, cover_event_tx);
+
+    {
+        let ui_handle = main_window.as_weak();
+        thread::spawn(move || {
+            while let Ok(event) = cover_event_rx.recv() {
+                let CoverEvent::Ready { key, art } = event;
+                let ui_handle = ui_handle.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        apply_album_cover(&ui, &key, art);
+                    }
+                });
+            }
+        });
+    }
+
     let pix_service = PixService::start(PixConfig::from_env(), pix_event_tx);
 
     {
@@ -368,35 +484,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // =========================================================================
-    // 9. Callbacks da UI
+    // 9. Callbacks da UI — orquestração da máquina de estados (Módulo 7)
     // =========================================================================
 
-    // Tecla 'Z': pulso do moedeiro/noteiro
+    // ---- Teclado arcade (E/R/I/W/Q/O/U/P/Z/X, case-insensitive) ----
+    // Único ponto de entrada: a máquina de estados decide a transição, este
+    // handler espelha o resultado na UI e despacha os efeitos colaterais.
     {
-        let tx_coin = db_tx.clone();
-        main_window.on_coin_inserted(move || {
-            log::debug!("Evento de moeda/tecla 'Z' detectado pela interface.");
-            if let Err(e) = tx_coin.send(DbCommand::AddCredit(1)) {
-                log::error!("Erro ao enviar comando de moeda para a fila: {}", e);
-            }
+        let ui_handle = main_window.as_weak();
+        let state_arc = state_arc.clone();
+        let db_tx = db_tx.clone();
+        let player_tx = player_cmd_tx.clone();
+        let usb_tx = usb_cmd_tx.clone();
+
+        main_window.on_arcade_key_pressed(move |key: slint::SharedString| -> bool {
+            let Some(ui) = ui_handle.upgrade() else { return false };
+
+            let action = {
+                let mut st = lock_state(&state_arc);
+                st.handle_key(key.as_str())
+            };
+
+            handle_ui_action(&ui, &state_arc, action, &db_tx, &player_tx, &usb_tx)
         });
     }
 
-    // Enter (ou clique/toque): debita e enfileira a faixa selecionada
+    // ---- Clique/toque numa capa do carrossel (equivale à tecla I) ----
     {
         let ui_handle = main_window.as_weak();
-        let tx_play = db_tx.clone();
-        main_window.on_track_activated(move |index| {
-            let ui = match ui_handle.upgrade() {
-                Some(ui) => ui,
-                None => return,
-            };
-            let model = ui.get_tracks();
-            if let Some(track) = model.iter().nth(index as usize) {
-                if let Err(e) = tx_play.send(DbCommand::RequestPlay(track)) {
-                    log::error!("Erro ao enviar faixa para débito: {}", e);
+        let state_arc = state_arc.clone();
+        let db_tx = db_tx.clone();
+        let player_tx = player_cmd_tx.clone();
+        let usb_tx = usb_cmd_tx.clone();
+
+        main_window.on_album_activated(move |index: i32| {
+            let Some(ui) = ui_handle.upgrade() else { return };
+
+            let action = {
+                let mut st = lock_state(&state_arc);
+                if st.focus == FocusState::BrowsingAlbums && !st.albums.is_empty() {
+                    st.album_index = (index.max(0) as usize).min(st.albums.len() - 1);
+                    st.open_current_album();
                 }
-            }
+                Some(Action::Noop)
+            };
+
+            handle_ui_action(&ui, &state_arc, action, &db_tx, &player_tx, &usb_tx);
+        });
+    }
+
+    // ---- Clique/toque numa faixa do álbum aberto (equivale à tecla O) ----
+    {
+        let ui_handle = main_window.as_weak();
+        let state_arc = state_arc.clone();
+        let db_tx = db_tx.clone();
+        let player_tx = player_cmd_tx.clone();
+        let usb_tx = usb_cmd_tx.clone();
+
+        main_window.on_track_activated(move |index: i32| {
+            let Some(ui) = ui_handle.upgrade() else { return };
+
+            let action = {
+                let mut st = lock_state(&state_arc);
+                if st.focus == FocusState::BrowsingTracks && st.track_count() > 0 {
+                    st.track_index = (index.max(0) as usize).min(st.track_count() - 1);
+                    st.current_album()
+                        .and_then(|album| album.tracks.get(st.track_index))
+                        .cloned()
+                        .map(Action::PlayTrack)
+                } else {
+                    None
+                }
+            };
+
+            handle_ui_action(&ui, &state_arc, action, &db_tx, &player_tx, &usb_tx);
         });
     }
 
@@ -481,7 +642,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // =============================================================================
-// Utilidades de UI (executadas dentro do event loop do Slint)
+// MÓDULO 7 — Orquestração da máquina de estados (executada no event loop)
+// =============================================================================
+
+/// Bloqueia o estado compartilhado. À prova de envenenamento: se outra
+/// thread entrar em pânico segurando o lock, recuperamos o conteúdo —
+/// um jukebox de bar não pode travar por causa de um estado inconsistente.
+fn lock_state(state_arc: &Arc<Mutex<AppState>>) -> std::sync::MutexGuard<'_, AppState> {
+    state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Espelha TODO o estado de navegação nas propriedades do Slint.
+/// Chamado após cada tecla/clique processado e a cada publicação de
+/// catálogo — o Slint é renderizador puro dessa única fonte de verdade.
+fn mirror_nav(ui: &MainWindow, st: &AppState) {
+    ui.set_ui_focus(st.focus.as_i32());
+    ui.set_selected_album(st.album_index as i32);
+    ui.set_selected_track(st.track_index as i32);
+    ui.set_volume_value(st.volume as i32);
+    ui.set_op_menu_index(st.menu_index as i32);
+
+    if let Some(album) = st.current_album() {
+        ui.set_current_album_title(album.title.clone().into());
+        ui.set_current_album_artist(album.artist.clone().into());
+        ui.set_current_album_count(album.tracks.len() as i32);
+
+        // Painel de faixas visível: publica as faixas do disco aberto
+        if st.focus == FocusState::BrowsingTracks {
+            let rows: Vec<TrackData> = album.tracks.iter().map(track_info_to_data).collect();
+            ui.set_current_album_tracks(ModelRc::new(VecModel::from(rows)));
+        }
+    } else {
+        ui.set_current_album_title("".into());
+        ui.set_current_album_artist("".into());
+        ui.set_current_album_count(0);
+    }
+}
+
+/// Executa os efeitos de uma ação da máquina de estados e devolve se a
+/// tecla foi consumida (o FocusScope do Slint usa isso para accept/reject).
+fn handle_ui_action(
+    ui: &MainWindow,
+    state_arc: &Arc<Mutex<AppState>>,
+    action: Option<Action>,
+    db_tx: &mpsc::Sender<DbCommand>,
+    player_tx: &mpsc::Sender<PlayerCommand>,
+    usb_tx: &mpsc::Sender<UsbSyncCommand>,
+) -> bool {
+    let Some(action) = action else { return false };
+
+    // Primeiro espelha o estado pós-tecla (uma única fonte de verdade)
+    {
+        let st = lock_state(state_arc);
+        mirror_nav(ui, &st);
+    }
+
+    match action {
+        Action::Noop => {}
+        Action::AddCredit => {
+            log::debug!("Evento de moeda/tecla 'Z' detectado pela interface.");
+            if let Err(e) = db_tx.send(DbCommand::AddCredit(1)) {
+                log::error!("Erro ao enviar comando de moeda para a fila: {}", e);
+            }
+        }
+        Action::PlayTrack(track) => {
+            if let Err(e) = db_tx.send(DbCommand::RequestPlay(track_info_to_data(&track))) {
+                log::error!("Erro ao enviar faixa para débito: {}", e);
+            }
+        }
+        Action::VolumeChanged(volume) => {
+            let _ = player_tx.send(PlayerCommand::SetVolume(volume_to_linear(volume)));
+        }
+        Action::VolumeClosed(volume) => {
+            // Aplica no player e persiste no banco (sobrevive ao reboot)
+            let _ = player_tx.send(PlayerCommand::SetVolume(volume_to_linear(volume)));
+            let _ = db_tx.send(DbCommand::SetVolume(volume));
+        }
+        Action::OpenOperatorMenu => {
+            // IP calculado na hora (dhcp pode mudar entre aberturas do menu)
+            ui.set_op_ip(query_local_ip().into());
+            let _ = db_tx.send(DbCommand::QueryCollected);
+            // O diálogo cobre a área do vídeo XVideo: esconde o vídeo para
+            // o menu ficar visível (mesma regra do overlay USB)
+            let _ = player_tx.send(PlayerCommand::HideVideo);
+        }
+        Action::CloseOperatorMenu => {
+            let _ = player_tx.send(PlayerCommand::RestoreVideo);
+        }
+        Action::ForceSync => {
+            // Restaura o vídeo (o menu fechou); se houver pendrive, o overlay
+            // de sincronização abre em seguida e esconde o vídeo de novo
+            let _ = player_tx.send(PlayerCommand::RestoreVideo);
+            if let Err(e) = usb_tx.send(UsbSyncCommand::ForceSync) {
+                log::error!("Erro ao solicitar sincronização forçada: {}", e);
+            }
+        }
+    }
+
+    true
+}
+
+// =============================================================================
+// Publicação do catálogo e das capas
 // =============================================================================
 
 /// Converte um TrackInfo (banco) em TrackData (modelo Slint)
@@ -496,18 +758,110 @@ fn track_info_to_data(t: &TrackInfo) -> TrackData {
     }
 }
 
-/// Publica o catálogo completo na UI e encerra o estado de escaneamento
-fn publish_catalog(ui_handle: &slint::Weak<MainWindow>, tracks: &[TrackInfo]) {
-    let model: Vec<TrackData> = tracks.iter().map(track_info_to_data).collect();
-    let count = model.len();
+/// Converte um AlbumInfo (banco) em AlbumData (modelo Slint) — estrutura
+/// aninhada: cada álbum carrega seu próprio VecModel de faixas
+fn album_info_to_data(a: &AlbumInfo) -> AlbumData {
+    let tracks: Vec<TrackData> = a.tracks.iter().map(track_info_to_data).collect();
+    AlbumData {
+        key: a.key.clone().into(),
+        title: a.title.clone().into(),
+        artist: a.artist.clone().into(),
+        initial: a.initial.clone().into(),
+        palette: a.palette as i32,
+        has_cover: false,
+        cover: slint::Image::default(),
+        tracks: ModelRc::new(VecModel::from(tracks)),
+    }
+}
+
+/// Publica o catálogo agrupado na UI (thread-safe: agenda no event loop),
+/// reseta a navegação da máquina de estados e dispara a varredura de capas.
+/// Chamada pelo scanner inicial e após cada sincronização USB.
+fn publish_albums(
+    ui_handle: &slint::Weak<MainWindow>,
+    state_arc: &Arc<Mutex<AppState>>,
+    cover_tx: &mpsc::Sender<CoverCommand>,
+    albums: Vec<AlbumInfo>,
+) {
+    let album_count = albums.len();
+    // Cópia para o serviço de capas (o original vai para o estado)
+    let scan_list = albums.clone();
+
     let ui_handle = ui_handle.clone();
+    let state_arc = state_arc.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = ui_handle.upgrade() {
-            ui.set_tracks(ModelRc::new(VecModel::from(model)));
-            ui.set_scanning(false);
-            log::info!("Catálogo carregado na interface: {} faixas.", count);
-        }
+        let Some(ui) = ui_handle.upgrade() else { return };
+
+        let rows: Vec<AlbumData> = {
+            let mut st = lock_state(&state_arc);
+            st.replace_catalog(albums);
+            let rows = st.albums.iter().map(album_info_to_data).collect();
+            // Limpa o painel de faixas do disco anterior
+            ui.set_current_album_tracks(ModelRc::new(VecModel::from(Vec::<TrackData>::new())));
+            mirror_nav(&ui, &st);
+            rows
+        };
+
+        ui.set_albums(ModelRc::new(VecModel::from(rows)));
+        ui.set_scanning(false);
+        log::info!("Catálogo publicado na interface: {} álbuns.", album_count);
     });
+
+    // A fila do event loop preserva a ordem: esta varredura roda DEPOIS da
+    // publicação acima, então capas reemitidas encontram o modelo novo.
+    // (Discos ainda sem capa na memória são extraídos e cacheados em disco.)
+    if let Err(e) = cover_tx.send(CoverCommand::Scan(scan_list)) {
+        log::error!("Falha ao solicitar varredura de capas: {}", e);
+    }
+}
+
+/// Aplica uma capa pronta (RGB cru) na linha do álbum correspondente do
+/// modelo atual da UI. Executada sempre dentro do event loop — a textura
+/// do Slint não pode nascer em outra thread.
+fn apply_album_cover(ui: &MainWindow, key: &str, art: CoverArt) {
+    let model = ui.get_albums();
+    let row_count = model.iter().count();
+
+    for row in 0..row_count {
+        if let Some(mut data) = model.row_data(row) {
+            if data.key.as_str() == key {
+                data.cover = rgb_buffer_to_image(art.rgb, art.width, art.height);
+                data.has_cover = true;
+                if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<AlbumData>>() {
+                    vec_model.set_row_data(row, data);
+                }
+                return;
+            }
+        }
+    }
+    // Álbuns do scan antigo que já saíram do catálogo: ignora silenciosamente
+}
+
+// =============================================================================
+// Utilidades de UI (executadas dentro do event loop do Slint)
+// =============================================================================
+
+/// Converte 0..=100 (barra da UI) para o volume linear do playbin com curva
+/// CÚBICA: a percepção humana de loudness é logarítmica — sem a curva, os
+/// 30% iniciais da barra seriam quase inaudíveis e o resto explodiria.
+fn volume_to_linear(volume: u32) -> f64 {
+    let fraction = (volume.min(100) as f64) / 100.0;
+    fraction * fraction * fraction
+}
+
+/// IP atual da máquina via `hostname -I` (primeiro endereço listado).
+/// Roda no keypress da abertura do menu — alguns milissegundos apenas.
+fn query_local_ip() -> String {
+    match std::process::Command::new("hostname").arg("-I").output() {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            match text.split_whitespace().next() {
+                Some(ip) if !ip.is_empty() => ip.to_string(),
+                _ => "IP indisponível".to_string(),
+            }
+        }
+        _ => "IP indisponível".to_string(),
+    }
 }
 
 /// Aplica um crédito no banco e reflete o novo saldo na UI
@@ -558,7 +912,7 @@ fn show_toast(ui_handle: &slint::Weak<MainWindow>, message: &str, kind: i32) {
     }
 }
 
-/// Converte o buffer RGB do QR Code (Módulo 5) em textura do Slint
+/// Converte um buffer RGB (QR do PIX, capas de álbum) em textura do Slint
 fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slint::Image {
     let mut buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(width, height);
     let pixels = buffer.make_mut_slice();
@@ -590,3 +944,4 @@ fn x11_window_id(window: &slint::Window) -> Option<u64> {
         _ => None,
     }
 }
+

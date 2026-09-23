@@ -15,20 +15,25 @@
 //!      para `/dados/musicas/` (pulando arquivos já existentes — sincronização
 //!      idempotente: reinserir o mesmo pendrive não duplica nada).
 //!   3. Roda o `scanner::scan_media_directory()` para indexar as novidades.
-//!   4. Emite `UsbSyncEvent::Finished` com o catálogo completo atualizado.
+//!   4. Emite `UsbSyncEvent::Finished` com o catálogo agrupado por álbum
+//!      (Módulo 7 — pronto para o carrossel de capas).
 //!   5. Aguarda a REMOÇÃO do pendrive antes de voltar ao estado ocioso,
 //!      para que o mesmo pendrive não dispare uma segunda sincronização.
+//!
+//! O menu do operador (Módulo 7, tecla X) também pode forçar uma passada
+//! completa via `UsbSyncCommand::ForceSync` — mesmo sem detectar pendrive
+//! novo, o catálogo é reescaneado na hora.
 //!
 //! Nenhuma operação bloqueia a thread de interface: todo o progresso é
 //! comunicado via canal mpsc e aplicado com `slint::invoke_from_event_loop`.
 
 use crate::db::Database;
 use crate::media::scanner;
-use crate::state::models::TrackInfo;
+use crate::state::models::AlbumInfo;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -52,36 +57,76 @@ pub enum UsbSyncEvent {
         total: usize,
         current_file: String,
     },
-    /// Sincronização concluída — catálogo completo atualizado no fim
+    /// Sincronização concluída — catálogo agrupado por álbum no fim
+    /// (Módulo 7: a UI recebe os discos prontos para o carrossel de capas)
     Finished {
         copied: usize,
         skipped: usize,
-        catalog: Vec<TrackInfo>,
+        albums: Vec<AlbumInfo>,
     },
     /// Falha de I/O durante a cópia (HD cheio, pendrive removido no meio...)
     Failed { reason: String },
+    /// MÓDULO 7: "Forçar Sincronização" sem pendrive útil inserido —
+    /// a UI mostra um toast; nenhum overlay é aberto
+    NoMedia { reason: String },
+}
+
+/// Comandos enviados PARA o worker de sincronização (Módulo 7)
+pub enum UsbSyncCommand {
+    /// "Forçar Sincronização USB" do menu do operador: dispara uma
+    /// passada completa imediatamente (idempotente — arquivos já
+    /// existentes são pulados, apenas o re-scan do catálogo é custoso)
+    ForceSync,
 }
 
 /// Inicia a thread dedicada de monitoramento/sincronização USB.
-/// Retorna imediatamente; toda a comunicação acontece via `event_tx`.
-pub fn spawn(event_tx: Sender<UsbSyncEvent>) {
+/// Retorna imediatamente; toda a comunicação acontece via canais.
+pub fn spawn(cmd_rx: Receiver<UsbSyncCommand>, event_tx: Sender<UsbSyncEvent>) {
     thread::Builder::new()
         .name("usb-sync".to_string())
         .spawn(move || {
             log::info!("USB Sync: thread de monitoramento de /media/usb iniciada.");
-            run_loop(&event_tx);
+            run_loop(&cmd_rx, &event_tx);
         })
         .expect("Falha crítica ao criar a thread de sincronização USB");
 }
 
-/// Máquina de estados principal: Ocioso → Copiando → Concluído → Aguarda remoção → Ocioso
-fn run_loop(event_tx: &Sender<UsbSyncEvent>) {
+/// Máquina de estados principal:
+/// Ocioso → Copiando → Concluído → Aguarda remoção → Ocioso
+///
+/// Os dois períodos de espera usam `recv_timeout` em vez de `sleep`: o
+/// comando `ForceSync` do menu do operador acorda a thread na hora,
+/// sem esperar o próximo ciclo de polling de 2s.
+fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) {
     loop {
         // ------------------------------------------------------------------
-        // ESTADO 1: OCIOSO — aguarda um pendrive com mídia aparecer
+        // ESTADO 1: OCIOSO — aguarda pendrive OU comando manual do operador
         // ------------------------------------------------------------------
         let files = loop {
-            thread::sleep(POLL_INTERVAL);
+            match cmd_rx.recv_timeout(POLL_INTERVAL) {
+                Ok(UsbSyncCommand::ForceSync) => {
+                    if mount_has_media() {
+                        let files = collect_media_files(Path::new(USB_MOUNT_POINT));
+                        if files.is_empty() {
+                            let _ = event_tx.send(UsbSyncEvent::NoMedia {
+                                reason: "Pendrive sem mídia suportada".to_string(),
+                            });
+                            continue;
+                        }
+                        log::info!(
+                            "USB Sync: sincronização FORÇADA pelo operador ({} arquivos).",
+                            files.len()
+                        );
+                        break files;
+                    }
+                    let _ = event_tx.send(UsbSyncEvent::NoMedia {
+                        reason: "Nenhum pendrive detectado".to_string(),
+                    });
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
 
             if !mount_has_media() {
                 continue;
@@ -151,11 +196,20 @@ fn run_loop(event_tx: &Sender<UsbSyncEvent>) {
             None => {
                 // Reescaneia o diretório com conexão SQLite própria (modo WAL
                 // permite concorrência com as outras threads do sistema)
-                let catalog = match Database::open() {
-                    Ok(mut db) => scanner::scan_media_directory(&mut db),
+                let (track_count, albums) = match Database::open() {
+                    Ok(mut db) => {
+                        let catalog = scanner::scan_media_directory(&mut db);
+                        // MÓDULO 7: catálogo já sai agrupado por álbum,
+                        // pronto para o carrossel de capas
+                        let albums = db.get_albums().unwrap_or_else(|e| {
+                            log::error!("USB Sync: falha ao agrupar catálogo: {}", e);
+                            Vec::new()
+                        });
+                        (catalog.len(), albums)
+                    }
                     Err(e) => {
                         log::error!("USB Sync: falha ao abrir banco pós-cópia: {}", e);
-                        Vec::new()
+                        (0, Vec::new())
                     }
                 };
 
@@ -163,22 +217,32 @@ fn run_loop(event_tx: &Sender<UsbSyncEvent>) {
                     "USB Sync: concluído — {} copiados, {} pulados, catálogo com {} faixas.",
                     copied,
                     skipped,
-                    catalog.len()
+                    track_count
                 );
 
                 let _ = event_tx.send(UsbSyncEvent::Finished {
                     copied,
                     skipped,
-                    catalog,
+                    albums,
                 });
             }
         }
 
         // ------------------------------------------------------------------
-        // ESTADO 4: AGUARDA REMOÇÃO — evita redisparar o mesmo pendrive
+        // ESTADO 4: AGUARDA REMOÇÃO — evita redisparar o mesmo pendrive.
+        // Um comando manual do operador antecipa a saída (o disco ainda
+        // está inserido: a próxima passada é idempotente e apenas re-synca).
         // ------------------------------------------------------------------
-        while mount_has_media() {
-            thread::sleep(POLL_INTERVAL);
+        loop {
+            match cmd_rx.recv_timeout(POLL_INTERVAL) {
+                Ok(UsbSyncCommand::ForceSync) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+
+            if !mount_has_media() {
+                break;
+            }
         }
         log::info!("USB Sync: pendrive removido. Monitoramento ocioso novamente.");
     }
