@@ -1,0 +1,33 @@
+# =============================================================================
+# Backend live-config FIXADO em Systemd (Debian 13 "Trixie")
+# =============================================================================
+# ESTE ARQUIVO É VERSIONADO DE PROPÓSITO — não delete, não adicione ao
+# .gitignore.
+#
+# POR QUÊ: o `lb config` só GERA este arquivo se ele não existir
+# (guarda `if [ ! -e live.list.chroot ]` no /usr/lib/live/build/config), e o
+# `lb clean`/auto/clean NUNCA o remove. Como ele ficava fora do git, um
+# resquício local da era bookworm/sysvinit (com live-config-sysvinit +
+# sysvinit-core) sobrevivia a todos os rebuilds e envenenava sistematicamente
+# o resolvedor do APT no trixie:
+#
+#     E: pkgProblemResolver::Resolve generated breaks
+#     (live-config-sysvinit -> sysvinit-core  X  systemd-sysv da base)
+#
+# Commitando a versão correta, o backend deixa de depender do estado local
+# da máquina de quem builda: fresh clone = build determinístico.
+#
+# CONTEÚDO: exatamente o que o live-build trixie (1:20250505+deb13u1) geraria
+# para LB_INITRAMFS=live-boot (padrão) + LB_INITSYSTEM=systemd (agora
+# explícito no auto/config). Corrobora com:
+#   - config/archives/00-block-sysvinit.pref.chroot  (pinagem: backend
+#     sysvinit sem candidato para o APT);
+#   - config/package-lists/99-remove-sysvinit.list.chroot (remoção ativa);
+#   - config/hooks/live/7000-purge-sysvinit-residue.hook.chroot (purga +
+#     verificação final).
+# =============================================================================
+
+live-boot
+live-config
+live-config-systemd
+systemd-sysv

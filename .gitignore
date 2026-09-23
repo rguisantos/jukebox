@@ -28,15 +28,27 @@ distro/config/chroot
 
 # Hooks de exemplo symlinkados pelo lb config (config/hooks/normal/ e os
 # *.hook.chroot de sistema em config/hooks/live/) + cópia legada que o
-# build_iso.sh gera em config/hooks/01-setup-kiosk.chroot
-distro/config/hooks/normal/
+# build_iso.sh gera em config/hooks/01-setup-kiosk.chroot.
+# Exceções versionadas (kit anti-sysvinit): guarda 0091 em hooks/normal/
+# (pré-condição de execução do chroot_hooks) e purga 7000 em hooks/live/.
+# NOTA: "hooks/normal/*" (e não "hooks/normal/") é obrigatório para que a
+# negação abaixo funcione — git não re-inclui arquivo sob diretório excluído.
+distro/config/hooks/normal/*
+!distro/config/hooks/normal/0091-ensure-live-hooks-run.hook.chroot
 distro/config/hooks/live/*
 !distro/config/hooks/live/01-setup-kiosk.hook.chroot
+!distro/config/hooks/live/7000-purge-sysvinit-residue.hook.chroot
 distro/config/hooks/*.chroot
 
-# Lista de pacotes do live gerada pelo lb config
+# Listas de pacotes: as geradas pelo lb config ficam fora do git, EXCETO
+# a live.list.chroot (backend live-config FIXADO em systemd — commitada de
+# propósito: o lb config só gera esse arquivo se ele NÃO existir, e um
+# resquício local obsoleto da era bookworm/sysvinit envenenava todos os
+# builds do trixie) e a lista de remoção ativa do kit anti-sysvinit.
 distro/config/package-lists/*
 !distro/config/package-lists/jukebox.list.chroot
+!distro/config/package-lists/live.list.chroot
+!distro/config/package-lists/99-remove-sysvinit.list.chroot
 
 # Binário do app embutido na ISO (copiado pelo build_iso.sh a cada build)
 distro/config/includes.chroot/opt/jukebox/jukebox-app

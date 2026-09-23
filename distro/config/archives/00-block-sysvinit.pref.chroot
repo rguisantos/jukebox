@@ -1,0 +1,71 @@
+# =============================================================================
+# CAMADA 1 — Bloqueio APT do backend SysVinit legado (Debian 13 "Trixie")
+# =============================================================================
+# Corrige a falha do resolvedor do APT durante o `lb build`
+# (lb chroot install-packages):
+#
+#     E: Error, pkgProblemResolver::Resolve generated breaks,
+#        this may be caused by held packages.
+#
+# CADEIA DO PROBLEMA (verificada nos metadados reais do repositório trixie):
+#
+#   live-config 11.0.5  Depends: live-config-systemd | live-config-backend
+#   live-config-sysvinit  Provides: live-config-backend
+#   live-config-sysvinit  Depends: sysvinit-core | sysvinit (<< 2.88dsf-44)
+#                        (a 2a alternativa não existe no trixie)
+#   sysvinit-core 3.14-4  Conflicts: systemd-sysv
+#   systemd-sysv 257.13   Priority: important (já presente no sistema base
+#                         instalado pelo debootstrap — exigido pelo autologin
+#                         do TTY1 e pelo watchdog do kiosk)
+#
+# Quando o resolvedor do APT (solver 3.0 do trixie) satisfaz a dependência
+# do live-config pela alternativa VIRTUAL (live-config-backend), ele pode
+# selecionar live-config-sysvinit como provedor, arrastar sysvinit-core e
+# quebrar contra o systemd-sysv — decisão contraditória insolúvel.
+#
+# COMO ESTE ARQUIVO CORRIGE:
+# Pin-Priority -1 remove live-config-sysvinit e toda a cadeia sysvinit do
+# conjunto de candidatos. Sem candidato, o APT jamais os seleciona — nem
+# como pedido direto, nem como provedor do pacote virtual, nem por
+# Recommends. A dependência do live-config passa a ser satisfeita pela
+# alternativa concreta live-config-systemd (que também entra explicitamente
+# na lista 00-init-systemd.list.chroot).
+#
+# ONDE E QUANDO ESTE ARQUIVO ATUA (live-build 1:20250505+deb13u1):
+#   - Copiado para chroot/etc/apt/preferences.d/00-block-sysvinit.pref pelo
+#     `lb chroot_prep install all mode-archives-chroot`, que roda ANTES de
+#     qualquer instalação de pacote do estágio chroot — inclusive antes do
+#     dist-upgrade interno e dos passes "install" e "live" do
+#     chroot_install-packages. É o "bloqueio na raiz" antes da instalação
+#     dos pacotes do usuário.
+#   - O estágio bootstrap (debootstrap puro) não usa APT e não instala
+#     live-config (Priority: optional) — não há o que bloquear ali; o
+#     systemd-sysv (Priority: important) já entra pela base.
+#   - Sufixo .pref.chroot => o arquivo É REMOVIDO da imagem final ao fim do
+#     estágio chroot (existe apenas durante o build).
+#     HARDENING OPCIONAL: para manter o bloqueio também no kiosk em
+#     produção (impedir que alguém instale sysvinit e quebre o boot),
+#     renomeie para 00-block-sysvinit.pref (sem sufixo) — nesse caso o
+#     live-build o mantém dentro da ISO final.
+#
+# NÃO BLOQUEAR "sysvinit-utils": não conflita com systemd-sysv e faz parte
+# da base normal do sistema (killall5, pidof etc.).
+# =============================================================================
+
+# Causa raiz: backend errado do live-config
+Package: live-config-sysvinit
+Pin: release *
+Pin-Priority: -1
+
+# Cadeia SysVinit legada (arrastada pelo backend acima)
+Package: sysvinit-core initscripts insserv startpar sysv-rc
+Pin: release *
+Pin-Priority: -1
+
+# Hardening opcional: alternativas legadas de init que também conflitam
+# com systemd-sysv no trixie (Conflicts declarado pelo próprio systemd-sysv).
+# Se algum pacote do seu kiosk realmente exigir um deles (improvável),
+# remova o nome desta estrofe.
+Package: file-rc systemd-shim orphan-sysvinit-scripts
+Pin: release *
+Pin-Priority: -1
