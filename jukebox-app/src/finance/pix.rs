@@ -26,9 +26,16 @@
 //!     em uma std::thread própria — o runtime de single-core do Sempron
 //!     não paga o preço de um pool multi-thread.
 //!
-//! Configuração por variáveis de ambiente (definidas no .xinitrc da distro):
-//!   - `PIX_API_URL`    — base da API  (padrão: https://meu-backend.com)
-//!   - `PIX_MAQUINA_ID` — ID da máquina (padrão: JUKEBOX-001)
+//! Configuração por variáveis de ambiente — arquivo persistente
+//! `/dados/jukebox.env`, carregado e exportado pelo launcher.sh (Módulo 6).
+//! Editar o arquivo e reiniciar a máquina reconfigura o PIX sem rebuild:
+//!   - `JUKEBOX_PIX_API`    — backend: aceita tanto a origem
+//!                            (`https://host`) quanto o caminho completo
+//!                            (`https://host/api/pix`)  [fallback: PIX_API_URL]
+//!   - `JUKEBOX_MACHINE_ID` — ID da máquina no backend  [fallback: PIX_MAQUINA_ID]
+//!   - `JUKEBOX_PIX_DEMO`   — `1` ativa o modo demo: QR simulado + pagamento
+//!                            confirmado sem backend (testes/treinamento)
+//!   - `RUST_LOG`           — nível de log do app (padrão: info)
 
 use serde::Deserialize;
 use std::sync::mpsc::Sender;
@@ -52,6 +59,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Espera entre tentativas de gerar novo QR quando o backend está fora
 const QR_RETRY_DELAY: Duration = Duration::from_secs(15);
+
+/// Modo demo: tempo até o pagamento "ser confirmado" (dá tempo do operador
+/// ver o QR na tela e conferir o fluxo completo de crédito + Toast)
+const DEMO_PAY_DELAY: Duration = Duration::from_secs(15);
 
 /// Timeout total de cada requisição HTTP (rede de bar é lenta, mas o usuário
 /// não pode esperar mais que isso pela responsividade do sistema)
@@ -112,9 +123,10 @@ impl PixService {
             .name("pix-service".to_string())
             .spawn(move || {
                 log::info!(
-                    "PIX: serviço iniciado — API: {} | Máquina: {}",
+                    "PIX: serviço iniciado — API: {} | Máquina: {} | Demo: {}",
                     config.api_base,
-                    config.machine_id
+                    config.machine_id,
+                    if config.demo { "SIM" } else { "não" }
                 );
 
                 // Runtime de thread única: econômico para o Sempron 145.
@@ -151,26 +163,60 @@ impl PixService {
 }
 
 /// Configuração do serviço PIX, resolvida a partir do ambiente
+/// (variáveis `JUKEBOX_*` do /dados/jukebox.env, com fallback para os
+/// nomes antigos `PIX_*` usados até o Módulo 5)
 #[derive(Debug, Clone)]
 pub struct PixConfig {
+    /// Base do backend. Aceita `https://host` ou `https://host/api/pix`.
     pub api_base: String,
     pub machine_id: String,
+    /// true = modo demo (JUKEBOX_PIX_DEMO=1): sem rede, pagamento simulado
+    pub demo: bool,
+}
+
+/// Primeira variável de ambiente não-vazia entre as informadas
+fn env_non_empty(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 impl PixConfig {
     pub fn from_env() -> Self {
-        Self {
-            api_base: std::env::var("PIX_API_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
-                .trim_end_matches('/')
-                .to_string(),
-            machine_id: std::env::var("PIX_MAQUINA_ID")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_MACHINE_ID.to_string()),
-        }
+        let api_base = env_non_empty(&["JUKEBOX_PIX_API", "PIX_API_URL"])
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
+            .trim_end_matches('/')
+            .to_string();
+
+        let machine_id = env_non_empty(&["JUKEBOX_MACHINE_ID", "PIX_MAQUINA_ID"])
+            .unwrap_or_else(|| DEFAULT_MACHINE_ID.to_string());
+
+        // "1" / "true" / "yes" / "on" / "sim" ligam o modo demo
+        let demo = env_non_empty(&["JUKEBOX_PIX_DEMO"])
+            .map(|v| {
+                matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "sim"
+                )
+            })
+            .unwrap_or(false);
+
+        Self { api_base, machine_id, demo }
+    }
+}
+
+/// Monta a URL de um endpoint do backend. Aceita bases nos dois formatos
+/// que o operador pode ter escrito no /dados/jukebox.env:
+///   `https://host`           → `https://host/api/pix/{path}`
+///   `https://host/api/pix`   → `https://host/api/pix/{path}` (sem duplicar)
+fn pix_endpoint(base: &str, path: &str) -> String {
+    if base.to_ascii_lowercase().ends_with("/api/pix") {
+        format!("{}/{}", base, path)
+    } else {
+        format!("{}/api/pix/{}", base, path)
     }
 }
 
@@ -183,6 +229,13 @@ async fn pix_main_loop(
     event_tx: Sender<PixUiEvent>,
     mut cmd_rx: Receiver<PixCommand>,
 ) {
+    // MODO DEMO (JUKEBOX_PIX_DEMO=1): fluxo completo sem backend —
+    // QR simulado, pagamento confirmado após DEMO_PAY_DELAY.
+    if config.demo {
+        demo_main_loop(&config, event_tx, cmd_rx).await;
+        return;
+    }
+
     // Cliente HTTP compartilhado por todas as requisições (pool de conexões
     // embutido). Se a construção falhar (sistema exausto), cai no retry.
     let client = loop {
@@ -298,6 +351,70 @@ async fn pix_main_loop(
     }
 }
 
+// =============================================================================
+// MODO DEMO — fluxo completo de venda sem backend (JUKEBOX_PIX_DEMO=1)
+// =============================================================================
+
+/// Simula o ciclo de vida inteiro de um pagamento: gera um QR local com um
+/// "payload" textual (claramente marcado como DEMO para ninguém tentar
+/// pagar), espera DEMO_PAY_DELAY e confirma o crédito. Ideal para testar a
+/// máquina no bar antes de plugar o backend de verdade.
+async fn demo_main_loop(
+    config: &PixConfig,
+    event_tx: Sender<PixUiEvent>,
+    mut cmd_rx: Receiver<PixCommand>,
+) {
+    log::warn!("PIX: MODO DEMO ativo — pagamentos são SIMULADOS (nenhuma cobrança real!)");
+
+    let mut seq: u64 = 0;
+    loop {
+        seq += 1;
+        let txid = format!("DEMO-{:04}", seq);
+        let payload = format!(
+            "PIX-MODO-DEMO | maquina={} | txid={} | R$ {:.2} | \
+             PAGAMENTO SIMULADO — NAO PAGAR",
+            config.machine_id, txid, VALOR_PIX
+        );
+
+        let _ = event_tx.send(PixUiEvent::Loading);
+
+        match render_qr_to_rgb(&payload) {
+            Some((rgb, width, height)) => {
+                log::info!("PIX [DEMO]: QR simulado pronto (txid={}).", txid);
+                let _ = event_tx.send(PixUiEvent::QrReady {
+                    rgb,
+                    width,
+                    height,
+                    copia_cola: payload,
+                });
+            }
+            None => {
+                // String curta: praticamente impossível; segura e tenta de novo
+                tokio::time::sleep(QR_RETRY_DELAY).await;
+                continue;
+            }
+        }
+
+        // Espera o "pagamento" — ou um refresh manual da UI, o que vier 1º
+        tokio::select! {
+            _ = tokio::time::sleep(DEMO_PAY_DELAY) => {
+                log::warn!(
+                    "PIX [DEMO]: pagamento SIMULADO confirmado (txid={}) — creditando {} crédito(s).",
+                    txid,
+                    CREDITOS_POR_PIX
+                );
+                let _ = event_tx.send(PixUiEvent::Paid {
+                    credits: CREDITOS_POR_PIX,
+                });
+            }
+            cmd = cmd_rx.recv() => match cmd {
+                Some(PixCommand::RefreshQr) => continue,
+                None => return,
+            }
+        }
+    }
+}
+
 /// Cliente reqwest com rustls (TLS 100% Rust — sem OpenSSL na máquina legada)
 fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
@@ -359,7 +476,7 @@ enum PixStatus {
 
 /// POST /api/pix/gerar — solicita um QR Code dinâmico para esta máquina.
 async fn fetch_qr_code(client: &reqwest::Client, config: &PixConfig) -> Result<QrInfo, String> {
-    let url = format!("{}/api/pix/gerar", config.api_base);
+    let url = pix_endpoint(&config.api_base, "gerar");
 
     let resp = client
         .post(&url)
@@ -394,10 +511,11 @@ async fn fetch_qr_code(client: &reqwest::Client, config: &PixConfig) -> Result<Q
         .or_else(|| extract_txid_from_emv(&payload))
         .ok_or_else(|| "txid ausente na resposta".to_string())?;
 
+    // Caminho relativo à base do PIX (resolvido por pix_endpoint em check_status)
     let status_path = data
         .status_url
         .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| format!("/api/pix/status/{}", txid));
+        .unwrap_or_else(|| format!("status/{}", txid));
 
     Ok(QrInfo {
         payload,
@@ -413,9 +531,19 @@ async fn check_status(
     qr: &QrInfo,
 ) -> Result<PixStatus, String> {
     let url = if qr.status_path.starts_with("http") {
+        // URL absoluta devolvida pelo próprio backend
         qr.status_path.clone()
+    } else if qr.status_path.starts_with('/') {
+        // Caminho absoluto a partir da ORIGEM (ex.: "/api/pix/status/x") —
+        // evita duplicar "/api/pix" quando a base já contém o caminho
+        let origin = config
+            .api_base
+            .splitn(2, "/api/")
+            .next()
+            .unwrap_or(&config.api_base);
+        format!("{}{}", origin, qr.status_path)
     } else {
-        format!("{}{}", config.api_base, qr.status_path)
+        pix_endpoint(&config.api_base, &qr.status_path)
     };
 
     let resp = client

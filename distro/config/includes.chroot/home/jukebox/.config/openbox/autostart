@@ -1,10 +1,15 @@
-# Oculta o cursor do mouse se ocioso por 1 segundo
-unclutter -idle 1 -root &
+# ==============================================================================
+# JUKEBOX OS — MÓDULO 6: Autostart da sessão Openbox (kiosk)
+# ------------------------------------------------------------------------------
+# Executado pelo openbox-session quando a sessão X sobe. Desliga qualquer
+# economia de energia do monitor (máquina de bar fica ligada o dia inteiro)
+# e sobe o watchdog que mantém o Jukebox sempre na tela.
+# ==============================================================================
 
-# Verificação e inicialização do binário da Jukebox em Rust
-if [ -x "/dados/jukebox_app" ]; then
-    /dados/jukebox_app &
-elif [ -x "/usr/local/bin/jukebox-install-to-disk.sh" ] && [ -f "/run/live/medium/live/filesystem.squashfs" ]; then
-    # Se estiver rodando do pendrive Live, abre o instalador no terminal
-    xterm -fullscreen -bg black -fg green -e /usr/local/bin/jukebox-install-to-disk.sh || true
-fi
+# Desativa descanso de tela, DPMS (economia de energia) e tela preta
+xset s off
+xset -dpms
+xset s noblank
+
+# Inicia o Watchdog do Jukebox em background
+/home/jukebox/launcher.sh &

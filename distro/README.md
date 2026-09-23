@@ -63,6 +63,44 @@ sudo dd if=jukebox-os-bookworm-amd64.hybrid.iso of=/dev/sdX bs=4M status=progres
 
 ---
 
+## Cadeia de Boot do Appliance (Módulo 6) e Auto-Recuperação
+
+```
+getty@tty1 (autologin jukebox)
+  └─ .bash_profile ─── tty1 sem X? → exec startx -- vt1 -keeptty -nocursor
+       └─ .xinitrc ─── logs em /dados/logs/xsession.log → exec openbox-session
+            └─ ~/.config/openbox/autostart ─── xset (sem DPMS/tela preta)
+                 └─ launcher.sh (watchdog, loop infinito)
+                      └─ jukebox-app ── crash? reinicia em 3s
+```
+
+- **App crasha** → `launcher.sh` sobe o Jukebox de novo em 3 segundos.
+- **Servidor X cai** → `startx` termina, o `getty` respawna e a sessão inteira é reconstruída.
+- **Kernel congela** → hardware watchdog reinicia a máquina.
+- **Cursor do mouse** → oculto pelo próprio Xorg (`-nocursor`), sem software extra.
+
+## Configuração por Máquina: /dados/jukebox.env
+
+As chaves do PIX e o ID da máquina moram na partição gravável — configurar
+uma máquina nova é editar um arquivo e reiniciar:
+
+```bash
+sudo nano /dados/jukebox.env
+```
+
+```ini
+JUKEBOX_PIX_API=https://meu-backend.com/api/pix
+JUKEBOX_MACHINE_ID=JBOX-001
+JUKEBOX_PIX_DEMO=0    # 1 = QR + pagamento simulados, sem backend
+RUST_LOG=info
+```
+
+Na primeira inicialização o `launcher.sh` cria o arquivo a partir do template
+somente-leitura `/etc/jukebox/jukebox.env`. Com o `overlayroot` ativo, este é
+o único ponto de configuração que sobrevive entre reinicializações.
+
+---
+
 ## Como Fazer Manutenção no Sistema Blindado
 
 Como o sistema de arquivos raiz (`/`) opera protegido pelo `overlayroot`, qualquer alteração feita no sistema tradicional é descartada ao reiniciar.

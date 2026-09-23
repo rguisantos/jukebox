@@ -22,9 +22,10 @@ xserver-xorg-input-libinput
 xinit
 x11-xserver-utils
 
-# Gerenciador de Janelas Ultra-Leve e Utilitários de Kiosk
+# Gerenciador de Janelas Ultra-Leve para o Kiosk
+# (cursor do mouse escondido pelo próprio Xorg: startx -- -nocursor,
+#  Módulo 6 — sem necessidade de unclutter)
 openbox
-unclutter
 # xmessage: caixa de erro textual quando o binário do app não é encontrado
 x11-utils
 

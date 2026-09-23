@@ -1,59 +1,40 @@
 # ==============================================================================
-# JUKEBOX OS — Sessão X11 do kiosk (executada pelo startx via .profile)
+# JUKEBOX OS — MÓDULO 6: Sessão X11 mínima do kiosk
 # ------------------------------------------------------------------------------
-# Fluxo de boot da máquina:
-#   getty@tty1 (autologin jukebox) -> bash login shell -> .profile -> startx
-#   -> este .xinitrc -> openbox + jukebox-app em tela cheia
+# Novo fluxo de boot (cadeia completa de recuperação de falhas):
+#
+#   getty@tty1 (autologin) → .bash_profile → startx (-nocursor)
+#     → este .xinitrc → openbox-session
+#       → ~/.config/openbox/autostart  (xset + watchdog)
+#         → launcher.sh → loop infinito { jukebox-app; sleep 3 }
+#
+#   - App crasha  → launcher reinicia em 3s
+#   - X crasha    → startx sai → getty respawna → sessão inteira refaz
+#   - Kernel hang → watchdog de hardware reinicia a máquina
 # ==============================================================================
 
-# Desativa descanso de tela e economia de energia (tela sempre ativa)
-xset -dpms
-xset s off
-xset s noblank
+# --- Logs de campo em /dados (partição gravável, sobrevive ao reboot) ---------
+# Tudo que roda abaixo daqui (openbox, launcher, jukebox-app) herda este
+# redirecionamento — um único arquivo para depurar a máquina no bar.
+mkdir -p /dados/logs 2>/dev/null || true
+LOG="/dados/logs/xsession.log"
+if [ -d /dados/logs ]; then
+    # Impede crescimento infinito em máquina ligada 24/7: se o log da sessão
+    # anterior passou de 5 MB, recomeça do zero.
+    if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+        : > "$LOG"
+    fi
+    exec >> "$LOG" 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] === Sessão X11 do Jukebox OS iniciada ==="
+fi
 
-# Redireciona logs da sessão para depuração em campo (tty2 / arquivo)
-exec >> /dados/logs/xsession.log 2>&1
-
-# --- GPU legada -----------------------------------------------------------------
+# --- GPU legada ----------------------------------------------------------------
 # Placas GMA 3150 / Radeon HD onboard expõem GL 2.0 clássico do Mesa, que é
 # o suficiente para o renderer FemtoVG do Slint com aceleração de hardware.
 # Se uma máquina específica exibir tela preta (GL quebrado), entre em modo
-# de manutenção (sudo jukebox-maintenance) e descomente a linha abaixo:
+# de manutenção (sudo jukebox-maintenance), edite este arquivo e descomente:
 # export LIBGL_ALWAYS_SOFTWARE=1
 
-# --- Configuração do serviço PIX (Módulo 5) ------------------------------------
-# Backend na nuvem que gera o QR Code dinâmico e responde o polling de status
-export PIX_API_URL="https://meu-backend.com"
-# Identificador único desta máquina no backend (troque por máquina!)
-export PIX_MAQUINA_ID="JUKEBOX-001"
-
-# --- Ambiente gráfico mínimo ----------------------------------------------------
-# Esconde o cursor do mouse após 3s de inatividade (tela é navegada por teclado)
-unclutter -idle 3 -root &
-
-# Gerenciador de janelas ultraleve: garante foco e decoração zero para a
-# janela do jukebox (obrigatório para o overlay de vídeo do GStreamer
-# receber eventos de exposição corretamente)
-openbox &
-
-# Aguarda o Xorg assentar antes de subir o app (evita race no boot)
-sleep 1
-
-# --- Localiza o binário do jukebox ---------------------------------------------
-APP=""
-for CANDIDATE in /opt/jukebox/jukebox-app /usr/local/bin/jukebox-app ./jukebox-app; do
-    if [ -x "$CANDIDATE" ]; then
-        APP="$CANDIDATE"
-        break
-    fi
-done
-
-if [ -n "$APP" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Iniciando jukebox: $APP"
-    exec "$APP"
-fi
-
-# Binário não encontrado: mensagem de campo no lugar de tela preta muda
-echo "ERRO: binário do jukebox não encontrado em /opt/jukebox ou /usr/local/bin"
-xmessage -center -timeout 0 "JUKEBOX OS\n\nBinario nao encontrado.\nInstale em /opt/jukebox/jukebox-app" &
+# Gerenciador de janelas ultraleve — o autostart dele (~/.config/openbox/
+# autostart) desliga o DPMS e sobe o watchdog launcher.sh.
 exec openbox-session

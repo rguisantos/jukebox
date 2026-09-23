@@ -22,11 +22,22 @@ mkdir -p /dados
 chown -R jukebox:jukebox /dados
 chmod 775 /dados
 
+# Seed do arquivo de configuração persistente (Módulo 6): na sessão LIVE
+# (ISO no pendrive, sem instalação) o /dados é parte do overlay gravável —
+# já nasce com o jukebox.env para o operador editar. No sistema instalado
+# em disco, o instalador formata /dados vazio e o launcher.sh recria o
+# arquivo a partir do template /etc/jukebox na primeira inicialização.
+if [ ! -f /dados/jukebox.env ] && [ -f /etc/jukebox/jukebox.env ]; then
+    cp /etc/jukebox/jukebox.env /dados/jukebox.env
+    chown jukebox:jukebox /dados/jukebox.env
+fi
+
 # Permissões dos scripts executáveis
 chmod +x /usr/local/bin/jukebox-install-to-disk.sh || true
 chmod +x /usr/local/sbin/jukebox-usb-mount.sh || true
 chmod +x /usr/local/bin/jukebox-maintenance || true
 chmod +x /home/jukebox/.xinitrc || true
+chmod +x /home/jukebox/launcher.sh || true
 chown -R jukebox:jukebox /home/jukebox
 
 # Habilita serviço de Watchdog

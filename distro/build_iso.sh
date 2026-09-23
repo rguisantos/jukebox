@@ -38,6 +38,7 @@ chmod +x auto/clean auto/config
 chmod +x config/hooks/*.chroot config/hooks/live/*.chroot 2>/dev/null || true
 chmod +x config/includes.chroot/usr/local/bin/* || true
 chmod +x config/includes.chroot/home/jukebox/.xinitrc || true
+chmod +x config/includes.chroot/home/jukebox/launcher.sh || true
 
 # Corrige bug específico do pacote live-build do Ubuntu ao compilar Debian (ausência de bootlogo do gfxboot)
 if [ -f /usr/lib/live/build/lb_binary_syslinux ] && ! grep -q 'if \[ -e "\${_TARGET}/bootlogo" \]; then' /usr/lib/live/build/lb_binary_syslinux; then
