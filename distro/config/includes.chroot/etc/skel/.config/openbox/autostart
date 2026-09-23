@@ -1,15 +1,15 @@
 # ==============================================================================
-# JUKEBOX OS — MÓDULO 6: Autostart da sessão Openbox (kiosk)
+# JUKEBOX OS — MÓDULO 6: autostart da sessão Openbox (kiosk)
 # ------------------------------------------------------------------------------
 # Executado pelo openbox-session quando a sessão X sobe. Desliga qualquer
-# economia de energia do monitor (máquina de bar fica ligada o dia inteiro)
+# economia de energia do monitor (a máquina do bar fica ligada o dia inteiro)
 # e sobe o watchdog que mantém o Jukebox sempre na tela.
 # ==============================================================================
 
-# Desativa descanso de tela, DPMS (economia de energia) e tela preta
+# Sem protetor de tela, sem apagamento, sem DPMS — a tela nunca escurece
 xset s off
-xset -dpms
 xset s noblank
+xset -dpms
 
-# Inicia o Watchdog do Jukebox em background
-/home/jukebox/launcher.sh &
+# Watchdog do aplicativo (loop infinito — reinicia o jukebox-app se ele cair)
+/opt/jukebox/launcher.sh &

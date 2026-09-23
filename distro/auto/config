@@ -1,17 +1,44 @@
 #!/bin/sh
+# ==============================================================================
+# JUKEBOX OS — MÓDULO 6: parâmetros do live-build
+# ------------------------------------------------------------------------------
+# Executado automaticamente por "lb config" dentro de distro/. Mantém a geração
+# da ISO 100% reprodutível: configuração nova entra AQUI, nunca nos arquivos
+# config/* gerados (que são descartáveis e ficam fora do git).
+#
+# Debian 13 "trixie" (stable atual): glibc 2.41 e GStreamer 1.26. Aceita
+# binários Rust compilados em hosts Debian 12/13 e Ubuntu 22.04/24.04 (glibc
+# sempre <= 2.41 — binário compilado em glibc antiga roda em imagem nova).
+# Para voltar ao Debian 12, troque "trixie" por "bookworm" — e nesse caso
+# compile o binário num host com glibc <= 2.36 (Debian 12 ou Ubuntu 22.04).
+#
+# Linha de boot (bootappend-live), parâmetro a parâmetro:
+#   boot=live components  -> carrega o sistema live (redundante com o template,
+#                            mantido por compatibilidade com o modelo antigo)
+#   quiet splash loglevel=3 vt.global_cursor_default=0 console=tty3
+#                        -> boot silencioso estilo fliperama (mensagens no tty3)
+#   username=jukebox      -> o live-config PULA a criação do usuário padrão
+#                            ("user") porque o jukebox já vem criado no image
+#   hostname=jukebox      -> hostname em cada boot live
+#   locales=pt_BR.UTF-8   -> locale pt-BR (componente "locales" do live-config)
+#   noroot                -> o live-config NÃO concede sudo sem senha ao
+#                            usuário live; o único NOPASSWD é o poweroff
+#                            restrito que o hook grava em /etc/sudoers.d/live
+# ==============================================================================
 set -e
 
 lb config noauto \
     --mode debian \
-    --distribution bookworm \
-    --architectures amd64 \
+    --distribution "trixie" \
+    --architectures "amd64" \
     --archive-areas "main contrib non-free non-free-firmware" \
-    --linux-flavours amd64 \
-    --binary-images iso-hybrid \
+    --linux-flavours "amd64" \
+    --binary-images "iso-hybrid" \
+    --image-name "jukebox-os-trixie" \
     --iso-application "Jukebox Arcade OS" \
     --iso-publisher "Jukebox Embedded Project" \
     --iso-volume "JUKEBOX_OS" \
-    --bootappend-live "boot=live components quiet splash loglevel=3 vt.global_cursor_default=0 console=tty3 rd.systemd.show_status=false rd.udev.log_level=3 username=jukebox hostname=jukebox" \
+    --bootappend-live "boot=live components quiet splash loglevel=3 vt.global_cursor_default=0 console=tty3 rd.systemd.show_status=false rd.udev.log_level=3 username=jukebox hostname=jukebox locales=pt_BR.UTF-8 noroot" \
     --apt-recommends false \
     --security false \
     --firmware-binary false \

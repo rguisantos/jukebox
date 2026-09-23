@@ -1,91 +1,103 @@
-# Jukebox OS - Distribuição Debian Customizada e Ultra-Leve
+# JUKEBOX OS — ISO Kiosk (Debian 13 Trixie, live-build)
 
-Esta pasta contém o gerador oficial da imagem ISO (**Debian 12 Bookworm amd64**) personalizada para máquinas de Jukebox/Arcade de rua (Socket AM3 e LGA 775).
+Gerador oficial da imagem ISO do appliance: Debian enxuto, autologin no tty1,
+X11 sem cursor, aplicativo Rust **embutido na imagem** e rodando sob watchdog.
 
-## Destaques da Arquitetura do Sistema
-- **Base Ultra-Leve**: Debian Bookworm sem Desktop Environment (sem GNOME/KDE/XFCE).
-- **Sem Overhead de Áudio**: Sem PulseAudio ou PipeWire. Apenas **ALSA nativo**, economizando memória e ciclos de CPU no AMD Sempron 145 e Core 2 Duo.
-- **Boot Direto em Modo Quiosque**: Autologin no `tty1`, inicialização imediata do X11 com `openbox` e tela preta sem cursor.
-- **Blindagem Completa contra Quedas de Energia**: `overlayroot` (OverlayFS em tmpfs) mantendo a partição raiz (`/`) 100% como Somente Leitura (Read-Only). Puxar da tomada não corrompe o sistema.
-- **Persistência de Dados**: Partição `/dados` formatada em `ext4` separada do OverlayFS para armazenar arquivos MP3/MP4, logs e o banco SQLite (créditos persistentes).
-- **Hardware Watchdog**: Monitora o processador contra superaquecimento e reinicia automaticamente em caso de congelamento.
-- **Silent Boot (Arcade)**: Oculta totalmente mensagens do kernel e cursor piscante durante o boot.
+## Arquitetura do Módulo 6 (Deployment)
 
----
+```
+jukebox/                        raiz do projeto
+├── build_iso.sh                ← ORQUESTRADOR (executa da raiz!)
+├── jukebox-app/                aplicativo Rust (cargo build --release)
+└── distro/                     árvore do live-build
+    ├── auto/config             parâmetros do "lb config" (build reprodutível)
+    ├── auto/clean              limpeza segura (desmonta chroot de build travado)
+    └── config/
+        ├── hooks/live/01-setup-kiosk.hook.chroot
+        │                       ← usuário jukebox + autologin tty1 + sudoers
+        │                         poweroff + /dados + systemd garantido
+        ├── includes.chroot/
+        │   ├── opt/jukebox/launcher.sh    WATCHDOG (loop infinito, sleep 3)
+        │   ├── opt/jukebox/jukebox-app    binário (copiado pelo build_iso.sh)
+        │   ├── etc/skel/                  a home do usuário nasce daqui:
+        │   │   ├── .bash_profile          tty1 sem X? → startx -- -nocursor
+        │   │   ├── .profile               fallback POSIX do autologin
+        │   │   ├── .xinitrc               log em /dados/logs + openbox-session
+        │   │   └── .config/openbox/autostart   xset (sem DPMS) + launcher &
+        │   ├── etc/jukebox/jukebox.env    template da configuração da máquina
+        │   ├── etc/udev/rules.d/99-jukebox-usb.rules   automontagem p/ USB Sync
+        │   └── etc/{overlayroot,watchdog,modules-load.d,…}
+        │                                     blindagens do appliance
+        ├── package-lists/jukebox.list.chroot   pacotes da imagem
+        └── bootloaders/                      syslinux/isolinux pinados
+                                              (fix para hosts Ubuntu)
+```
 
-## Como Gerar a Imagem ISO
+## Como gerar a ISO
 
-Em qualquer computador rodando Debian, Ubuntu ou derivado, execute:
+No host de build (Debian, Ubuntu ou derivado):
 
 ```bash
-cd /home/bilhares/jukebox/distro
-sudo chmod +x build_iso.sh
-sudo ./build_iso.sh
+# 1) Dependências do host (uma única vez)
+sudo apt install live-build debootstrap squashfs-tools xorriso \
+     isolinux syslinux-common
+#    Para compilar o aplicativo, além do Rust (https://rustup.rs):
+sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+     pkg-config build-essential
+
+# 2) Inicializa o live-build (uma única vez por clone)
+cd distro
+lb config          # executa o auto/config: trixie, amd64, boot silencioso…
+cd ..
+
+# 3) Gera a ISO — compila o Rust, embute o binário e roda o lb build
+./build_iso.sh
 ```
 
-O script instalará automaticamente as ferramentas necessárias (`live-build`, `debootstrap`, `xorriso`), baixará os pacotes limpos dos repositórios oficiais e gerará o arquivo `jukebox-os-bookworm-amd64.hybrid.iso`.
+Resultado: **`distro/jukebox-os-trixie-amd64.hybrid.iso`** (híbrida: boota em
+BIOS legada — Sempron 145 / LGA 775 — e em UEFI).
 
----
+O `build_iso.sh` também aceita `sudo ./build_iso.sh`: nesse caso o `cargo` é
+rebaixado de volta ao usuário dono do projeto (nunca compila como root, para
+não sujar o `target/`). Primeira build: 10 a 30 min (baixa o Debian inteiro).
 
-## Como Gravar no Pendrive
+### Nota de compatibilidade glibc (importante)
 
-### Opção 1: Ventoy (Recomendado - Mais Rápido)
-1. Instale o [Ventoy](https://www.ventoy.net/) no seu pendrive.
-2. Copie o arquivo `.iso` gerado diretamente para o pendrive.
+O binário é compilado **no seu host** e roda **dentro da ISO** (Debian 13
+trixie = glibc 2.41). Regra de ouro: glibc do host ≤ glibc da imagem.
+Debian 12/13 e Ubuntu 22.04/24.04 sempre funcionam; evite hosts Debian
+testing/sid. (Para voltar ao Debian 12 na imagem, edite `auto/config` — e
+use um host com glibc ≤ 2.36 para compilar.)
 
-### Opção 2: Gravação Direta (Linux)
-```bash
-sudo dd if=jukebox-os-bookworm-amd64.hybrid.iso of=/dev/sdX bs=4M status=progress oflag=sync
-```
-*(Substitua `/dev/sdX` pelo dispositivo correto do seu pendrive)*.
+## Gravação no pendrive
 
-### Opção 3: Rufus (Windows)
-1. Abra o Rufus e selecione o arquivo `.iso`.
-2. Quando solicitado, selecione o **Modo Imagem DD**.
+| Método | Comando / procedimento |
+|---|---|
+| dd (Linux) | `sudo dd if=distro/jukebox-os-trixie-amd64.hybrid.iso of=/dev/sdX bs=4M status=progress oflag=sync` |
+| Ventoy | Apenas copie a ISO para o pendrive (mais rápido) |
+| Rufus (Windows) | Selecione a ISO e o **modo DD** |
 
----
-
-## Como Instalar na Máquina Arcade (AM3 / 775)
-
-1. Conecte o pendrive na máquina do Jukebox e configure a BIOS para inicializar pelo USB.
-2. O sistema inicializará diretamente no ambiente Live silencioso.
-3. Para instalar no disco interno (HD ou SSD), execute o instalador automatizado:
-   ```bash
-   sudo jukebox-install-to-disk.sh
-   ```
-4. O instalador irá:
-   - Detectar o HD/SSD interno.
-   - Criar o particionamento ideal (`/` com 12GB, `swap` com 2GB e `/dados` com o restante do disco).
-   - Formatar as partições em `ext4`.
-   - Clonar o sistema e instalar o bootloader GRUB.
-   - Ativar a blindagem do `overlayroot`.
-5. Ao concluir, remova o pendrive e reinicie a máquina.
-
----
-
-## Cadeia de Boot do Appliance (Módulo 6) e Auto-Recuperação
+## Cadeia de boot do appliance e auto-recuperação
 
 ```
-getty@tty1 (autologin jukebox)
-  └─ .bash_profile ─── tty1 sem X? → exec startx -- vt1 -keeptty -nocursor
-       └─ .xinitrc ─── logs em /dados/logs/xsession.log → exec openbox-session
-            └─ ~/.config/openbox/autostart ─── xset (sem DPMS/tela preta)
-                 └─ launcher.sh (watchdog, loop infinito)
-                      └─ jukebox-app ── crash? reinicia em 3s
+BIOS → isolinux (silencioso)
+  └─ systemd → getty@tty1 (autologin jukebox)
+       └─ .bash_profile ─── tty1 sem X? → startx -- vt1 -keeptty -nocursor
+            └─ .xinitrc ─── loga em /dados/logs/xsession.log → openbox-session
+                 └─ autostart ─── xset (sem DPMS/screensaver)
+                      └─ /opt/jukebox/launcher.sh (watchdog)
+                           └─ /opt/jukebox/jukebox-app ── crash? reinicia em 3s
 ```
 
-- **App crasha** → `launcher.sh` sobe o Jukebox de novo em 3 segundos.
-- **Servidor X cai** → `startx` termina, o `getty` respawna e a sessão inteira é reconstruída.
-- **Kernel congela** → hardware watchdog reinicia a máquina.
-- **Cursor do mouse** → oculto pelo próprio Xorg (`-nocursor`), sem software extra.
+- **App crasha** → watchdog relança em 3 segundos.
+- **Servidor X cai** → `startx` termina, o getty respawna, sessão inteira refaz.
+- **Kernel congela** → watchdog de hardware reinicia a máquina (15 s).
+- **Cursor do mouse** → oculto pelo próprio Xorg (`-nocursor`), zero software extra.
 
-## Configuração por Máquina: /dados/jukebox.env
-
-As chaves do PIX e o ID da máquina moram na partição gravável — configurar
-uma máquina nova é editar um arquivo e reiniciar:
+## Configuração por máquina: `/dados/jukebox.env`
 
 ```bash
-sudo nano /dados/jukebox.env
+sudo nano /dados/jukebox.env   # e reinicie a máquina
 ```
 
 ```ini
@@ -95,20 +107,39 @@ JUKEBOX_PIX_DEMO=0    # 1 = QR + pagamento simulados, sem backend
 RUST_LOG=info
 ```
 
-Na primeira inicialização o `launcher.sh` cria o arquivo a partir do template
-somente-leitura `/etc/jukebox/jukebox.env`. Com o `overlayroot` ativo, este é
-o único ponto de configuração que sobrevive entre reinicializações.
+Na sessão live o `/dados` é o overlay gravável (nasce com o arquivo, via hook);
+no sistema instalado em disco o `/dados` é a 3ª partição (ext4) e o launcher
+recria o arquivo a partir do template `/etc/jukebox/jukebox.env` na primeira
+inicialização. Ali também moram o banco SQLite (`jukebox.db`), as músicas
+(`musicas/`), o cache de capas (`capas/`) e os logs (`logs/`).
 
----
+## Modelo de segurança
 
-## Como Fazer Manutenção no Sistema Blindado
+- **Usuário `jukebox` / senha `jukebox`** — acesso de manutenção (Alt+F2 no
+  tty2, ou SSH).
+- **sudo sem senha: SOMENTE `systemctl poweroff`** — usado pela opção
+  "Desligar Máquina" do menu do operador. Todo o resto pede senha.
+  O live-config é neutralizado duas vezes: parâmetro `noroot` na linha de
+  boot + regra restrita escrita pelo hook em `/etc/sudoers.d/live` (o
+  componente de sudo do live-config passa reto quando o arquivo já contém
+  uma regra para o usuário).
+- **root** — sem senha (travado).
 
-Como o sistema de arquivos raiz (`/`) opera protegido pelo `overlayroot`, qualquer alteração feita no sistema tradicional é descartada ao reiniciar.
+## Live x instalado em disco
 
-Quando você precisar atualizar pacotes ou alterar configurações permanentes do sistema operacional:
+- **Live (pendrive)**: boot direto, `/` efêmero (qualquer alteração é
+  descartada no reboot — à prova de tomada arrancada), `/dados` no overlay.
+- **Disco (HD/SSD)**: rode `sudo jukebox-install-to-disk.sh` na máquina —
+  particiona (12 GB sistema + 2 GB swap + resto para /dados), clona, instala
+  o GRUB e ativa o overlayroot (sistema somente-leitura em produção).
+  Manutenção permanente do sistema: `sudo jukebox-maintenance`.
 
-```bash
-sudo jukebox-maintenance
-```
+## Solução de problemas
 
-Este comando abre um shell `chroot` diretamente na partição física em modo Leitura/Escrita (`rw`). Faça as alterações necessárias e digite `exit`. Ao reiniciar, as alterações estarão gravadas.
+| Sintoma | Onde olhar |
+|---|---|
+| Tela preta após logo do boot | tty3 (`Alt+F3`) tem os logs do kernel; `/dados/logs/xsession.log` tem a sessão X |
+| App não abre (caixa "Binário não encontrado") | O pendrive foi gravado com uma ISO antiga (sem binário embutido) — gere de novo com `./build_iso.sh` |
+| Sem áudio | `amixer` no tty2; verifique se `gstreamer1.0-alsa` está na imagem (`gst-inspect-1.0 alsasink`) |
+| GL quebrado na GMA 3150 | descomente `LIBGL_ALWAYS_SOFTWARE=1` no `.xinitrc` (via `jukebox-maintenance` no sistema instalado) |
+| Diagnóstico do player | `gst-inspect-1.0` / `gst-launch-1.0` vêm instalados (`gstreamer1.0-tools`) |

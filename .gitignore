@@ -1,9 +1,46 @@
+# ==============================================================================
+# JUKEBOX OS — .gitignore
+# ==============================================================================
+
+# --- Artefatos do live-build (gerados a cada build — nunca versionar) ---------
+distro/.build/
 distro/binary/
 distro/cache/
 distro/chroot/
+distro/local/
+distro/chroot.files
+distro/chroot.headers
+distro/chroot.packages.*
+distro/binary.contents
+distro/binary.packages
+distro/binary.hybrid.iso.zsync.xz
+distro/*.zsync
 *.iso
 *.img
 *.squashfs
+
+# Arquivos de config gerados pelo "lb config" a partir de distro/auto/config
+distro/config/binary
+distro/config/bootstrap
+distro/config/common
+distro/config/source
+distro/config/chroot
+
+# Hooks de exemplo symlinkados pelo lb config (config/hooks/normal/ e os
+# *.hook.chroot de sistema em config/hooks/live/) + cópia legada que o
+# build_iso.sh gera em config/hooks/01-setup-kiosk.chroot
+distro/config/hooks/normal/
+distro/config/hooks/live/*
+!distro/config/hooks/live/01-setup-kiosk.hook.chroot
+distro/config/hooks/*.chroot
+
+# Lista de pacotes do live gerada pelo lb config
+distro/config/package-lists/*
+!distro/config/package-lists/jukebox.list.chroot
+
+# Binário do app embutido na ISO (copiado pelo build_iso.sh a cada build)
+distro/config/includes.chroot/opt/jukebox/jukebox-app
+
 # Build Rust (artefatos de compilação — nunca versionar)
 jukebox-app/target/
 

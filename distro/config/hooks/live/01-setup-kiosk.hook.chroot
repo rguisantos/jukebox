@@ -1,0 +1,156 @@
+#!/bin/sh
+# ==============================================================================
+# JUKEBOX OS — MÓDULO 6: Hook de configuração do sistema Kiosk
+# ------------------------------------------------------------------------------
+# Executado pelo live-build DENTRO do chroot da imagem, como root, depois da
+# instalação dos pacotes (package-lists) e da cópia dos includes
+# (config/includes.chroot). É este hook que transforma o Debian cru em
+# appliance:
+#
+#   1. Garante SYSTEMD como init (PID 1) — sem isso o autologin não existe
+#   2. Cria o usuário jukebox (senha jukebox; grupos audio/video/input/…)
+#   3. Popula a home a partir de /etc/skel (.bash_profile → startx, .xinitrc…)
+#   4. Força o autologin no tty1 (override do getty@tty1)
+#   5. Libera "sudo systemctl poweroff" SEM senha (botão Desligar do app)
+#   6. Prepara /dados (banco, músicas, capas, logs e jukebox.env)
+#   7. Watchdog de hardware + bloqueio de PulseAudio/PipeWire + locale pt-BR
+#
+# Nota: o script é 100% idempotente (pode rodar mais de uma vez sem efeito
+# colateral) — requisito para conviver com re-execuções do lb build.
+# ==============================================================================
+set -e
+
+echo "--> [01-setup-kiosk] Configurando o appliance Jukebox…"
+
+# ------------------------------------------------------------------------------
+# 1) SYSTEMD como init — verificação e correção
+# ------------------------------------------------------------------------------
+# Lição do Módulo 6 antigo: a ISO de bookworm boota com SysVinit (sysvinit-core
+# vem do debootstrap) e TODO o resto deste hook (systemctl, override do getty)
+# virava enfeite morto. Aqui isso é imposição: sem systemd, o build falha.
+if [ "$(readlink -f /sbin/init 2>/dev/null)" != "/lib/systemd/systemd" ]; then
+    echo "--> [01-setup-kiosk] AVISO: /sbin/init não é systemd — instalando systemd-sysv…"
+    apt-get update -qq || true
+    apt-get install -y systemd-sysv || true
+    if [ "$(readlink -f /sbin/init 2>/dev/null)" != "/lib/systemd/systemd" ]; then
+        echo "ERRO FATAL: systemd-sysv não pôde ser instalado — o kiosk não vai funcionar."
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# 2) Usuário do kiosk
+# ------------------------------------------------------------------------------
+if ! getent passwd jukebox >/dev/null; then
+    # UID fixo 1000: o instalador de disco (jukebox-install-to-disk.sh) faz
+    # chown 1000:1000 no /dados da máquina — nunca mudar este UID.
+    useradd -m -s /bin/bash -u 1000 -c "Jukebox Arcade Operator" jukebox
+    echo "jukebox:jukebox" | chpasswd
+    echo "--> [01-setup-kiosk] usuário jukebox criado (senha: jukebox)"
+else
+    echo "--> [01-setup-kiosk] usuário jukebox já existe — reaproveitando"
+fi
+
+# Grupos de hardware:
+#   audio  -> placa de som (ALSA)         | video -> GPU/DRM (X11 sem root)
+#   input  -> evdev (teclado arcade USB)  | render-> DRM render node
+#   sudo   -> manutenção em campo (com senha; NOPASSWD só para o poweroff)
+usermod -aG audio,video,input,render,sudo jukebox
+
+# O useradd -m já copia o /etc/skel, mas copiamos de novo para não depender da
+# ordem interna do live-build entre "includes" e "hooks".
+mkdir -p /home/jukebox
+cp -a /etc/skel/. /home/jukebox/
+chown -R jukebox:jukebox /home/jukebox
+chmod 0755 /home/jukebox
+
+# ------------------------------------------------------------------------------
+# 3) Autologin no tty1 (getty → .bash_profile → startx → openbox → app)
+# ------------------------------------------------------------------------------
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/override.conf <<'EOF'
+[Service]
+# A linha "ExecStart=" vazia é OBRIGATÓRIA: limpa o comando original antes de
+# redefini-lo (sem ela o systemd ignora a linha seguinte).
+ExecStart=
+ExecStart=-/sbin/agetty --autologin jukebox --noclear %I $TERM
+# --noclear preserva a última tela (diagnóstico de crash no local);
+# TTYVTDisallocate=no acompanha o --noclear (o systemd não realoca/limpa o VT).
+TTYVTDisallocate=no
+# Type=idle: espera as unidades de boot assentarem antes de logar (tela limpa)
+Type=idle
+EOF
+
+# ------------------------------------------------------------------------------
+# 4) Desligamento seguro SEM senha — apenas o poweroff, nada além disso
+# ------------------------------------------------------------------------------
+# O aplicativo executa "sudo systemctl poweroff" na opção "Desligar Máquina"
+# do menu do operador (Módulo 8). A permissão é restrita a ESSE comando: todo
+# o resto continua exigindo a senha do usuário.
+#
+# Por que o arquivo se chama /etc/sudoers.d/live (e não "jukebox")? Porque o
+# componente "sudo" do live-config, no boot, injetaria a regra
+# "jukebox ALL=(ALL) NOPASSWD: ALL" exatamente nesse arquivo — mas só se ele
+# ainda não contiver uma regra começando com "jukebox". Escrevendo nossa regra
+# restrita nele, o live-config passa reto. O parâmetro "noroot" na linha de
+# boot (ver auto/config) é a segunda trava no mesmo sentido.
+cat > /etc/sudoers.d/live <<'EOF'
+# JUKEBOX OS — desligamento sem senha (opção "Desligar" do menu do operador).
+# Nada além do poweroff roda sem senha. /bin e /usr/bin cobrem sistemas com
+# e sem usr-merge.
+jukebox ALL=(ALL) NOPASSWD: /bin/systemctl poweroff, /usr/bin/systemctl poweroff
+EOF
+chmod 0440 /etc/sudoers.d/live
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/live \
+        || { rm -f /etc/sudoers.d/live; echo "ERRO: sudoers inválido"; exit 1; }
+fi
+
+# ------------------------------------------------------------------------------
+# 5) /dados — banco SQLite, músicas, capas, logs e o jukebox.env
+# ------------------------------------------------------------------------------
+mkdir -p /dados
+chown -R jukebox:jukebox /dados
+chmod 0775 /dados
+
+# Na sessão LIVE (ISO no pendrive) o /dados é parte do overlay gravável e já
+# nasce com o jukebox.env para o operador editar. No sistema instalado em
+# disco (jukebox-install-to-disk.sh) o /dados é formatado vazio e o launcher
+# recria o arquivo a partir deste template na primeira inicialização.
+if [ ! -f /dados/jukebox.env ] && [ -f /etc/jukebox/jukebox.env ]; then
+    cp /etc/jukebox/jukebox.env /dados/jukebox.env
+    chown jukebox:jukebox /dados/jukebox.env
+fi
+
+# ------------------------------------------------------------------------------
+# 6) Watchdog de hardware + áudio limpo (ALSA puro)
+# ------------------------------------------------------------------------------
+# watchdog: reinicia a máquina se o kernel congelar (módulos iTCO_wdt /
+# sp5100_tco / softdog vêm via /etc/modules-load.d/watchdog.conf).
+systemctl enable watchdog || true
+# PulseAudio/PipeWire não são instalados, mas o mask garante que nenhum
+# pacote futuro os truxe de volta atrás das costas.
+systemctl mask pulseaudio.service pulseaudio.socket pipewire.service pipewire.socket 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# 7) Ajustes finais: hostname, locale pt-BR, fuso horário, permissões
+# ------------------------------------------------------------------------------
+echo "jukebox" > /etc/hostname
+
+ln -sf /usr/share/zoneinfo/America/Campo_Grande /etc/localtime
+echo "America/Campo_Grande" > /etc/timezone
+
+if [ -f /etc/locale.gen ] && command -v locale-gen >/dev/null 2>&1; then
+    grep -q '^pt_BR.UTF-8 UTF-8' /etc/locale.gen \
+        || echo 'pt_BR.UTF-8 UTF-8' >> /etc/locale.gen
+    locale-gen >/dev/null 2>&1 || true
+    update-locale LANG=pt_BR.UTF-8 || true
+fi
+
+chmod +x /opt/jukebox/launcher.sh /opt/jukebox/jukebox-app 2>/dev/null || true
+chmod +x /usr/local/bin/jukebox-install-to-disk.sh 2>/dev/null || true
+chmod +x /usr/local/bin/jukebox-maintenance 2>/dev/null || true
+chmod +x /usr/local/bin/rsvg 2>/dev/null || true
+chmod +x /usr/local/sbin/jukebox-usb-mount.sh 2>/dev/null || true
+
+echo "--> [01-setup-kiosk] Appliance configurado com sucesso."
