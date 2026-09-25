@@ -47,6 +47,8 @@ pub struct AlbumInfo {
     /// 0..=5: índice da paleta de cores do placeholder (derivado da chave,
     /// estável entre reinicializações para a cor nunca "mudar sozinha")
     pub palette: u32,
+    /// true se o disco contiver ao menos uma faixa recém-adicionada (*)
+    pub is_recent: bool,
     /// Faixas do disco (já ordenadas por título pela consulta SQL)
     pub tracks: Vec<TrackInfo>,
 }
@@ -81,13 +83,12 @@ pub struct GenreInfo {
 // como teclado USB comum — maiúscula ou minúscula, daí a normalização):
 //
 //   E = esquerda (capa anterior)      R = direita (próxima capa)
-//   I = escolhe a capa (abre faixas)  W = cima (sobe lista/menu)
+//   I = escolhe a capa (abre faixas)  W = cima (sobe lista/menu / pula linha)
 //   Q = baixo (desce lista/menu)      O = seleciona música (1 crédito)
-//   U = cancela/volta                 P = barra de volume
+//   U = cancela música                P = barra de volume
 //   Z = insere crédito (moedeiro)     X = menu do operador
+//   A = zera créditos                 L = encerra o programa
 //
-// A tecla Z é aceita em QUALQUER estado: moeda inserida com overlay aberto
-// também precisa ser registrada (dinheiro não se recusa).
 // =============================================================================
 
 /// Passo do volume por pressionamento de W/Q dentro do overlay (em %)
@@ -109,12 +110,18 @@ pub const SONG_PRICE_MIN: u32 = 1;
 /// Preço máximo da música (10 créditos — limite de segurança do operador)
 pub const SONG_PRICE_MAX: u32 = 10;
 
+/// Régua da seleção rápida de letras alfabética e * para recém-adicionados
+pub const ALPHABET_ITEMS: &[&str] = &[
+    "*", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "#"
+];
+
 // =============================================================================
-// MÓDULO 8 — Menu do operador profissional (6 opções + 2 submenus)
+// MÓDULO 8 — Menu do operador profissional (7 opções + 3 submenus)
 // =============================================================================
 
 /// Total de linhas do menu principal do operador
-pub const OPERATOR_MENU_ITEMS: usize = 6;
+pub const OPERATOR_MENU_ITEMS: usize = 7;
 
 /// Índice da linha "Sincronizar Pendrive" no menu principal
 pub const OPERATOR_MENU_SYNC: usize = 0;
@@ -122,27 +129,30 @@ pub const OPERATOR_MENU_SYNC: usize = 0;
 /// Índice da linha "Preço da Música" (abre o submenu de preço)
 pub const OPERATOR_MENU_PRICE: usize = 1;
 
+/// Índice da linha "Dias Recém Adicionados (*)" (submenu de dias do recém adicionado)
+pub const OPERATOR_MENU_RECENT_DAYS: usize = 2;
+
 /// Índice da linha "Bloquear Gêneros" (abre o submenu de gêneros)
-pub const OPERATOR_MENU_GENRES: usize = 2;
+pub const OPERATOR_MENU_GENRES: usize = 3;
 
 /// Índice da linha "Zerar Caixa Parcial"
-pub const OPERATOR_MENU_RESET_PARTIAL: usize = 3;
+pub const OPERATOR_MENU_RESET_PARTIAL: usize = 4;
 
 /// Índice da linha "Zerar Créditos Atuais"
-pub const OPERATOR_MENU_RESET_CREDITS: usize = 4;
+pub const OPERATOR_MENU_RESET_CREDITS: usize = 5;
 
 /// Índice da linha "Desligar Máquina"
-pub const OPERATOR_MENU_POWEROFF: usize = 5;
+pub const OPERATOR_MENU_POWEROFF: usize = 6;
 
 /// Estado de foco da interface — uma única fonte de verdade, espelhada
 /// para a propriedade `ui-focus` do Slint (que decide qual camada desenhar).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FocusState {
-    /// Camada 1 — carrossel de capas (E/R navegam, I abre o disco)
+    /// Camada 1 — carrossel de capas (E/R/W/Q navegam, I abre o disco)
     BrowsingAlbums,
-    /// Camada 2 — faixas do álbum aberto (W/Q navegam, O toca, U volta)
+    /// Camada 2 — faixas do álbum aberto (W/Q navegam, O toca, I volta)
     BrowsingTracks,
-    /// Overlay de volume (P abre, W/Q ajustam, U fecha)
+    /// Overlay de volume (P abre/fecha, W/Q/E/R ajustam)
     VolumeControl,
     /// MÓDULO 8 — Menu principal do operador (X abre, W/Q navegam, O entra, U fecha)
     OperatorMainMenu,
@@ -150,10 +160,14 @@ pub enum FocusState {
     OperatorPriceMenu,
     /// MÓDULO 8 — Submenu de gêneros (W/Q navegam, O alterna bloqueio, U volta)
     OperatorGenreMenu,
+    /// Régua de seleção rápida alfabética e recém-adicionados (*)
+    AlphabetPicker,
+    /// Submenu de dias recém-adicionados (W/Q alteram, O/U salvam)
+    OperatorRecentDaysMenu,
 }
 
 impl FocusState {
-    /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=5)
+    /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=7)
     pub fn as_i32(self) -> i32 {
         match self {
             FocusState::BrowsingAlbums => 0,
@@ -162,6 +176,8 @@ impl FocusState {
             FocusState::OperatorMainMenu => 3,
             FocusState::OperatorPriceMenu => 4,
             FocusState::OperatorGenreMenu => 5,
+            FocusState::AlphabetPicker => 6,
+            FocusState::OperatorRecentDaysMenu => 7,
         }
     }
 
@@ -174,6 +190,7 @@ impl FocusState {
             FocusState::OperatorMainMenu
                 | FocusState::OperatorPriceMenu
                 | FocusState::OperatorGenreMenu
+                | FocusState::OperatorRecentDaysMenu
         )
     }
 }
@@ -216,6 +233,20 @@ pub enum Action {
     ResetCredits,
     /// MÓDULO 8 — O em "Desligar Máquina" (sudo systemctl poweroff)
     PowerOff,
+    /// Tecla U enquanto está tocando: cancela a faixa atual e avança para a próxima
+    SkipTrack,
+    /// Tecla L: encerra a aplicação
+    QuitApp,
+    /// Abertura da régua alfabética
+    OpenAlphabetPicker,
+    /// Movimento na régua alfabética
+    LetterMoved(usize),
+    /// Confirmação da letra na régua alfabética
+    ConfirmLetter(usize),
+    /// Abertura do submenu de dias recém-adicionados
+    OpenRecentDaysMenu,
+    /// Salvamento do valor de dias recém-adicionados
+    RecentDaysSaved(u32),
 }
 
 /// Estado global de navegação da interface. Vivem dentro de um
@@ -240,11 +271,19 @@ pub struct AppState {
     pub song_price: u32,
     /// MÓDULO 8 — Valor em edição no submenu de preço (W/Q alteram, O/U salvam)
     pub price_value: u32,
+    /// Dias para considerar um disco como recém-adicionado (*)
+    pub recent_days: u32,
+    /// Valor em edição no submenu de dias recém-adicionados
+    pub recent_days_value: u32,
+    /// Índice selecionado na régua de letras alfabética (*, A-Z, #)
+    pub letter_index: usize,
     /// MÓDULO 8 — Gêneros do acervo para o submenu "Bloquear Gêneros"
     /// (pré-carregados do banco na abertura do menu do operador)
     pub genres: Vec<GenreInfo>,
     /// MÓDULO 8 — Gênero selecionado no submenu de gêneros
     pub genre_index: usize,
+    /// Indica se há uma música sendo reproduzida no momento
+    pub is_playing: bool,
 }
 
 impl AppState {
@@ -259,8 +298,12 @@ impl AppState {
             volume: volume.min(VOLUME_MAX),
             song_price: song_price.clamp(SONG_PRICE_MIN, SONG_PRICE_MAX),
             price_value: song_price.clamp(SONG_PRICE_MIN, SONG_PRICE_MAX),
+            recent_days: 30,
+            recent_days_value: 30,
+            letter_index: 0,
             genres: Vec::new(),
             genre_index: 0,
+            is_playing: false,
         }
     }
 
@@ -305,6 +348,34 @@ impl AppState {
         self.track_index = 0;
     }
 
+    /// Pula a seleção do carrossel para o primeiro álbum correspondente à letra selecionada
+    pub fn jump_to_letter(&mut self, letter: &str) {
+        if self.albums.is_empty() {
+            self.focus = FocusState::BrowsingAlbums;
+            return;
+        }
+
+        let target_index = match letter {
+            "*" => self.albums.iter().position(|a| a.is_recent),
+            "#" => self.albums.iter().position(|a| {
+                let first = a.artist.chars().next().or_else(|| a.title.chars().next());
+                first.map(|c| !c.is_alphabetic()).unwrap_or(false)
+            }),
+            char_str => {
+                let target_char = char_str.chars().next().unwrap().to_ascii_lowercase();
+                self.albums.iter().position(|a| {
+                    let first = a.artist.chars().next().or_else(|| a.title.chars().next());
+                    first.map(|c| c.to_ascii_lowercase() == target_char).unwrap_or(false)
+                })
+            }
+        };
+
+        if let Some(idx) = target_index {
+            self.album_index = idx;
+        }
+        self.focus = FocusState::BrowsingAlbums;
+    }
+
     /// Processa uma tecla crua (case-insensitive: a controladora arcade
     /// gera maiúsculas ou minúsculas conforme o modo do firmware).
     ///
@@ -314,15 +385,32 @@ impl AppState {
     ///                      e segue para o resto do sistema, se houver).
     pub fn handle_key(&mut self, raw: &str) -> Option<Action> {
         let lowered = raw.trim().to_lowercase();
+
+        // Pressionamento longo das teclas E ou R abre a régua de seleção alfabética
+        if lowered.contains("long") || lowered.contains("hold") || lowered == "e_long" || lowered == "r_long" {
+            if self.focus == FocusState::BrowsingAlbums {
+                self.previous = FocusState::BrowsingAlbums;
+                self.focus = FocusState::AlphabetPicker;
+                self.letter_index = 0;
+                return Some(Action::OpenAlphabetPicker);
+            }
+        }
+
         let mut chars = lowered.chars();
         let key = chars.next()?;
         if chars.next().is_some() {
             return None; // textos multi-caractere não são teclas arcade
         }
 
-        // A moeda entra em qualquer estado — nunca recuse dinheiro
+        // Teclas globais (disponíveis em qualquer estado)
         if key == 'z' {
             return Some(Action::AddCredit);
+        }
+        if key == 'a' {
+            return Some(Action::ResetCredits);
+        }
+        if key == 'l' {
+            return Some(Action::QuitApp);
         }
 
         match self.focus {
@@ -339,6 +427,18 @@ impl AppState {
                     }
                     Some(Action::Noop)
                 }
+                'w' => {
+                    if !self.albums.is_empty() {
+                        self.album_index = self.album_index.saturating_sub(2);
+                    }
+                    Some(Action::Noop)
+                }
+                'q' => {
+                    if !self.albums.is_empty() {
+                        self.album_index = (self.album_index + 2).min(self.albums.len() - 1);
+                    }
+                    Some(Action::Noop)
+                }
                 'i' => {
                     self.open_current_album();
                     Some(Action::Noop)
@@ -348,11 +448,44 @@ impl AppState {
                     self.focus = FocusState::VolumeControl;
                     Some(Action::Noop)
                 }
+                'u' => {
+                    if self.is_playing {
+                        Some(Action::SkipTrack)
+                    } else {
+                        None
+                    }
+                }
                 'x' => {
                     self.previous = FocusState::BrowsingAlbums;
                     self.focus = FocusState::OperatorMainMenu;
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
+                }
+                _ => None,
+            },
+
+            FocusState::AlphabetPicker => match key {
+                'e' | 'w' => {
+                    self.letter_index = self.letter_index.saturating_sub(1);
+                    Some(Action::LetterMoved(self.letter_index))
+                }
+                'r' | 'q' => {
+                    self.letter_index = (self.letter_index + 1).min(ALPHABET_ITEMS.len() - 1);
+                    Some(Action::LetterMoved(self.letter_index))
+                }
+                'i' => {
+                    let idx = self.letter_index;
+                    if let Some(&letter) = ALPHABET_ITEMS.get(idx) {
+                        self.jump_to_letter(letter);
+                        Some(Action::ConfirmLetter(idx))
+                    } else {
+                        self.focus = FocusState::BrowsingAlbums;
+                        Some(Action::Noop)
+                    }
+                }
+                'u' | 'x' => {
+                    self.focus = FocusState::BrowsingAlbums;
+                    Some(Action::Noop)
                 }
                 _ => None,
             },
@@ -368,6 +501,10 @@ impl AppState {
                     }
                     Some(Action::Noop)
                 }
+                'i' => {
+                    self.focus = FocusState::BrowsingAlbums;
+                    Some(Action::Noop)
+                }
                 'o' => {
                     let track = self
                         .current_album()
@@ -379,8 +516,11 @@ impl AppState {
                     }
                 }
                 'u' => {
-                    self.focus = FocusState::BrowsingAlbums;
-                    Some(Action::Noop)
+                    if self.is_playing {
+                        Some(Action::SkipTrack)
+                    } else {
+                        None
+                    }
                 }
                 'p' => {
                     self.previous = FocusState::BrowsingTracks;
@@ -397,23 +537,30 @@ impl AppState {
             },
 
             FocusState::VolumeControl => match key {
-                'w' => {
+                'w' | 'r' => {
                     self.volume = (self.volume + VOLUME_STEP).min(VOLUME_MAX);
                     Some(Action::VolumeChanged(self.volume))
                 }
-                'q' => {
+                'q' | 'e' => {
                     self.volume = self.volume.saturating_sub(VOLUME_STEP);
                     Some(Action::VolumeChanged(self.volume))
                 }
-                'u' => {
+                'p' => {
                     let volume = self.volume;
                     self.focus = self.previous;
                     Some(Action::VolumeClosed(volume))
                 }
+                'u' => {
+                    if self.is_playing {
+                        Some(Action::SkipTrack)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
 
-            // MÓDULO 8 — Menu principal do operador (6 opções + 2 submenus).
+            // MÓDULO 8 — Menu principal do operador (7 opções + 3 submenus).
             // W/Q navegam, O entra/confirma, U fecha e volta à tela anterior.
             FocusState::OperatorMainMenu => match key {
                 'w' => {
@@ -431,10 +578,14 @@ impl AppState {
                         Some(Action::ForceSync)
                     }
                     OPERATOR_MENU_PRICE => {
-                        // Semeia o valor em edição com o preço vigente
                         self.price_value = self.song_price;
                         self.focus = FocusState::OperatorPriceMenu;
                         Some(Action::OpenPriceMenu)
+                    }
+                    OPERATOR_MENU_RECENT_DAYS => {
+                        self.recent_days_value = self.recent_days;
+                        self.focus = FocusState::OperatorRecentDaysMenu;
+                        Some(Action::OpenRecentDaysMenu)
                     }
                     OPERATOR_MENU_GENRES => {
                         self.genre_index = 0;
@@ -469,6 +620,25 @@ impl AppState {
                     self.song_price = price;
                     self.focus = FocusState::OperatorMainMenu;
                     Some(Action::PriceSaved(price))
+                }
+                _ => None,
+            },
+
+            // Submenu de dias para recém-adicionados (*)
+            FocusState::OperatorRecentDaysMenu => match key {
+                'w' | 'r' => {
+                    self.recent_days_value = (self.recent_days_value + 5).min(365);
+                    Some(Action::Noop)
+                }
+                'q' | 'e' => {
+                    self.recent_days_value = self.recent_days_value.saturating_sub(5).max(1);
+                    Some(Action::Noop)
+                }
+                'o' | 'u' => {
+                    let days = self.recent_days_value;
+                    self.recent_days = days;
+                    self.focus = FocusState::OperatorMainMenu;
+                    Some(Action::RecentDaysSaved(days))
                 }
                 _ => None,
             },
@@ -529,3 +699,103 @@ pub fn album_initial(title: &str) -> String {
         .map(|c| c.to_string())
         .unwrap_or_else(|| "?".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_volume_toggle_with_p() {
+        let mut state = AppState::new(50, 1);
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+
+        // Apertar 'p' abre o volume
+        state.handle_key("p");
+        assert_eq!(state.focus, FocusState::VolumeControl);
+
+        // Apertar 'p' novamente fecha o volume
+        state.handle_key("p");
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+    }
+
+    #[test]
+    fn test_volume_up_down_keys() {
+        let mut state = AppState::new(50, 1);
+        state.handle_key("p"); // abre volume
+        assert_eq!(state.volume, 50);
+
+        // 'w' ou 'r' aumenta volume
+        state.handle_key("w");
+        assert_eq!(state.volume, 55);
+        state.handle_key("r");
+        assert_eq!(state.volume, 60);
+
+        // 'q' ou 'e' diminui volume
+        state.handle_key("q");
+        assert_eq!(state.volume, 55);
+        state.handle_key("e");
+        assert_eq!(state.volume, 50);
+    }
+
+    #[test]
+    fn test_album_open_close_with_i() {
+        let mut state = AppState::new(50, 1);
+        state.albums = vec![AlbumInfo {
+            title: "Album Test".to_string(),
+            artist: "Artist Test".to_string(),
+            genre: "Rock".to_string(),
+            key: "key".to_string(),
+            initial: "A".to_string(),
+            palette: 0,
+            is_recent: false,
+            tracks: vec![TrackInfo {
+                id: 1,
+                title: "Track 1".to_string(),
+                artist: "Artist Test".to_string(),
+                album: "Album Test".to_string(),
+                genre: "Rock".to_string(),
+                file_path: "/test.mp3".to_string(),
+                file_type: "mp3".to_string(),
+            }],
+        }];
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+
+        // 'i' abre as faixas do álbum
+        state.handle_key("i");
+        assert_eq!(state.focus, FocusState::BrowsingTracks);
+
+        // 'i' fecha o álbum e volta ao carrossel
+        state.handle_key("i");
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+    }
+
+    #[test]
+    fn test_global_keys_a_and_l() {
+        let mut state = AppState::new(50, 1);
+        
+        // 'a' zera os créditos
+        let action_a = state.handle_key("a");
+        assert!(matches!(action_a, Some(Action::ResetCredits)));
+
+        // 'l' encerra o programa
+        let action_l = state.handle_key("l");
+        assert!(matches!(action_l, Some(Action::QuitApp)));
+    }
+
+    #[test]
+    fn test_skip_track_with_u() {
+        let mut state = AppState::new(50, 1);
+        state.is_playing = true;
+
+        // Quando está tocando, 'u' cancela a faixa
+        let action = state.handle_key("u");
+        assert!(matches!(action, Some(Action::SkipTrack)));
+
+        state.is_playing = false;
+        // Quando não está tocando, 'u' não tem efeito
+        let action_not_playing = state.handle_key("u");
+        assert!(action_not_playing.is_none());
+    }
+}
+
+

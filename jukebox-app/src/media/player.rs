@@ -63,6 +63,8 @@ pub enum PlayerCommand {
     /// Para tudo e limpa a fila (reservado ao modo de manutenção)
     #[allow(dead_code)]
     Stop,
+    /// Cancela a faixa atual e toca a próxima da fila (se houver)
+    SkipTrack,
 }
 
 /// Eventos emitidos PELO player para a thread principal
@@ -376,6 +378,10 @@ impl Player {
                 self.queue.clear();
                 self.current = None;
                 let _ = self.event_tx.send(PlayerEvent::QueueFinished);
+            }
+            PlayerCommand::SkipTrack => {
+                log::info!("Player: cancelando faixa atual (skip).");
+                self.on_track_end();
             }
             PlayerCommand::SetVolume(volume) => {
                 // Clamp defensivo: a propriedade do playbin aceita > 1.0,

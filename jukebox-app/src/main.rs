@@ -75,6 +75,8 @@ enum DbCommand {
     ResetPartial,
     /// "Zerar Créditos Atuais": zera os créditos não gastos (Módulo 8)
     ResetCredits,
+    /// Submenu de dias recém-adicionados: grava os dias para filtro de recentes (*)
+    SetRecentDays(u32),
 }
 
 /// Geração do toast atual (evita que um timer antigo apague um toast novo)
@@ -113,6 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(VOLUME_DEFAULT);
     log::info!("Volume persistido carregado do banco: {}%", initial_volume);
 
+    let initial_recent_days = db.get_recent_days().unwrap_or(30);
+    log::info!("Dias recém-adicionados carregados do banco: {}", initial_recent_days);
+
     // =========================================================================
     // 2. Interface Slint + máquina de estados de foco (Módulo 7)
     // =========================================================================
@@ -120,12 +125,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     main_window.set_credits(initial_credits as i32);
     main_window.set_volume_value(initial_volume as i32);
     main_window.set_op_song_price(initial_price as i32);
+    main_window.set_op_recent_days(initial_recent_days as i32);
     main_window.set_scanning(true);
 
     // Estado de navegação compartilhado: callbacks da UI (event loop) e
     // bridges de publicação de catálogo — Arc<Mutex> atravessa as threads.
     let state_arc: Arc<Mutex<AppState>> =
         Arc::new(Mutex::new(AppState::new(initial_volume, initial_price)));
+    {
+        let mut st = lock_state(&state_arc);
+        st.recent_days = initial_recent_days;
+        st.recent_days_value = initial_recent_days;
+    }
 
     // =========================================================================
     // 3. Canais de comunicação entre as threads
@@ -212,12 +223,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let partial = db.get_partial_coins().unwrap_or(0);
                         let absolute = db.get_absolute_coins().unwrap_or(0);
                         let price = db.get_song_price().unwrap_or(1);
+                        let recent_days = db.get_recent_days().unwrap_or(30);
                         let genres: Vec<GenreInfo> = db.get_genres().unwrap_or_default();
                         log::debug!(
-                            "Menu do operador: odômetro={}, caixa parcial={}, preço={}, {} gênero(s).",
+                            "Menu do operador: odômetro={}, caixa parcial={}, preço={}, recentes={}d, {} gênero(s).",
                             absolute,
                             partial,
                             price,
+                            recent_days,
                             genres.len()
                         );
 
@@ -228,12 +241,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_op_partial_coins(partial as i32);
                                 ui.set_op_absolute_coins(absolute as i32);
                                 ui.set_op_song_price(price as i32);
+                                ui.set_op_recent_days(recent_days as i32);
 
                                 // Espelha no estado: o submenu de preço semeia
                                 // sua edição com o valor vigente e o submenu de
                                 // gêneros navega na lista recém-carregada
                                 let mut st = lock_state(&state_arc);
                                 st.song_price = price;
+                                st.recent_days = recent_days;
                                 st.genres = genres;
                                 mirror_nav(&ui, &st);
                             }
@@ -316,6 +331,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             show_toast(&ui_handle, "Erro ao zerar créditos", 2);
                         }
                     },
+                    DbCommand::SetRecentDays(days) => match db.set_recent_days(days) {
+                        Ok(()) => {
+                            log::info!("Dias recém-adicionados atualizados: {}.", days);
+                            show_toast(&ui_handle, &format!("Dias recentes: {}", days), 1);
+                            let albums = db.get_albums().unwrap_or_default();
+                            publish_albums(&ui_handle, &state_arc, &cover_tx, albums, true);
+                        }
+                        Err(e) => {
+                            log::error!("Falha ao salvar dias recém-adicionados: {}", e);
+                            show_toast(&ui_handle, "Erro ao salvar dias recentes", 2);
+                        }
+                    },
                 }
             }
         });
@@ -366,9 +393,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let ui_handle = main_window.as_weak();
+        let state_arc = state_arc.clone();
         thread::spawn(move || {
             while let Ok(event) = player_event_rx.recv() {
                 let ui_handle = ui_handle.clone();
+                let state_arc = state_arc.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     let ui = match ui_handle.upgrade() {
                         Some(ui) => ui,
@@ -376,6 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     match event {
                         PlayerEvent::TrackStarted { id, title, artist, is_video } => {
+                            lock_state(&state_arc).is_playing = true;
                             ui.set_np_active(true);
                             ui.set_np_track_id(id as i32);
                             ui.set_np_title(title.into());
@@ -388,6 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ui.set_queue_tracks(ModelRc::new(VecModel::from(model)));
                         }
                         PlayerEvent::QueueFinished => {
+                            lock_state(&state_arc).is_playing = false;
                             ui.set_np_active(false);
                             ui.set_np_track_id(-1);
                             ui.set_np_title("".into());
@@ -792,6 +823,8 @@ fn mirror_nav(ui: &MainWindow, st: &AppState) {
 
     // MÓDULO 8 — Espelhos dos submenus do operador
     ui.set_op_price_edit(st.price_value as i32);
+    ui.set_op_recent_days_edit(st.recent_days_value as i32);
+    ui.set_selected_letter_index(st.letter_index as i32);
     ui.set_op_genre_index(st.genre_index as i32);
     if st.focus == FocusState::OperatorGenreMenu {
         let rows: Vec<GenreData> = st
@@ -864,6 +897,13 @@ fn handle_ui_action(
             let _ = player_tx.send(PlayerCommand::SetVolume(volume_to_linear(volume)));
             let _ = db_tx.send(DbCommand::SetVolume(volume));
         }
+        Action::SkipTrack => {
+            let _ = player_tx.send(PlayerCommand::SkipTrack);
+        }
+        Action::QuitApp => {
+            log::info!("Tecla L detectada: encerrando o programa.");
+            std::process::exit(0);
+        }
         Action::OpenOperatorMenu => {
             // IP calculado na hora (dhcp pode mudar entre aberturas do menu)
             ui.set_op_ip(query_local_ip().into());
@@ -922,6 +962,19 @@ fn handle_ui_action(
                 log::error!("Erro ao enviar zeramento de créditos: {}", e);
             }
         }
+        Action::OpenAlphabetPicker => {
+            schedule_alphabet_auto_confirm(ui, state_arc);
+        }
+        Action::LetterMoved(_idx) => {
+            schedule_alphabet_auto_confirm(ui, state_arc);
+        }
+        Action::ConfirmLetter(_idx) => {}
+        Action::OpenRecentDaysMenu => {}
+        Action::RecentDaysSaved(days) => {
+            if let Err(e) = db_tx.send(DbCommand::SetRecentDays(days)) {
+                log::error!("Erro ao enviar novos dias recém-adicionados ao banco: {}", e);
+            }
+        }
         Action::PowerOff => {
             // A distro concede sudo sem senha ao usuário jukebox
             // (/etc/sudoers.d/jukebox) — o systemctl desliga a máquina de
@@ -951,6 +1004,37 @@ fn handle_ui_action(
 // Publicação do catálogo e das capas
 // =============================================================================
 
+/// Timer de auto-confirmação da seleção alfabética (1.5s após a última navegação)
+static ALPHABET_TIMER_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn schedule_alphabet_auto_confirm(ui: &MainWindow, state_arc: &Arc<Mutex<AppState>>) {
+    let gen = ALPHABET_TIMER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let ui_weak = ui.as_weak();
+    let state_arc = state_arc.clone();
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        let ui_weak = ui_weak.clone();
+        let state_arc = state_arc.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if ALPHABET_TIMER_GEN.load(Ordering::SeqCst) == gen {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let mut st = lock_state(&state_arc);
+                    if st.focus == FocusState::AlphabetPicker {
+                        let idx = st.letter_index;
+                        if let Some(&letter) = state::models::ALPHABET_ITEMS.get(idx) {
+                            st.jump_to_letter(letter);
+                        } else {
+                            st.focus = FocusState::BrowsingAlbums;
+                        }
+                        mirror_nav(&ui, &st);
+                    }
+                }
+            }
+        });
+    });
+}
+
 /// Converte um TrackInfo (banco) em TrackData (modelo Slint)
 fn track_info_to_data(t: &TrackInfo) -> TrackData {
     TrackData {
@@ -974,6 +1058,7 @@ fn album_info_to_data(a: &AlbumInfo) -> AlbumData {
         genre: a.genre.clone().into(),
         initial: a.initial.clone().into(),
         palette: a.palette as i32,
+        is_recent: a.is_recent,
         has_cover: false,
         cover: slint::Image::default(),
         tracks: ModelRc::new(VecModel::from(tracks)),

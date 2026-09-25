@@ -71,15 +71,17 @@ impl Database {
 
         // Tabela de faixas de mídia indexadas pelo scanner. O gênero (Módulo 8)
         // alimenta o bloqueio de gêneros no catálogo público.
+        // created_at (Unix epoch) é usado para o filtro de recém-adicionados (*).
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS tracks (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                title     TEXT    NOT NULL,
-                artist    TEXT    NOT NULL DEFAULT 'Artista Desconhecido',
-                album     TEXT    NOT NULL DEFAULT 'Sem Álbum',
-                file_path TEXT    NOT NULL UNIQUE,
-                file_type TEXT    NOT NULL,
-                genre     TEXT    NOT NULL DEFAULT 'Desconhecido'
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT    NOT NULL,
+                artist     TEXT    NOT NULL DEFAULT 'Artista Desconhecido',
+                album      TEXT    NOT NULL DEFAULT 'Sem Álbum',
+                file_path  TEXT    NOT NULL UNIQUE,
+                file_type  TEXT    NOT NULL,
+                genre      TEXT    NOT NULL DEFAULT 'Desconhecido',
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );",
             [],
         )?;
@@ -146,11 +148,29 @@ impl Database {
             [],
         )?;
 
-        // MÓDULO 8 — Preço da música em créditos (padrão 1)
+        // Preço da música em créditos (padrão 1)
         self.conn.execute(
             "INSERT OR IGNORE INTO system_state (key, value) VALUES ('song_price', 1);",
             [],
         )?;
+
+        // Dias para considerar álbum recém-adicionado (*) (padrão 30 dias)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO system_state (key, value) VALUES ('recent_days', 30);",
+            [],
+        )?;
+
+        // Adiciona a coluna `created_at` na tabela `tracks` se não existir
+        // (migração de bancos criados antes desta versão do schema).
+        // NOTA: ALTER TABLE ADD COLUMN só aceita defaults constantes no SQLite —
+        // usamos 0 (epoch Unix = 1970) para que faixas antigas não sejam "recentes".
+        if !self.has_tracks_created_at_column()? {
+            self.conn.execute(
+                "ALTER TABLE tracks ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;",
+                [],
+            )?;
+            log::info!("Migração: coluna `created_at` adicionada à tabela tracks (faixas existentes com created_at=0).");
+        }
 
         // v9: catálogo ordenado por pasta Gênero/Artista/Álbum. Bases antigas
         // têm gênero só do ID3 (ou "Desconhecido") — wipe força o scanner a
@@ -171,6 +191,15 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn has_tracks_created_at_column(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(tracks);")?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names.contains(&"created_at".to_string()))
     }
 
     /// Verifica se a tabela `tracks` já possui a coluna `genre` (Módulo 8)
@@ -349,8 +378,15 @@ impl Database {
     /// Catálogo agrupado por (artista, álbum), ordenado para o carrossel:
     /// gênero → artista → álbum → faixa.
     pub fn get_albums(&self) -> Result<Vec<AlbumInfo>> {
+        let recent_days = self.get_recent_days().unwrap_or(30);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff_secs = now_secs - (recent_days as i64 * 86400);
+
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, artist, album, file_path, file_type, genre
+            "SELECT id, title, artist, album, file_path, file_type, genre, COALESCE(created_at, 0)
              FROM tracks
              WHERE genre NOT IN (SELECT genre FROM blocked_genres)
              ORDER BY genre COLLATE NOCASE ASC,
@@ -361,7 +397,7 @@ impl Database {
 
         let rows = stmt
             .query_map([], |row| {
-                Ok(TrackInfo {
+                let track = TrackInfo {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     artist: row.get(2)?,
@@ -369,20 +405,27 @@ impl Database {
                     file_path: row.get(4)?,
                     file_type: row.get(5)?,
                     genre: row.get(6)?,
-                })
+                };
+                let created_at: i64 = row.get(7)?;
+                Ok((track, created_at))
             })?
             .filter_map(|r| r.ok());
 
         let mut albums: Vec<AlbumInfo> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
 
-        for track in rows {
+        for (track, created_at) in rows {
             let key = format!("{}|{}", track.artist, track.album);
+            let is_recent = created_at >= cutoff_secs;
 
             match index.get(&key) {
-                // Disco já começado: apenas anexa a faixa (chave idêntica,
-                // mesmo artista/álbum — não há como divergir)
-                Some(&position) => albums[position].tracks.push(track),
+                Some(&position) => {
+                    let alb = &mut albums[position];
+                    alb.tracks.push(track);
+                    if is_recent {
+                        alb.is_recent = true;
+                    }
+                }
                 None => {
                     let initial = album_initial(&track.album);
                     let palette = (fnv64(&key) % 6) as u32;
@@ -394,6 +437,7 @@ impl Database {
                         key,
                         initial,
                         palette,
+                        is_recent,
                         tracks: vec![track],
                     });
                 }
@@ -401,6 +445,19 @@ impl Database {
         }
 
         Ok(albums)
+    }
+
+    pub fn get_recent_days(&self) -> Result<u32> {
+        self.read_counter("recent_days").map(|v| (v as u32).max(1))
+    }
+
+    pub fn set_recent_days(&self, days: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO system_state (key, value) VALUES ('recent_days', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![days as i64],
+        )?;
+        Ok(())
     }
 
     // =========================================================================

@@ -62,6 +62,7 @@ export struct AlbumData {
     genre: string,
     initial: string,
     palette: int,
+    is-recent: bool,
     has-cover: bool,
     cover: image,
     tracks: [TrackData],
@@ -249,6 +250,24 @@ component AlbumCard inherits Rectangle {
             font-weight: 800;
             horizontal-alignment: center;
             vertical-alignment: center;
+        }
+
+        // Badge de recém-adicionado (*)
+        if root.album.is-recent : Rectangle {
+            x: parent.width - 32px;
+            y: 6px;
+            width: 26px;
+            height: 26px;
+            border-radius: 13px;
+            background: #f59e0be6;
+            Text {
+                text: "★";
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: 800;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
         }
     }
 
@@ -470,6 +489,11 @@ export component MainWindow inherits Window {
     in-out property <int> op-song-price: 1;       // preço vigente (créditos)
     // MÓDULO 8 — Submenu de preço (valor em edição, W/Q alteram)
     in-out property <int> op-price-edit: 1;
+    // Submenu de dias recém-adicionados
+    in-out property <int> op-recent-days: 30;
+    in-out property <int> op-recent-days-edit: 30;
+    // Régua alfabética selecionada
+    in-out property <int> selected-letter-index: 0;
     // MÓDULO 8 — Submenu de gêneros (lista + linha selecionada)
     in-out property <[GenreData]> op-genres: [];
     in-out property <int> op-genre-index: 0;
@@ -522,7 +546,46 @@ export component MainWindow inherits Window {
     forward-focus: keyboard-handler;
 
     keyboard-handler := FocusScope {
+        property <string> last-key: "";
+        property <bool> is-long: false;
+
+        key-timer := Timer {
+            interval: 600ms;
+            running: false;
+            triggered => {
+                keyboard-handler.is-long = true;
+                if (keyboard-handler.last-key == "e" || keyboard-handler.last-key == "E") {
+                    root.arcade-key-pressed("e_long");
+                } else if (keyboard-handler.last-key == "r" || keyboard-handler.last-key == "R") {
+                    root.arcade-key-pressed("r_long");
+                }
+            }
+        }
+
+        key-released(event) => {
+            if (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R") {
+                key-timer.running = false;
+                if (!keyboard-handler.is-long) {
+                    root.arcade-key-pressed(event.text);
+                }
+                keyboard-handler.is-long = false;
+                keyboard-handler.last-key = "";
+                return accept;
+            }
+            return reject;
+        }
+
         key-pressed(event) => {
+            // ---- Long press trigger para E e R no carrossel ----
+            if (root.ui-focus == 0 && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
+                if (keyboard-handler.last-key != event.text) {
+                    keyboard-handler.last-key = event.text;
+                    keyboard-handler.is-long = false;
+                    key-timer.running = true;
+                }
+                return accept;
+            }
+
             // ---- Aliases de manutenção (teclado USB comum) ----
             if (event.text == Key.LeftArrow) {
                 if (root.arcade-key-pressed("e")) { return accept; }
@@ -715,9 +778,7 @@ export component MainWindow inherits Window {
 
                         Rectangle { height: 1px; background: #1a1b26; }
 
-                        // Faixa das capas: rolagem horizontal INSTANTÂNEA por
-                        // expressão (offset é função pura do disco selecionado
-                        // — zero animação, zero Flickable, zero custo de GPU)
+                        // Faixa das capas: rolagem horizontal em 2 LINHAS
                         carousel := Rectangle {
                             vertical-stretch: 1;
                             clip: true;
@@ -725,15 +786,19 @@ export component MainWindow inherits Window {
 
                             property <length> pitch: 204px;   // largura + espaçamento
                             property <length> card-w: 176px;
-                            property <length> content-w: max(root.albums.length * self.pitch, self.width);
-                            // Centraliza o disco selecionado (clamp nas bordas)
-                            property <length> raw-off: root.selected-album * self.pitch
+                            property <int> cols: (root.albums.length + 1) / 2;
+                            property <length> content-w: max(self.cols * self.pitch, self.width);
+                            property <int> selected-col: root.selected-album / 2;
+                            // Centraliza a coluna selecionada (clamp nas bordas)
+                            property <length> raw-off: self.selected-col * self.pitch
                                 - (self.width - self.card-w) / 2;
                             property <length> off: min(max(0px, self.raw-off), self.content-w - self.width);
 
                             for album[index] in root.albums : AlbumCard {
-                                x: index * carousel.pitch - carousel.off;
-                                y: (carousel.height - self.height) / 2;
+                                x: (index / 2) * carousel.pitch - carousel.off;
+                                y: (mod(index, 2) == 0)
+                                    ? (carousel.height / 2 - self.height) / 2
+                                    : carousel.height / 2 + (carousel.height / 2 - self.height) / 2;
                                 index: index;
                                 album: album;
                                 is-selected: index == root.selected-album;
@@ -1436,7 +1501,7 @@ export component MainWindow inherits Window {
 
                 Rectangle { height: 1px; background: #1e2438; }
 
-                // ---- 6 opções do menu ----
+                // ---- 7 opções do menu ----
                 OperatorMenuRow {
                     index: 0;
                     selected-index: root.op-menu-index;
@@ -1460,6 +1525,15 @@ export component MainWindow inherits Window {
                 OperatorMenuRow {
                     index: 2;
                     selected-index: root.op-menu-index;
+                    label: "DIAS RECÉM-ADICIONADOS (*)";
+                    value: "\{root.op-recent-days} dias";
+                    actionable: true;
+                    danger: false;
+                }
+
+                OperatorMenuRow {
+                    index: 3;
+                    selected-index: root.op-menu-index;
                     label: "BLOQUEAR GÊNEROS";
                     value: "abrir lista";
                     actionable: true;
@@ -1467,7 +1541,7 @@ export component MainWindow inherits Window {
                 }
 
                 OperatorMenuRow {
-                    index: 3;
+                    index: 4;
                     selected-index: root.op-menu-index;
                     label: "✕  ZERAR CAIXA PARCIAL";
                     value: "\{root.op-partial-coins} créditos";
@@ -1476,7 +1550,7 @@ export component MainWindow inherits Window {
                 }
 
                 OperatorMenuRow {
-                    index: 4;
+                    index: 5;
                     selected-index: root.op-menu-index;
                     label: "✕  ZERAR CRÉDITOS ATUAIS";
                     value: "\{root.credits} créditos";
@@ -1485,7 +1559,7 @@ export component MainWindow inherits Window {
                 }
 
                 OperatorMenuRow {
-                    index: 5;
+                    index: 6;
                     selected-index: root.op-menu-index;
                     label: "DESLIGAR MÁQUINA";
                     value: "desligar";
@@ -1514,6 +1588,143 @@ export component MainWindow inherits Window {
                         horizontal-stretch: 1;
                         vertical-alignment: center;
                     }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // OVERLAY: Régua de seleção rápida alfabética (*) (ui-focus 6)
+    // =========================================================================
+    if root.ui-focus == 6 : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000bf;
+
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 880px;
+            height: 120px;
+            background: #0d0e14;
+            border-radius: 16px;
+            border-width: 2px;
+            border-color: #818cf8;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+
+                Text {
+                    text: "SELEÇÃO RÁPIDA DE DISCOS (E/R move, I confirma ou aguarde)";
+                    color: #818cf8;
+                    font-size: 14px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 6px;
+
+                    // Items: *, A..Z, #
+                    for letter[idx] in ["*", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "#"] : Rectangle {
+                        width: 26px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: idx == root.selected-letter-index ? #6366f1 : #1e2438;
+
+                        Text {
+                            text: letter;
+                            color: idx == root.selected-letter-index ? #ffffff : #94a3b8;
+                            font-size: 15px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // OVERLAY: Submenu de dias recém-adicionados (ui-focus 7)
+    // =========================================================================
+    if root.ui-focus == 7 : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000e6;
+
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 480px;
+            height: 420px;
+            background: #0d0e14;
+            border-radius: 16px;
+            border-width: 2px;
+            border-color: #f59e0b;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 14px;
+
+                Text {
+                    text: "DIAS PARA RECÉM-ADICIONADOS (*)";
+                    color: #f59e0b;
+                    font-size: 20px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    height: 150px;
+                    background: #12131c;
+                    border-radius: 14px;
+                    border-width: 2px;
+                    border-color: #38bdf8;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+
+                        Text {
+                            text: "\{root.op-recent-days-edit}";
+                            color: #fbbf24;
+                            font-size: 64px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "DIAS";
+                            color: #9ca3af;
+                            font-size: 14px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "W/R aumenta (+5)   ·   Q/E diminui (-5)";
+                    color: #94a3b8;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "O ou U salva e volta";
+                    color: #64748b;
+                    font-size: 13px;
+                    horizontal-alignment: center;
                 }
             }
         }

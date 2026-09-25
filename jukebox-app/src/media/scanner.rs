@@ -85,6 +85,21 @@ pub fn scan_media_directory(db: &mut Database) -> Vec<TrackInfo> {
         log::info!("Scanner: Indexação de novos arquivos concluída.");
     }
 
+    // Garante que todas as faixas (novas e existentes) utilizem artista (pasta) e álbum (pasta)
+    if let Ok(all_tracks) = db.get_all_tracks() {
+        for mut track in all_tracks {
+            let path = Path::new(&track.file_path);
+            let (file_artist, _) = parse_filename(path);
+            let correct_artist = resolve_track_artist(&track.file_path, &media_dir, &file_artist, None);
+            let correct_album = resolve_track_album(&track.file_path, &media_dir, None);
+            if track.artist != correct_artist || track.album != correct_album {
+                track.artist = correct_artist;
+                track.album = correct_album;
+                let _ = db.upsert_track(&track);
+            }
+        }
+    }
+
     // Retorna o catálogo completo atualizado para enviar à UI
     match db.get_all_tracks() {
         Ok(tracks) => {
@@ -134,9 +149,42 @@ fn is_supported_media(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Extrai metadados de uma faixa. Prefere tags ID3; o que faltar vem da
-/// pasta do acervo (`gênero/artista/álbum/faixa.mp3`) e, por último, do nome
-/// do arquivo (`Artista - Titulo.ext`).
+/// Resolve o nome do artista preferindo a pasta do artista no sistema de arquivos (não ID3).
+pub fn resolve_track_artist(file_path: &str, media_root: &Path, file_artist: &str, id3_artist: Option<&str>) -> String {
+    let path = Path::new(file_path);
+    let from_dir = infer_from_folder(path, media_root);
+    if let Some(folder_artist) = from_dir.artist.filter(|s| !s.trim().is_empty()) {
+        return folder_artist;
+    }
+    if !file_artist.trim().is_empty() && file_artist != "Artista Desconhecido" {
+        return file_artist.to_string();
+    }
+    if let Some(artist) = id3_artist.filter(|s| !s.trim().is_empty()) {
+        return artist.to_string();
+    }
+    String::from("Artista Desconhecido")
+}
+
+/// Resolve o nome do álbum preferindo a pasta do álbum no sistema de arquivos (não ID3).
+pub fn resolve_track_album(file_path: &str, media_root: &Path, id3_album: Option<&str>) -> String {
+    let path = Path::new(file_path);
+    let from_dir = infer_from_folder(path, media_root);
+    if let Some(folder_album) = from_dir.album.filter(|s| !s.trim().is_empty()) {
+        return folder_album;
+    }
+    if let Some(parent) = path.parent().filter(|p| *p != media_root) {
+        if let Some(folder_name) = parent.file_name().and_then(|s| s.to_str()).filter(|s| !s.trim().is_empty()) {
+            return folder_name.to_string();
+        }
+    }
+    if let Some(album) = id3_album.filter(|s| !s.trim().is_empty()) {
+        return album.to_string();
+    }
+    String::from("Sem Álbum")
+}
+
+/// Extrai metadados de uma faixa. Prefere a pasta para Artista e Álbum (para agrupar o carrossel);
+/// tags ID3 preenchem título e gênero (quando não definidos na pasta).
 fn extract_track_info(path: &Path, media_root: &Path) -> TrackInfo {
     let file_path = path.to_string_lossy().to_string();
     let extension = path
@@ -149,18 +197,12 @@ fn extract_track_info(path: &Path, media_root: &Path) -> TrackInfo {
     let (file_artist, file_title) = parse_filename(path);
 
     let mut title = file_title;
-    let mut artist = from_dir
-        .artist
-        .clone()
-        .unwrap_or(file_artist);
-    let mut album = from_dir
-        .album
-        .clone()
-        .unwrap_or_else(|| String::from("Sem Álbum"));
     let mut genre = from_dir
         .genre
         .clone()
         .unwrap_or_else(|| String::from("Desconhecido"));
+    let mut id3_artist: Option<String> = None;
+    let mut id3_album: Option<String> = None;
 
     if extension == "mp3" {
         if let Ok(tag) = id3::Tag::read_from_path(path) {
@@ -168,10 +210,10 @@ fn extract_track_info(path: &Path, media_root: &Path) -> TrackInfo {
                 title = t.to_string();
             }
             if let Some(a) = tag.artist().filter(|s| !s.trim().is_empty()) {
-                artist = a.to_string();
+                id3_artist = Some(a.to_string());
             }
             if let Some(a) = tag.album().filter(|s| !s.trim().is_empty()) {
-                album = a.to_string();
+                id3_album = Some(a.to_string());
             }
             // Pasta do acervo (Gênero/Artista/Álbum) manda no estilo; ID3 só
             // preenche quando a faixa não está nessa árvore.
@@ -182,6 +224,9 @@ fn extract_track_info(path: &Path, media_root: &Path) -> TrackInfo {
             }
         }
     }
+
+    let artist = resolve_track_artist(&file_path, media_root, &file_artist, id3_artist.as_deref());
+    let album = resolve_track_album(&file_path, media_root, id3_album.as_deref());
 
     TrackInfo {
         id: 0,
@@ -262,3 +307,40 @@ fn filename_without_ext(path: &Path) -> &str {
         .and_then(OsStr::to_str)
         .unwrap_or("Sem Nome")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_track_artist_uses_folder_name() {
+        let media_root = Path::new("/dados/musicas");
+        let track_path = "/dados/musicas/Rock/ACDC/BackInBlack/01-HellsBells.mp3";
+        let resolved = resolve_track_artist(track_path, media_root, "Parsed Artist", Some("ID3 Artist Name"));
+        
+        // Deve priorizar a pasta do artista ("ACDC") em vez do ID3 tag ou filename
+        assert_eq!(resolved, "ACDC");
+    }
+
+    #[test]
+    fn test_resolve_track_album_uses_folder_name() {
+        let media_root = Path::new("/dados/musicas");
+        let track_path = "/dados/musicas/Rock/ACDC/BackInBlack/01-HellsBells.mp3";
+        let resolved = resolve_track_album(track_path, media_root, Some("ID3 Album Name"));
+        
+        // Deve priorizar a pasta do álbum ("BackInBlack") em vez do ID3 tag
+        assert_eq!(resolved, "BackInBlack");
+    }
+
+    #[test]
+    fn test_resolve_track_album_fallback_to_id3_when_no_subfolder() {
+        let media_root = Path::new("/dados/musicas");
+        let track_path = "/dados/musicas/01-Track.mp3";
+        let resolved = resolve_track_album(track_path, media_root, Some("ID3 Album Name"));
+        
+        // Se estiver diretamente na raiz de mídia, usa o ID3 se disponível
+        assert_eq!(resolved, "ID3 Album Name");
+    }
+}
+
+
