@@ -31,18 +31,12 @@ lb config noauto \
     --mode debian \
     --distribution "trixie" \
     --architectures "amd64" \
-    --archive-areas "main contrib non-free non-free-firmware" \
-    --linux-flavours "amd64" \
+    --linux-flavours "cloud" \
+    --linux-packages "linux-image-cloud-amd64" \
     --binary-images "iso-hybrid" \
-    --image-name "jukebox-os-trixie" \
-    --iso-application "Jukebox Arcade OS" \
-    --iso-publisher "Jukebox Embedded Project" \
-    --iso-volume "JUKEBOX_OS" \
     --bootappend-live "boot=live components quiet splash loglevel=3 vt.global_cursor_default=0 console=tty3 rd.systemd.show_status=false rd.udev.log_level=3 username=jukebox hostname=jukebox locales=pt_BR.UTF-8 noroot" \
     --apt-recommends false \
     --security false \
-    --firmware-binary false \
-    --firmware-chroot false \
     --compression xz \
     --initsystem systemd \
     "$@"

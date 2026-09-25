@@ -39,6 +39,8 @@ pub struct AlbumInfo {
     pub title: String,
     /// Artista/banda
     pub artist: String,
+    /// Gênero do disco (tag ID3 ou pasta do acervo) — ordenação do carrossel
+    pub genre: String,
     /// Primeira letra do título (maiúscula) — usada no placeholder da capa
     /// quando o arquivo não traz arte embutida
     pub initial: String,

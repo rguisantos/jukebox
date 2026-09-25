@@ -72,7 +72,7 @@ pub fn scan_media_directory(db: &mut Database) -> Vec<TrackInfo> {
         );
 
         for file_path in &new_files {
-            let track = extract_track_info(file_path);
+            let track = extract_track_info(file_path, &media_dir);
             if let Err(e) = db.upsert_track(&track) {
                 log::error!(
                     "Scanner: Erro ao indexar {:?}: {}",
@@ -134,8 +134,10 @@ fn is_supported_media(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Extrai metadados de uma faixa de mídia (tags ID3 para MP3, nome do arquivo como fallback)
-fn extract_track_info(path: &Path) -> TrackInfo {
+/// Extrai metadados de uma faixa. Prefere tags ID3; o que faltar vem da
+/// pasta do acervo (`gênero/artista/álbum/faixa.mp3`) e, por último, do nome
+/// do arquivo (`Artista - Titulo.ext`).
+fn extract_track_info(path: &Path, media_root: &Path) -> TrackInfo {
     let file_path = path.to_string_lossy().to_string();
     let extension = path
         .extension()
@@ -143,36 +145,98 @@ fn extract_track_info(path: &Path) -> TrackInfo {
         .unwrap_or("")
         .to_lowercase();
 
-    // Tenta ler tags ID3 para arquivos MP3
+    let from_dir = infer_from_folder(path, media_root);
+    let (file_artist, file_title) = parse_filename(path);
+
+    let mut title = file_title;
+    let mut artist = from_dir
+        .artist
+        .clone()
+        .unwrap_or(file_artist);
+    let mut album = from_dir
+        .album
+        .clone()
+        .unwrap_or_else(|| String::from("Sem Álbum"));
+    let mut genre = from_dir
+        .genre
+        .clone()
+        .unwrap_or_else(|| String::from("Desconhecido"));
+
     if extension == "mp3" {
         if let Ok(tag) = id3::Tag::read_from_path(path) {
-            return TrackInfo {
-                id: 0, // Será atribuído pelo SQLite
-                title: tag
-                    .title()
-                    .unwrap_or_else(|| filename_without_ext(path))
-                    .to_string(),
-                artist: tag.artist().unwrap_or("Artista Desconhecido").to_string(),
-                album: tag.album().unwrap_or("Álbum Desconhecido").to_string(),
-                // MÓDULO 8: gênero da tag ID3 alimenta o bloqueio de gêneros
-                genre: tag.genre().unwrap_or("Desconhecido").to_string(),
-                file_path,
-                file_type: extension.clone(),
-            };
+            if let Some(t) = tag.title().filter(|s| !s.trim().is_empty()) {
+                title = t.to_string();
+            }
+            if let Some(a) = tag.artist().filter(|s| !s.trim().is_empty()) {
+                artist = a.to_string();
+            }
+            if let Some(a) = tag.album().filter(|s| !s.trim().is_empty()) {
+                album = a.to_string();
+            }
+            // Pasta do acervo (Gênero/Artista/Álbum) manda no estilo; ID3 só
+            // preenche quando a faixa não está nessa árvore.
+            if from_dir.genre.is_none() {
+                if let Some(g) = tag.genre().filter(|s| !s.trim().is_empty()) {
+                    genre = g.to_string();
+                }
+            }
         }
     }
-
-    // Fallback para todos os formatos: extrai do padrão "Artista - Titulo.ext" no nome do arquivo
-    let (artist, title) = parse_filename(path);
 
     TrackInfo {
         id: 0,
         title,
         artist,
-        album: String::from("Sem Álbum"),
-        genre: String::from("Desconhecido"),
+        album,
+        genre,
         file_path,
         file_type: extension,
+    }
+}
+
+struct FolderTags {
+    genre: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+}
+
+/// Lê gênero / artista / álbum a partir de `media_root/Gênero/Artista/Álbum/faixa`.
+fn infer_from_folder(path: &Path, media_root: &Path) -> FolderTags {
+    let empty = FolderTags {
+        genre: None,
+        artist: None,
+        album: None,
+    };
+    let rel = match path.strip_prefix(media_root) {
+        Ok(rel) => rel,
+        Err(_) => return empty,
+    };
+    let parent = match rel.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return empty,
+    };
+    let dirs: Vec<String> = parent
+        .iter()
+        .filter_map(|s| s.to_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    match dirs.len() {
+        0 => empty,
+        1 => FolderTags {
+            album: Some(dirs[0].clone()),
+            ..empty
+        },
+        2 => FolderTags {
+            artist: Some(dirs[0].clone()),
+            album: Some(dirs[1].clone()),
+            ..empty
+        },
+        _ => FolderTags {
+            genre: Some(dirs[0].clone()),
+            artist: Some(dirs[dirs.len() - 2].clone()),
+            album: Some(dirs[dirs.len() - 1].clone()),
+        },
     }
 }
 

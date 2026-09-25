@@ -1,5 +1,0 @@
-#!/bin/sh
-if command -v rsvg-convert >/dev/null 2>&1; then
-    exec rsvg-convert "$@"
-fi
-exit 0

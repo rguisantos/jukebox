@@ -809,6 +809,7 @@ fn mirror_nav(ui: &MainWindow, st: &AppState) {
     if let Some(album) = st.current_album() {
         ui.set_current_album_title(album.title.clone().into());
         ui.set_current_album_artist(album.artist.clone().into());
+        ui.set_current_album_genre(album.genre.clone().into());
         ui.set_current_album_count(album.tracks.len() as i32);
 
         // Painel de faixas visível: publica as faixas do disco aberto
@@ -819,6 +820,7 @@ fn mirror_nav(ui: &MainWindow, st: &AppState) {
     } else {
         ui.set_current_album_title("".into());
         ui.set_current_album_artist("".into());
+        ui.set_current_album_genre("".into());
         ui.set_current_album_count(0);
     }
 }
@@ -969,6 +971,7 @@ fn album_info_to_data(a: &AlbumInfo) -> AlbumData {
         key: a.key.clone().into(),
         title: a.title.clone().into(),
         artist: a.artist.clone().into(),
+        genre: a.genre.clone().into(),
         initial: a.initial.clone().into(),
         palette: a.palette as i32,
         has_cover: false,

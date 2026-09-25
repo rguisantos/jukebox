@@ -152,6 +152,24 @@ impl Database {
             [],
         )?;
 
+        // v9: catálogo ordenado por pasta Gênero/Artista/Álbum. Bases antigas
+        // têm gênero só do ID3 (ou "Desconhecido") — wipe força o scanner a
+        // reler as pastas. Os arquivos em /dados/musicas não são tocados.
+        const CATALOG_SCHEMA: i64 = 9;
+        let schema = self.read_counter("catalog_schema").unwrap_or(0);
+        if schema < CATALOG_SCHEMA {
+            log::warn!(
+                "Migração catálogo v{}: re-indexando (gênero/artista/álbum pela pasta).",
+                CATALOG_SCHEMA
+            );
+            self.conn.execute("DELETE FROM tracks;", [])?;
+            self.conn.execute(
+                "INSERT INTO system_state (key, value) VALUES ('catalog_schema', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+                params![CATALOG_SCHEMA],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -328,17 +346,17 @@ impl Database {
     // MÓDULO 7 — Catálogo agrupado por álbum (navegação por capas)
     // =========================================================================
 
-    /// Retorna o catálogo inteiro agrupado por (artista, álbum), pronto para
-    /// o carrossel de capas: um `AlbumInfo` por disco, cada um com suas
-    /// faixas ordenadas por título. O agrupamento preserva a ordem da
-    /// consulta (artista → álbum → título), então os discos aparecem no
-    /// carrossel em ordem alfabética de artista.
+    /// Catálogo agrupado por (artista, álbum), ordenado para o carrossel:
+    /// gênero → artista → álbum → faixa.
     pub fn get_albums(&self) -> Result<Vec<AlbumInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, artist, album, file_path, file_type, genre
              FROM tracks
              WHERE genre NOT IN (SELECT genre FROM blocked_genres)
-             ORDER BY artist ASC, album ASC, title ASC;",
+             ORDER BY genre COLLATE NOCASE ASC,
+                      artist COLLATE NOCASE ASC,
+                      album COLLATE NOCASE ASC,
+                      title COLLATE NOCASE ASC;",
         )?;
 
         let rows = stmt
@@ -372,6 +390,7 @@ impl Database {
                     albums.push(AlbumInfo {
                         title: track.album.clone(),
                         artist: track.artist.clone(),
+                        genre: track.genre.clone(),
                         key,
                         initial,
                         palette,

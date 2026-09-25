@@ -59,6 +59,7 @@ export struct AlbumData {
     key: string,
     title: string,
     artist: string,
+    genre: string,
     initial: string,
     palette: int,
     has-cover: bool,
@@ -264,12 +265,14 @@ component AlbumCard inherits Rectangle {
         horizontal-alignment: center;
     }
 
-    // Artista
+    // Artista + gênero (carrossel já vem ordenado gênero → artista → álbum)
     Text {
         y: 206px;
         x: 0;
         width: parent.width;
-        text: root.album.artist;
+        text: root.album.genre != ""
+            ? "\{root.album.genre}  ·  \{root.album.artist}"
+            : root.album.artist;
         color: #6b7280;
         font-size: 13px;
         overflow: elide;
@@ -450,6 +453,7 @@ export component MainWindow inherits Window {
     // Álbum aberto no painel de faixas (Camada 2)
     in-out property <string> current-album-title: "";
     in-out property <string> current-album-artist: "";
+    in-out property <string> current-album-genre: "";
     in-out property <int> current-album-count: 0;
     in-out property <[TrackData]> current-album-tracks: [];
     in-out property <int> selected-track: 0;
@@ -691,7 +695,9 @@ export component MainWindow inherits Window {
                                 alignment: space-between;
 
                                 Text {
-                                    text: "DISCOS  ·  \{root.albums.length}";
+                                    text: root.current-album-genre != ""
+                                        ? "\{root.current-album-genre}  ·  \{root.albums.length} DISCOS"
+                                        : "DISCOS  ·  \{root.albums.length}";
                                     color: #818cf8;
                                     font-size: 15px;
                                     font-weight: 700;
@@ -765,7 +771,9 @@ export component MainWindow inherits Window {
 
                                 Text {
                                     text: root.current-album-artist != ""
-                                        ? root.current-album-artist
+                                        ? (root.current-album-genre != ""
+                                            ? "\{root.current-album-genre}  ·  \{root.current-album-artist}"
+                                            : root.current-album-artist)
                                         : "Navegue com E e R";
                                     color: #94a3b8;
                                     font-size: 15px;
@@ -839,7 +847,9 @@ export component MainWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: root.current-album-title;
+                                    text: root.current-album-genre != ""
+                                        ? "\{root.current-album-genre}  ·  \{root.current-album-title}"
+                                        : root.current-album-title;
                                     color: #f8fafc;
                                     font-size: 16px;
                                     font-weight: 800;

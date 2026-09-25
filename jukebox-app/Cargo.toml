@@ -58,11 +58,14 @@ qrcode = { version = "0.14", default-features = false }
 # 256x256 com cache em /dados/capas. Features mínimas (só jpeg/png, sem
 # rayon/parallel) — a crate já entra no build via slint/femtovg, custo zero.
 # =============================================================================
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Utilitários de Comunicação e Logging
 log = "0.4"
 env_logger = "0.11"
+
+# Prioridade real-time na thread do player (SCHED_FIFO) — precisa CAP_SYS_NICE
+libc = "0.2"
 
 [build-dependencies]
 slint-build = "=1.8.0"

@@ -87,6 +87,35 @@ pub fn spawn(cmd_rx: Receiver<PlayerCommand>, event_tx: Sender<PlayerEvent>) {
     thread::Builder::new()
         .name("gstreamer-player".to_string())
         .spawn(move || {
+            // Timer-based scheduling do ALSA no Sempron 145 single-core gera
+            // glitches quando a UI (FemtoVG) ou a thread de capas pica a CPU.
+            // Precisa estar setado ANTES do gst::init().
+            std::env::set_var("GST_ALSA_TSCHED", "0");
+
+            // Prioridade da thread do player (SCHED_FIFO se CAP_SYS_NICE;
+            // senão nice negativo). O decode do GStreamer roda em threads
+            // próprias — esta thread só conduz o pipeline, mas não pode
+            // perder o poll do bus para a UI.
+            #[cfg(target_os = "linux")]
+            {
+                use libc::{sched_param, sched_setscheduler, SCHED_FIFO};
+                let param = sched_param { sched_priority: 10 };
+                let res = unsafe { sched_setscheduler(0, SCHED_FIFO, &param) };
+                if res == 0 {
+                    log::info!("Player: thread promovida a SCHED_FIFO (prioridade 10).");
+                } else {
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+                    let nice = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, -10) };
+                    if nice == 0 {
+                        log::info!("Player: nice -10 aplicado (sem CAP_SYS_NICE para FIFO).");
+                    } else {
+                        log::warn!(
+                            "Player: sem SCHED_FIFO nem nice -10 (CAP_SYS_NICE ausente). Áudio compete em igualdade com a UI."
+                        );
+                    }
+                }
+            }
+
             log::info!("Player: thread do GStreamer iniciada.");
 
             // gst::init() é pré-requisito único e global — sem ele nada existe.
@@ -168,8 +197,16 @@ impl Player {
         };
 
         // ---- Saída de áudio: ALSA direto, sem servidor de som ----
+        // Chiado em CPU alta = underrun. `tsched` NÃO é propriedade do
+        // alsasink (setar isso fazia o build falhar e cair no autoaudiosink
+        // sem buffer grande). GST_ALSA_TSCHED=0 já foi exportado acima.
+        // sync permanece true: sync=false despeja samples fora do clock e
+        // piora o chiado. Buffers grandes absorvem picos da UI/capas.
         let audio_sink = match gst::ElementFactory::make("alsasink")
             .name("jukebox-audio-sink")
+            .property("buffer-time", 800_000i64) // 800ms
+            .property("latency-time", 100_000i64) // 100ms período de refill
+            .property("device", "default")
             .build()
         {
             Ok(sink) => sink,
@@ -185,6 +222,19 @@ impl Player {
         playbin.set_property("video-sink", &video_sink);
         playbin.set_property("audio-sink", &audio_sink);
         playbin.set_property("volume", 1.0_f64);
+        // ~2s de pré-buffer no playbin (ns) — decode pode atrasar no Sempron
+        playbin.set_property("buffer-duration", 2_000_000_000i64);
+
+        // Fila entre decode e alsasink (thread própria). 2s em ns, sem
+        // limite de buffers/bytes — o tempo é o teto de RAM.
+        let audio_queue = gst::ElementFactory::make("queue")
+            .name("jukebox-audio-queue")
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 2_000_000_000u64)
+            .build()
+            .map_err(|e| format!("queue de áudio indisponível: {e}"))?;
+        playbin.set_property("audio-filter", &audio_queue);
 
         // playbin implementa a interface GstVideoOverlay: repassa o handle
         // e o retângulo para o sink real mesmo trocando de sink internamente
