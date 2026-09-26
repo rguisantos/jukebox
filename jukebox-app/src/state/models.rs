@@ -429,13 +429,13 @@ impl AppState {
                 }
                 'w' => {
                     if !self.albums.is_empty() {
-                        self.album_index = self.album_index.saturating_sub(2);
+                        self.album_index = (self.album_index + 4).min(self.albums.len() - 1);
                     }
                     Some(Action::Noop)
                 }
                 'q' => {
                     if !self.albums.is_empty() {
-                        self.album_index = (self.album_index + 2).min(self.albums.len() - 1);
+                        self.album_index = self.album_index.saturating_sub(4);
                     }
                     Some(Action::Noop)
                 }
@@ -466,11 +466,11 @@ impl AppState {
 
             FocusState::AlphabetPicker => match key {
                 'e' | 'w' => {
-                    self.letter_index = self.letter_index.saturating_sub(1);
+                    self.letter_index = (self.letter_index + 1).min(ALPHABET_ITEMS.len() - 1);
                     Some(Action::LetterMoved(self.letter_index))
                 }
                 'r' | 'q' => {
-                    self.letter_index = (self.letter_index + 1).min(ALPHABET_ITEMS.len() - 1);
+                    self.letter_index = self.letter_index.saturating_sub(1);
                     Some(Action::LetterMoved(self.letter_index))
                 }
                 'i' => {
@@ -492,13 +492,13 @@ impl AppState {
 
             FocusState::BrowsingTracks => match key {
                 'w' => {
-                    self.track_index = self.track_index.saturating_sub(1);
-                    Some(Action::Noop)
-                }
-                'q' => {
                     if self.track_count() > 0 {
                         self.track_index = (self.track_index + 1).min(self.track_count() - 1);
                     }
+                    Some(Action::Noop)
+                }
+                'q' => {
+                    self.track_index = self.track_index.saturating_sub(1);
                     Some(Action::Noop)
                 }
                 'i' => {
@@ -564,11 +564,11 @@ impl AppState {
             // W/Q navegam, O entra/confirma, U fecha e volta à tela anterior.
             FocusState::OperatorMainMenu => match key {
                 'w' => {
-                    self.menu_index = self.menu_index.saturating_sub(1);
+                    self.menu_index = (self.menu_index + 1).min(OPERATOR_MENU_ITEMS - 1);
                     Some(Action::Noop)
                 }
                 'q' => {
-                    self.menu_index = (self.menu_index + 1).min(OPERATOR_MENU_ITEMS - 1);
+                    self.menu_index = self.menu_index.saturating_sub(1);
                     Some(Action::Noop)
                 }
                 'o' => match self.menu_index {
@@ -608,11 +608,11 @@ impl AppState {
             // O ou U salvam e voltam ao menu principal.
             FocusState::OperatorPriceMenu => match key {
                 'w' => {
-                    self.price_value = (self.price_value + 1).min(SONG_PRICE_MAX);
+                    self.price_value = self.price_value.saturating_sub(1).max(SONG_PRICE_MIN);
                     Some(Action::Noop)
                 }
                 'q' => {
-                    self.price_value = self.price_value.saturating_sub(1).max(SONG_PRICE_MIN);
+                    self.price_value = (self.price_value + 1).min(SONG_PRICE_MAX);
                     Some(Action::Noop)
                 }
                 'o' | 'u' => {
@@ -627,11 +627,11 @@ impl AppState {
             // Submenu de dias para recém-adicionados (*)
             FocusState::OperatorRecentDaysMenu => match key {
                 'w' | 'r' => {
-                    self.recent_days_value = (self.recent_days_value + 5).min(365);
+                    self.recent_days_value = self.recent_days_value.saturating_sub(5).max(1);
                     Some(Action::Noop)
                 }
                 'q' | 'e' => {
-                    self.recent_days_value = self.recent_days_value.saturating_sub(5).max(1);
+                    self.recent_days_value = (self.recent_days_value + 5).min(365);
                     Some(Action::Noop)
                 }
                 'o' | 'u' => {
@@ -649,13 +649,13 @@ impl AppState {
             FocusState::OperatorGenreMenu => match key {
                 'w' => {
                     if !self.genres.is_empty() {
-                        self.genre_index = self.genre_index.saturating_sub(1);
+                        self.genre_index = (self.genre_index + 1).min(self.genres.len() - 1);
                     }
                     Some(Action::Noop)
                 }
                 'q' => {
                     if !self.genres.is_empty() {
-                        self.genre_index = (self.genre_index + 1).min(self.genres.len() - 1);
+                        self.genre_index = self.genre_index.saturating_sub(1);
                     }
                     Some(Action::Noop)
                 }

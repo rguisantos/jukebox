@@ -1,60 +1,23 @@
 // =============================================================================
 // JUKEBOX ARCADE OS — Interface principal (Slint) — MÓDULOS 7 e 8
 // -----------------------------------------------------------------------------
-// Layout 1024x768 para kiosk de bar — navegação 100% por controles arcade
-// (controladora USB "Zero Delay" vista como teclado: E/R/I/W/Q/O/U/P/Z/X).
-//
-//   ┌──────────────────────────────────────────┬──────────────┐
-//   │  HEADER: título + badge de créditos      │              │
-//   ├──────────────────────────────────────────┤  TOCANDO     │
-//   │                                          │  AGORA       │
-//   │   CAMADA 1: CARROSSEL DE CAPAS (E/R/I)   ├──────────────┤
-//   │   CAMADA 2: FAIXAS DO ÁLBUM (W/Q/O/U)    │  A SEGUIR    │
-//   │   ou ÁREA DE VÍDEO (XVideo embutido,     │  (fila)      │
-//   │    pintado pelo GStreamer nesta região)  ├──────────────┤
-//   │                                          │  PAGUE COM   │
-//   ├──────────────────────────────────────────┤  PIX (QR)    │
-//   │  FOOTER: mapa das teclas arcade          │              │
-//   └──────────────────────────────────────────┴──────────────┘
-//
-//   Overlays flutuantes (desenhados por cima de tudo):
-//     · Barra de volume (P abre; W/Q ajusta; U fecha) — faixa do topo
-//     · Menu do operador (X abre; W/Q navega; O confirma; U fecha):
-//       MÓDULO 8 — painel de stats (odômetro, caixa parcial, preço) +
-//       6 opções (sync, preço, gêneros, zerar caixa, zerar créditos,
-//       desligar) + submenus de Preço (W/Q/O-U) e Gêneros (W/Q/O/U)
-//     · Sincronização USB (Módulo 4, tela cheia)
-//     · Toast de notificações (PIX, erros, fila cheia...)
-//
-//   A máquina de estados de foco vive em Rust (state/models.rs — AppState)
-//   e é espelhada aqui pela propriedade `ui-focus`:
-//     0 = BrowsingAlbums     · 1 = BrowsingTracks
-//     2 = VolumeControl      · 3 = OperatorMainMenu (Módulo 8)
-//     4 = OperatorPriceMenu  · 5 = OperatorGenreMenu  (Módulo 8)
-//   O Slint é RENDERIZADOR PURO do estado: nenhuma decisão de navegação é
-//   tomada aqui — apenas camadas condicionais e feedback visual.
-//
-//   Animações: instantâneas por especificação (GPU GMA 3150 + Sempron 145).
+// Teclas verticais: Q = cima, W = baixo (remapeadas conforme solicitado).
 // =============================================================================
 
 import { ListView, Spinner } from "std-widgets.slint";
 
-// Estrutura compartilhada entre Slint e Rust (catálogo e fila)
+// -----------------------------------------------------------------------------
+// Estruturas compartilhadas com Rust
+// -----------------------------------------------------------------------------
 export struct TrackData {
     id: int,
     title: string,
     artist: string,
     album: string,
     file-type: string,
-    // Caminho no disco — invisível na UI, usado pelo player ao tocar
     file-path: string,
 }
 
-// MÓDULO 7 — Um disco do catálogo (cartão do carrossel de capas).
-// `tracks` é o modelo aninhado (Model de Músicas dentro do Model de Álbuns).
-// `cover` chega depois, preenchido pela thread de capas (ID3 APIC → RGB)
-// via substituição de linha do VecModel no Rust — `has-cover` acende a
-// textura; antes disso o disco mostra o placeholder colorido com a inicial.
 export struct AlbumData {
     key: string,
     title: string,
@@ -68,9 +31,6 @@ export struct AlbumData {
     tracks: [TrackData],
 }
 
-// MÓDULO 8 — Um gênero musical do acervo para o submenu "Bloquear Gêneros"
-// do operador: nome (tag ID3), contagem de faixas e situação de bloqueio
-// (gêneros bloqueados não aparecem no catálogo público do carrossel).
 export struct GenreData {
     name: string,
     blocked: bool,
@@ -78,22 +38,20 @@ export struct GenreData {
 }
 
 // =============================================================================
-// Linha de faixa (56px — altura referência para a navegação por teclado)
+// Linha de faixa (56px)
 // =============================================================================
 component TrackRow inherits Rectangle {
     in property <int> index;
     in property <TrackData> track;
     in property <bool> is-selected;
     in property <bool> is-playing;
-    in property <bool> has-focus-list; // painel visível (vídeo não tocando)
+    in property <bool> has-focus-list;
 
-    // Dispara quando o operador toca/clica na linha (a MainWindow conecta)
     callback activated(int);
 
     height: 56px;
     background: is-selected && has-focus-list ? #1c2033 : (mod(index, 2) == 0 ? #0d0e14 : #101118);
 
-    // Barra de acento à esquerda quando selecionada
     Rectangle {
         x: 0; y: 0;
         width: 4px; height: parent.height;
@@ -105,7 +63,6 @@ component TrackRow inherits Rectangle {
         padding-right: 24px;
         spacing: 16px;
 
-        // Número da faixa (ou indicador "tocando")
         Text {
             text: is-playing ? "♪" : "\{index + 1}";
             color: is-playing ? #34d399 : (is-selected && has-focus-list ? #a5b4fc : #4b5563);
@@ -116,7 +73,6 @@ component TrackRow inherits Rectangle {
             horizontal-alignment: center;
         }
 
-        // Ícone do tipo de mídia (♫ áudio / ▶ vídeo)
         Text {
             text: track.file-type == "mp3" || track.file-type == "wav" ? "♫" : "▶";
             color: track.file-type == "mp3" || track.file-type == "wav" ? #818cf8 : #34d399;
@@ -126,7 +82,6 @@ component TrackRow inherits Rectangle {
             horizontal-alignment: center;
         }
 
-        // Título
         Text {
             text: track.title;
             color: is-playing ? #6ee7b7 : (is-selected && has-focus-list ? #f8fafc : #e5e7eb);
@@ -137,7 +92,6 @@ component TrackRow inherits Rectangle {
             horizontal-stretch: 1;
         }
 
-        // Artista
         Text {
             text: track.artist;
             color: #9ca3af;
@@ -149,16 +103,13 @@ component TrackRow inherits Rectangle {
         }
     }
 
-    // Toque/clique também seleciona e executa (telas de toque de bar)
     TouchArea {
-        clicked => {
-            root.activated(root.index);
-        }
+        clicked => { root.activated(root.index); }
     }
 }
 
 // =============================================================================
-// Linha compacta da fila "A seguir"
+// Linha compacta da fila
 // =============================================================================
 component QueueRow inherits Rectangle {
     in property <int> index;
@@ -204,27 +155,26 @@ component QueueRow inherits Rectangle {
 }
 
 // =============================================================================
-// MÓDULO 7 — Cartão de disco do carrossel de capas
+// Cartão de disco — tamanho chega de fora via `size` (responsivo)
 // =============================================================================
 component AlbumCard inherits Rectangle {
+    in property <length> size: 168px;
     in property <int> index;
     in property <AlbumData> album;
     in property <bool> is-selected;
     callback activated(int);
 
-    width: 176px;
-    height: 232px;
+    width: root.size;
+    height: root.size;
     background: transparent;
 
-    // Moldura da capa: arte embutida ou placeholder colorido com a inicial.
-    // A paleta vem do hash da chave do disco (Rust) — cor estável para sempre.
     Rectangle {
-        y: 0;
-        width: 176px;
-        height: 176px;
-        border-radius: 12px;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        border-radius: 14px;
         clip: true;
-        border-width: root.is-selected ? 3px : 1px;
+        border-width: root.is-selected ? 4px : 1px;
         border-color: root.is-selected ? #818cf8 : #1e2438;
         background: root.album.palette == 0 ? #312e81 :
                     root.album.palette == 1 ? #134e4a :
@@ -233,7 +183,6 @@ component AlbumCard inherits Rectangle {
                     root.album.palette == 4 ? #4c1d95 :
                                               #14532d;
 
-        // Arte real (pixels RGB da thread de capas — sem I/O de disco)
         if root.album.has-cover : Image {
             x: 0; y: 0;
             width: parent.width;
@@ -242,24 +191,23 @@ component AlbumCard inherits Rectangle {
             image-fit: ImageFit.cover;
         }
 
-        // Placeholder: inicial do título do disco
         if !root.album.has-cover : Text {
             text: root.album.initial;
             color: #cbd5e1;
-            font-size: 64px;
+            font-size: 90px;
             font-weight: 800;
             horizontal-alignment: center;
             vertical-alignment: center;
         }
 
-        // Badge de recém-adicionado (*)
         if root.album.is-recent : Rectangle {
-            x: parent.width - 32px;
-            y: 6px;
+            x: parent.width - 34px;
+            y: 10px;
             width: 26px;
             height: 26px;
             border-radius: 13px;
             background: #f59e0be6;
+
             Text {
                 text: "★";
                 color: #ffffff;
@@ -271,60 +219,29 @@ component AlbumCard inherits Rectangle {
         }
     }
 
-    // Título do disco
-    Text {
-        y: 184px;
-        x: 0;
-        width: parent.width;
-        text: root.album.title;
-        color: root.is-selected ? #f8fafc : #cbd5e1;
-        font-size: 15px;
-        font-weight: root.is-selected ? 700 : 600;
-        overflow: elide;
-        horizontal-alignment: center;
-    }
-
-    // Artista + gênero (carrossel já vem ordenado gênero → artista → álbum)
-    Text {
-        y: 206px;
-        x: 0;
-        width: parent.width;
-        text: root.album.genre != ""
-            ? "\{root.album.genre}  ·  \{root.album.artist}"
-            : root.album.artist;
-        color: #6b7280;
-        font-size: 13px;
-        overflow: elide;
-        horizontal-alignment: center;
-    }
-
-    // Escurece os cartões não selecionados (troca instantânea, sem animação)
     if !root.is-selected : Rectangle {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
+        border-radius: 14px;
         background: #00000059;
     }
 
-    // Toque/clique na capa abre o disco (equivalente à tecla I)
     TouchArea {
-        clicked => {
-            root.activated(root.index);
-        }
+        clicked => { root.activated(root.index); }
     }
 }
 
 // =============================================================================
-// MÓDULO 8 — Linha do menu do operador (sync, preço, gêneros, zeragens,
-// desligar). `danger` pinta o valor de vermelho (operações destrutivas).
+// MÓDULO 8 — Linha do menu do operador
 // =============================================================================
 component OperatorMenuRow inherits Rectangle {
     in property <int> index;
     in property <int> selected-index;
     in property <string> label;
     in property <string> value;
-    in property <bool> actionable; // linha executável (O confirma)
-    in property <bool> danger;    // operação destrutiva (valor em vermelho)
+    in property <bool> actionable;
+    in property <bool> danger;
 
     height: 64px;
     background: root.index == root.selected-index ? #1c2033 : #101118;
@@ -334,7 +251,6 @@ component OperatorMenuRow inherits Rectangle {
         : #1e2438;
     border-radius: 10px;
 
-    // Barra de acento à esquerda quando selecionada
     Rectangle {
         x: 0; y: 10px;
         width: 4px;
@@ -374,8 +290,7 @@ component OperatorMenuRow inherits Rectangle {
 }
 
 // =============================================================================
-// MÓDULO 8 — Linha de gênero do submenu "Bloquear Gêneros"
-// [✓] = liberado no catálogo · [✕] = bloqueado (invisível para o freguês)
+// MÓDULO 8 — Linha de gênero
 // =============================================================================
 component GenreRow inherits Rectangle {
     in property <int> index;
@@ -385,7 +300,6 @@ component GenreRow inherits Rectangle {
     height: 56px;
     background: root.is-selected ? #1c2033 : (mod(root.index, 2) == 0 ? #0d0e14 : #101118);
 
-    // Barra de acento à esquerda quando selecionada
     Rectangle {
         x: 0; y: 0;
         width: 4px; height: parent.height;
@@ -397,7 +311,6 @@ component GenreRow inherits Rectangle {
         padding-right: 24px;
         spacing: 16px;
 
-        // Indicador de bloqueio (troca instantânea, sem animação)
         Text {
             text: root.genre.blocked ? "[✕]" : "[✓]";
             color: root.genre.blocked ? #f87171 : #34d399;
@@ -408,7 +321,6 @@ component GenreRow inherits Rectangle {
             horizontal-alignment: center;
         }
 
-        // Nome do gênero (tag ID3 das faixas do acervo)
         Text {
             text: root.genre.name;
             color: root.is-selected ? #f8fafc : (root.genre.blocked ? #6b7280 : #e5e7eb);
@@ -419,7 +331,6 @@ component GenreRow inherits Rectangle {
             horizontal-stretch: 1;
         }
 
-        // Contagem de faixas do acervo (mesmo bloqueado — dado do operador)
         Text {
             text: "\{root.genre.count} faixas";
             color: #6b7280;
@@ -429,7 +340,6 @@ component GenreRow inherits Rectangle {
             horizontal-alignment: right;
         }
 
-        // Situação no catálogo público
         Text {
             text: root.genre.blocked ? "BLOQUEADO" : "LIVRE";
             color: root.genre.blocked ? #f87171 : #34d399;
@@ -451,25 +361,14 @@ export component MainWindow inherits Window {
     preferred-width: 1024px;
     preferred-height: 768px;
 
-    // =========================================================================
-    // Estado sincronizado com as threads de controle Rust
-    // =========================================================================
-
-    // Créditos e catálogo agrupado (Módulos 1, 2 e 7)
+    // ---- Estado sincronizado com Rust ----
     in-out property <int> credits: 0;
     in-out property <bool> scanning: true;
-
-    // MÓDULO 7 — Espelho da máquina de estados de foco (state/models.rs):
-    //   0 = BrowsingAlbums     · 1 = BrowsingTracks
-    //   2 = VolumeControl      · 3 = OperatorMainMenu (Módulo 8)
-    //   4 = OperatorPriceMenu  · 5 = OperatorGenreMenu  (Módulo 8)
     in-out property <int> ui-focus: 0;
 
-    // Catálogo aninhado (Model de Álbuns, cada um com Model de Músicas)
     in-out property <[AlbumData]> albums: [];
     in-out property <int> selected-album: 0;
 
-    // Álbum aberto no painel de faixas (Camada 2)
     in-out property <string> current-album-title: "";
     in-out property <string> current-album-artist: "";
     in-out property <string> current-album-genre: "";
@@ -477,28 +376,20 @@ export component MainWindow inherits Window {
     in-out property <[TrackData]> current-album-tracks: [];
     in-out property <int> selected-track: 0;
 
-    // Overlay de volume (2 = VolumeControl)
     in-out property <int> volume-value: 70;
 
-    // Menu do operador (3/4/5 = telas do Módulo 8)
     in-out property <int> op-menu-index: 0;
     in-out property <string> op-ip: "";
-    // MÓDULO 8 — Painel de stats do operador (header do menu principal)
-    in-out property <int> op-absolute-coins: 0;   // odômetro (nunca zera)
-    in-out property <int> op-partial-coins: 0;    // caixa atual (zerável)
-    in-out property <int> op-song-price: 1;       // preço vigente (créditos)
-    // MÓDULO 8 — Submenu de preço (valor em edição, W/Q alteram)
+    in-out property <int> op-absolute-coins: 0;
+    in-out property <int> op-partial-coins: 0;
+    in-out property <int> op-song-price: 1;
     in-out property <int> op-price-edit: 1;
-    // Submenu de dias recém-adicionados
     in-out property <int> op-recent-days: 30;
     in-out property <int> op-recent-days-edit: 30;
-    // Régua alfabética selecionada
     in-out property <int> selected-letter-index: 0;
-    // MÓDULO 8 — Submenu de gêneros (lista + linha selecionada)
     in-out property <[GenreData]> op-genres: [];
     in-out property <int> op-genre-index: 0;
 
-    // Player e fila (Módulo 3)
     in property <bool> np-active: false;
     in property <int> np-track-id: -1;
     in property <string> np-title: "";
@@ -506,18 +397,15 @@ export component MainWindow inherits Window {
     in property <bool> np-video: false;
     in property <[TrackData]> queue-tracks: [];
 
-    // PIX (Módulo 5)
     in property <image> pix-qr-image;
     in property <bool> pix-loading: true;
     in property <bool> pix-offline: false;
     in property <string> pix-error-text: "";
 
-    // Toast flutuante (kind: 0=informação 1=sucesso 2=erro)
     in property <bool> toast-visible: false;
     in property <string> toast-message: "";
     in property <int> toast-kind: 0;
 
-    // Overlay de sincronização USB (Módulo 4) — state: 1=sincronizando 2=concluído 3=falha
     in property <bool> usb-overlay-visible: false;
     in property <int> usb-state: 1;
     in property <int> usb-total: 0;
@@ -526,23 +414,14 @@ export component MainWindow inherits Window {
     in property <string> usb-current-file: "";
     in property <string> usb-error-text: "";
 
-    // =========================================================================
-    // Callbacks -> core engine Rust
-    // =========================================================================
-    // Único ponto de entrada do teclado: a máquina de estados em Rust decide
-    // o que fazer com cada tecla (case-insensitive) e devolve true quando
-    // o evento foi consumido. Setas/Enter/Esc chegam aqui como aliases
-    // (manutenção com teclado comum — o público do bar usa só o arcade).
+    // ---- Callbacks ----
     callback arcade-key-pressed(string) -> bool;
-    // Clique/toque numa capa do carrossel (equivale à tecla I)
     callback album-activated(int);
-    // Clique/toque numa faixa do álbum aberto (equivale à tecla O)
     callback track-activated(int);
-    callback pix-retry();                                    // botão tentar novamente
-    callback usb-close();                                    // fechar overlay USB
-    callback video-geometry-changed(length, length, length, length); // x,y,w,h da área de vídeo
+    callback pix-retry();
+    callback usb-close();
+    callback video-geometry-changed(length, length, length, length);
 
-    // Direciona o foco do teclado para o handler global
     forward-focus: keyboard-handler;
 
     keyboard-handler := FocusScope {
@@ -576,7 +455,6 @@ export component MainWindow inherits Window {
         }
 
         key-pressed(event) => {
-            // ---- Long press trigger para E e R no carrossel ----
             if (root.ui-focus == 0 && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
                 if (keyboard-handler.last-key != event.text) {
                     keyboard-handler.last-key = event.text;
@@ -586,7 +464,6 @@ export component MainWindow inherits Window {
                 return accept;
             }
 
-            // ---- Aliases de manutenção (teclado USB comum) ----
             if (event.text == Key.LeftArrow) {
                 if (root.arcade-key-pressed("e")) { return accept; }
                 return reject;
@@ -595,12 +472,13 @@ export component MainWindow inherits Window {
                 if (root.arcade-key-pressed("r")) { return accept; }
                 return reject;
             }
+            // Mapeamento vertical invertido: cima = Q, baixo = W
             if (event.text == Key.UpArrow) {
-                if (root.arcade-key-pressed("w")) { return accept; }
+                if (root.arcade-key-pressed("q")) { return accept; }
                 return reject;
             }
             if (event.text == Key.DownArrow) {
-                if (root.arcade-key-pressed("q")) { return accept; }
+                if (root.arcade-key-pressed("w")) { return accept; }
                 return reject;
             }
             if (event.text == Key.Escape) {
@@ -608,8 +486,6 @@ export component MainWindow inherits Window {
                 return reject;
             }
             if (event.text == Key.Return) {
-                // No carrossel, Enter abre o disco (I); no painel de faixas
-                // e no menu do operador, confirma (O)
                 if (root.ui-focus == 0) {
                     if (root.arcade-key-pressed("i")) { return accept; }
                 } else {
@@ -618,9 +494,6 @@ export component MainWindow inherits Window {
                 return reject;
             }
 
-            // ---- Teclas da controladora arcade (Zero Delay) ----
-            // E/R/I/W/Q/O/U/P/Z/X chegam como texto comum, maiúsculo ou
-            // minúsculo — o Rust normaliza antes de despachar.
             if (root.arcade-key-pressed(event.text)) {
                 return accept;
             }
@@ -635,42 +508,31 @@ export component MainWindow inherits Window {
         padding: 0px;
         spacing: 0px;
 
-        // ------------------------------------------------------------------
-        // Barra superior: título + badge de créditos
-        // ------------------------------------------------------------------
+        // ---- Header enxuto: só o badge de créditos --------------------------
         Rectangle {
-            height: 80px;
+            height: 56px;
             background: #0a0b10;
 
-            Text {
-                x: 32px;
-                text: "JUKEBOX ARCADE OS";
-                color: #e5e7eb;
-                font-size: 22px;
-                font-weight: 800;
-                vertical-alignment: center;
-            }
-
             Rectangle {
-                x: parent.width - self.width - 28px;
+                x: parent.width - self.width - 24px;
                 y: (parent.height - self.height) / 2;
-                width: 200px;
-                height: 48px;
+                width: 190px;
+                height: 40px;
                 background: #12131c;
                 border-radius: 10px;
                 border-width: 2px;
                 border-color: #f59e0b;
 
                 HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
+                    padding-left: 14px;
+                    padding-right: 14px;
                     alignment: center;
                     spacing: 10px;
 
                     Text {
                         text: "CRÉDITOS:";
                         color: #9ca3af;
-                        font-size: 16px;
+                        font-size: 15px;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
@@ -678,7 +540,7 @@ export component MainWindow inherits Window {
                     Text {
                         text: "\{root.credits}";
                         color: #fbbf24;
-                        font-size: 22px;
+                        font-size: 20px;
                         font-weight: 800;
                         vertical-alignment: center;
                     }
@@ -688,47 +550,31 @@ export component MainWindow inherits Window {
 
         Rectangle { height: 2px; background: #1e1f2e; }
 
-        // ------------------------------------------------------------------
-        // Corpo: navegação/vídeo (esquerda) + painel lateral (direita)
-        // ------------------------------------------------------------------
+        // ---- Corpo ----------------------------------------------------------
         HorizontalLayout {
             padding: 0px;
             spacing: 0px;
             vertical-stretch: 1;
 
-            // ============================ ESQUERDA =========================
+            // ===================== ESQUERDA ==================================
             Rectangle {
                 horizontal-stretch: 1;
 
-                // CAMADA DE FUNDO: área de vídeo — sempre presente para
-                // reportar geometria ao GStreamer (GstVideoOverlay). O vídeo
-                // é composto pelo X11 ACIMA de qualquer desenho do Slint.
+                // Área de vídeo (fundo)
                 video-area := Rectangle {
                     background: #000000;
 
-                    // Espelha o estado do player nesta propriedade local
-                    // para disparar o callback de geometria também quando
-                    // a área de vídeo acaba de surgir
                     property <bool> video-active: root.np-video;
                     changed video-active => {
                         if (self.video-active) {
                             root.video-geometry-changed(self.x, self.y, self.width, self.height);
                         }
                     }
-                    changed x => {
-                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
-                    }
-                    changed y => {
-                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
-                    }
-                    changed width => {
-                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
-                    }
-                    changed height => {
-                        root.video-geometry-changed(self.x, self.y, self.width, self.height);
-                    }
+                    changed x      => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
+                    changed y      => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
+                    changed width  => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
+                    changed height => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
 
-                    // Durante o vídeo: mensagem discreta (o XVideo pinta aqui)
                     Text {
                         text: "▶  REPRODUZINDO VÍDEO";
                         color: #334155;
@@ -740,77 +586,89 @@ export component MainWindow inherits Window {
                 }
 
                 // =============================================================
-                // CAMADA 1 (ui-focus 0): carrossel de capas de disco
+                // CARROSSEL RESPONSIVO 4×2
+                //
+                // Sem barra de cabeçalho — o grid ocupa toda a área.
+                // As capas crescem até o máximo que caiba 4×2 na tela.
                 // =============================================================
                 if !root.np-video && root.ui-focus != 1 && !root.scanning && root.albums.length > 0 : Rectangle {
                     VerticalLayout {
                         padding: 0px;
                         spacing: 0px;
 
-                        // Cabeçalho do carrossel
-                        Rectangle {
-                            height: 52px;
-                            background: #0c0d13;
-
-                            HorizontalLayout {
-                                padding-left: 32px;
-                                padding-right: 32px;
-                                alignment: space-between;
-
-                                Text {
-                                    text: root.current-album-genre != ""
-                                        ? "\{root.current-album-genre}  ·  \{root.albums.length} DISCOS"
-                                        : "DISCOS  ·  \{root.albums.length}";
-                                    color: #818cf8;
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-
-                                Text {
-                                    text: "E e R navegam   ·   I abre o disco";
-                                    color: #6b7280;
-                                    font-size: 14px;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-
-                        Rectangle { height: 1px; background: #1a1b26; }
-
-                        // Faixa das capas: rolagem horizontal em 2 LINHAS
                         carousel := Rectangle {
                             vertical-stretch: 1;
                             clip: true;
                             background: #08080c;
 
-                            property <length> pitch: 204px;   // largura + espaçamento
-                            property <length> card-w: 176px;
-                            property <int> cols: (root.albums.length + 1) / 2;
-                            property <length> content-w: max(self.cols * self.pitch, self.width);
-                            property <int> selected-col: root.selected-album / 2;
-                            // Centraliza a coluna selecionada (clamp nas bordas)
-                            property <length> raw-off: self.selected-col * self.pitch
-                                - (self.width - self.card-w) / 2;
-                            property <length> off: min(max(0px, self.raw-off), self.content-w - self.width);
+                            // Espaçamento e margens do grid
+                            property <length> gap: 20px;
+                            property <length> pad-x: 16px;
+                            property <length> pad-y: 16px;
 
-                            for album[index] in root.albums : AlbumCard {
-                                x: (index / 2) * carousel.pitch - carousel.off;
-                                y: (mod(index, 2) == 0)
-                                    ? (carousel.height / 2 - self.height) / 2
-                                    : carousel.height / 2 + (carousel.height / 2 - self.height) / 2;
-                                index: index;
-                                album: album;
-                                is-selected: index == root.selected-album;
-                                activated(i) => {
-                                    root.album-activated(i);
+                            // Tamanho máximo que caiba 4 colunas
+                            property <length> cap-by-w:
+                                max(80px,
+                                    (self.width - 2 * self.pad-x - 3 * self.gap) / 4);
+                            // Tamanho máximo que caiba 2 linhas
+                            property <length> cap-by-h:
+                                max(80px,
+                                    (self.height - 2 * self.pad-y - 1 * self.gap) / 2);
+
+                            // Tamanho final da capa (menor dos dois), com
+                            // um teto generoso pra não estourar em monitores
+                            // muito grandes
+                            property <length> cap-size:
+                                min(min(self.cap-by-w, self.cap-by-h), 520px);
+
+                            property <length> pitch-h: self.cap-size + self.gap;
+                            property <length> pitch-v: self.cap-size + self.gap;
+
+                            // Largura total do grid (centralizado horizontal)
+                            property <length> grid-w:
+                                4 * self.cap-size + 3 * self.gap;
+                            property <length> margin-x:
+                                max(0px, (self.width - self.grid-w) / 2);
+                            property <length> margin-y:
+                                max(self.pad-y,
+                                    (self.height - (2 * self.cap-size + self.gap)) / 2);
+
+                            // Paginação: 2 linhas visíveis (8 discos por página)
+                            property <int> selected-row:
+                                floor(root.selected-album / 4);
+                            property <int> current-page:
+                                floor(self.selected-row / 2);
+                            property <length> off-y:
+                                self.current-page * 2 * self.pitch-v;
+
+                            // Teto de linhas — 32 linhas × 4 = 128 discos
+                            for row in 32 : Rectangle {
+                                visible: (row * 4) < root.albums.length;
+                                x: carousel.margin-x;
+                                y: carousel.margin-y
+                                   + row * carousel.pitch-v
+                                   - carousel.off-y;
+                                width: carousel.grid-w;
+                                height: carousel.cap-size;
+                                background: transparent;
+
+                                for col in 4 : AlbumCard {
+                                    visible: (row * 4 + col) < root.albums.length;
+                                    x: col * carousel.pitch-h;
+                                    y: 0;
+                                    size: carousel.cap-size;
+                                    index: row * 4 + col;
+                                    album: root.albums[row * 4 + col];
+                                    is-selected:
+                                        (row * 4 + col) == root.selected-album;
+                                    activated(i) => { root.album-activated(i); }
                                 }
                             }
                         }
 
                         // Painel de informações do disco selecionado
                         Rectangle {
-                            height: 168px;
+                            height: 140px;
                             background: #0c0d13;
 
                             Rectangle {
@@ -821,39 +679,40 @@ export component MainWindow inherits Window {
                             }
 
                             VerticalLayout {
-                                padding: 20px;
-                                spacing: 6px;
+                                padding-top: 16px;
+                                padding-bottom: 16px;
+                                padding-left: 24px;
+                                padding-right: 24px;
+                                spacing: 4px;
 
                                 Text {
                                     text: root.current-album-title != ""
                                         ? root.current-album-title
                                         : "Selecione um disco";
                                     color: root.current-album-title != "" ? #f8fafc : #475569;
-                                    font-size: 24px;
+                                    font-size: 22px;
                                     font-weight: 800;
                                     overflow: elide;
+                                    width: 100%;
                                 }
 
                                 Text {
                                     text: root.current-album-artist != ""
-                                        ? (root.current-album-genre != ""
-                                            ? "\{root.current-album-genre}  ·  \{root.current-album-artist}"
-                                            : root.current-album-artist)
+                                        ? root.current-album-artist
                                         : "Navegue com E e R";
                                     color: #94a3b8;
-                                    font-size: 15px;
+                                    font-size: 14px;
                                     overflow: elide;
+                                    width: 100%;
                                 }
 
                                 HorizontalLayout {
                                     spacing: 16px;
                                     alignment: start;
 
-                                    // Chamada de ação (a tecla I abre as faixas;
-                                    // toque/clique também funciona)
                                     Rectangle {
-                                        width: 300px;
-                                        height: 44px;
+                                        width: 320px;
+                                        height: 40px;
                                         background: cta-touch.has-hover ? #4f46e5 : #6366f1;
                                         border-radius: 10px;
 
@@ -864,9 +723,9 @@ export component MainWindow inherits Window {
                                         }
 
                                         Text {
-                                            text: "APERTE I PARA VER AS MÚSICAS";
+                                            text: "APERE O BOTÃO ESCOLHER PARA ABRIR O ÁLBUM";
                                             color: #ffffff;
-                                            font-size: 13px;
+                                            font-size: 12px;
                                             font-weight: 800;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
@@ -876,7 +735,7 @@ export component MainWindow inherits Window {
                                     Text {
                                         text: "\{root.current-album-count} faixas";
                                         color: #64748b;
-                                        font-size: 14px;
+                                        font-size: 13px;
                                         vertical-alignment: center;
                                     }
                                 }
@@ -886,14 +745,13 @@ export component MainWindow inherits Window {
                 }
 
                 // =============================================================
-                // CAMADA 2 (ui-focus 1): faixas do álbum aberto
+                // CAMADA 2 (ui-focus 1): FAIXAS DO ÁLBUM
                 // =============================================================
                 if !root.np-video && root.ui-focus == 1 && !root.scanning : Rectangle {
                     VerticalLayout {
                         padding: 0px;
                         spacing: 0px;
 
-                        // Cabeçalho do álbum aberto
                         Rectangle {
                             height: 52px;
                             background: #0c0d13;
@@ -935,7 +793,6 @@ export component MainWindow inherits Window {
 
                         Rectangle { height: 1px; background: #1a1b26; }
 
-                        // Lista virtualizada de faixas do disco
                         if root.current-album-tracks.length > 0 : Rectangle {
                             vertical-stretch: 1;
                             background: #08080c;
@@ -947,15 +804,11 @@ export component MainWindow inherits Window {
                                     is-selected: index == root.selected-track;
                                     is-playing: track.id == root.np-track-id;
                                     has-focus-list: root.ui-focus == 1 && !root.np-video;
-                                    activated(i) => {
-                                        root.track-activated(i);
-                                    }
+                                    activated(i) => { root.track-activated(i); }
                                 }
 
-                                // Espelha a seleção para reagir a mudanças dela
                                 property <int> sel: root.selected-track;
 
-                                // Mantém a linha selecionada visível ao navegar
                                 changed sel => {
                                     if (self.sel * 56px < -self.viewport-y) {
                                         self.viewport-y = 0px - self.sel * 56px;
@@ -968,7 +821,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // Estado vazio (catálogo sem faixas e sem escaneamento)
+                // Estado vazio
                 if !root.np-video && root.albums.length == 0 && !root.scanning : Rectangle {
                     VerticalLayout {
                         alignment: center;
@@ -991,7 +844,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // Estado de escaneamento inicial
+                // Estado de escaneamento
                 if !root.np-video && root.scanning : Rectangle {
                     VerticalLayout {
                         alignment: center;
@@ -1017,7 +870,7 @@ export component MainWindow inherits Window {
 
             Rectangle { width: 2px; background: #1e1f2e; }
 
-            // ============================ DIREITA ==========================
+            // ===================== DIREITA ===================================
             Rectangle {
                 width: 310px;
                 background: #0a0b10;
@@ -1026,7 +879,7 @@ export component MainWindow inherits Window {
                     padding: 16px;
                     spacing: 12px;
 
-                    // ---- TOCANDO AGORA -------------------------------------
+                    // ---- TOCANDO AGORA ----
                     Rectangle {
                         height: 116px;
                         background: #12131c;
@@ -1069,7 +922,7 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    // ---- FILA: A SEGUIR ------------------------------------
+                    // ---- A SEGUIR ----
                     Rectangle {
                         vertical-stretch: 1;
                         background: #0d0e14;
@@ -1105,7 +958,7 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    // ---- PAINEL PIX ----------------------------------------
+                    // ---- PIX ----
                     Rectangle {
                         height: 346px;
                         background: #0d1117;
@@ -1126,14 +979,12 @@ export component MainWindow inherits Window {
                                 horizontal-alignment: center;
                             }
 
-                            // Moldura do QR (fundo branco p/ contraste máximo)
                             Rectangle {
                                 width: 248px;
                                 height: 248px;
                                 background: #ffffff;
                                 border-radius: 8px;
 
-                                // Estado: QR pronto
                                 if !root.pix-loading && !root.pix-offline : Image {
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
@@ -1143,7 +994,6 @@ export component MainWindow inherits Window {
                                     image-fit: ImageFit.contain;
                                 }
 
-                                // Estado: gerando QR (spinner nativo animado)
                                 if root.pix-loading : Rectangle {
                                     x: 0; y: 0;
                                     width: parent.width;
@@ -1168,7 +1018,6 @@ export component MainWindow inherits Window {
                                     }
                                 }
 
-                                // Estado: sem conexão + botão de retry
                                 if root.pix-offline && !root.pix-loading : Rectangle {
                                     x: 0; y: 0;
                                     width: parent.width;
@@ -1221,9 +1070,6 @@ export component MainWindow inherits Window {
                                 }
                             }
 
-                            // Preço visível ao freguês (MÓDULO 8): com preço
-                            // dinâmico, mostra o custo da música em créditos
-                            // e o equivalente em R$ (1 crédito = R$ 2,00 PIX)
                             Text {
                                 text: root.op-song-price == 1
                                     ? "R$ 2,00 = 1 CRÉDITO"
@@ -1247,33 +1093,16 @@ export component MainWindow inherits Window {
                 }
             }
         }
-
-        // ------------------------------------------------------------------
-        // Rodapé: mapa das teclas do gabinete arcade
-        // ------------------------------------------------------------------
-        Rectangle {
-            height: 44px;
-            background: #0a0b10;
-
-            Text {
-                text: "E·R capas   ·   I abre   ·   W·Q lista   ·   O toca   ·   U volta   ·   P volume   ·   Z crédito   ·   X operador";
-                color: #4b5563;
-                font-size: 13px;
-                vertical-alignment: center;
-                horizontal-alignment: center;
-            }
-        }
     }
 
     // =========================================================================
-    // OVERLAY: Toast flutuante (notificações PIX, erros, fila cheia...)
-    // Ancorado na COLUNA DIREITA (sobre TOCANDO AGORA / fila): o vídeo XVideo
-    // pinta acima do desenho do Slint na zona esquerda — aqui o toast nunca
-    // fica escondido atrás do vídeo durante uma reprodução.
+    // OVERLAYS
     // =========================================================================
+
+    // ---- Toast ----
     if root.toast-visible : Rectangle {
         x: root.width - 310px + (310px - self.width) / 2;
-        y: 100px;
+        y: 80px;
         height: 56px;
         width: min(toast-text.preferred-width + 56px, 294px);
         border-radius: 14px;
@@ -1299,12 +1128,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // MÓDULO 7 — OVERLAY: barra de volume (ui-focus 2)
-    // Faixa do TOPO da janela (sobre o header): fora do retângulo do vídeo
-    // XVideo (que começa abaixo do header) — dispensa HideVideo/RestoreVideo
-    // e o vídeo não "pisca" durante o ajuste.
-    // =========================================================================
+    // ---- Volume ----
     if root.ui-focus == 2 : Rectangle {
         x: (root.width - self.width) / 2;
         y: 16px;
@@ -1338,7 +1162,6 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
 
-            // Trilha da barra
             Rectangle {
                 height: 10px;
                 width: 210px;
@@ -1365,22 +1188,13 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // MÓDULO 8 — OVERLAY: menu do operador (ui-focus 3) — versão profissional
-    // X abre · W/Q navegam · O entra/confirma · U fecha.
-    // Header: odômetro (nunca zera) | caixa atual (zerável) | preço vigente.
-    // 6 opções: sincronizar pendrive, preço da música (submenu), bloquear
-    // gêneros (submenu), zerar caixa parcial, zerar créditos, desligar.
-    // O diálogo cobre a área do vídeo XVideo — o Rust envia HideVideo ao
-    // abrir e RestoreVideo ao fechar (submenus mantêm o vídeo oculto).
-    // =========================================================================
+    // ---- Menu do operador ----
     if root.ui-focus == 3 : Rectangle {
         x: 0; y: 0;
         width: root.width;
         height: root.height;
         background: #000000e6;
 
-        // Bloqueia cliques-toque por baixo do escurecimento
         TouchArea { }
 
         Rectangle {
@@ -1407,7 +1221,6 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                 }
 
-                // ---- Painel de stats: Odômetro | Caixa Atual | Preço ----
                 Rectangle {
                     height: 52px;
                     background: #12131c;
@@ -1419,11 +1232,9 @@ export component MainWindow inherits Window {
                         padding-left: 8px;
                         padding-right: 8px;
 
-                        // Odômetro absoluto (contadores antifraude)
                         HorizontalLayout {
                             alignment: center;
                             spacing: 8px;
-
                             Text {
                                 text: "ODÔMETRO:";
                                 color: #64748b;
@@ -1431,7 +1242,6 @@ export component MainWindow inherits Window {
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
-
                             Text {
                                 text: "\{root.op-absolute-coins}";
                                 color: #fbbf24;
@@ -1441,16 +1251,11 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        Rectangle {
-                            width: 1px;
-                            background: #1e2438;
-                        }
+                        Rectangle { width: 1px; background: #1e2438; }
 
-                        // Caixa parcial (zerado a cada recolhimento)
                         HorizontalLayout {
                             alignment: center;
                             spacing: 8px;
-
                             Text {
                                 text: "CAIXA ATUAL:";
                                 color: #64748b;
@@ -1458,7 +1263,6 @@ export component MainWindow inherits Window {
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
-
                             Text {
                                 text: "\{root.op-partial-coins}";
                                 color: #34d399;
@@ -1468,16 +1272,11 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        Rectangle {
-                            width: 1px;
-                            background: #1e2438;
-                        }
+                        Rectangle { width: 1px; background: #1e2438; }
 
-                        // Preço vigente da música
                         HorizontalLayout {
                             alignment: center;
                             spacing: 8px;
-
                             Text {
                                 text: "PREÇO:";
                                 color: #64748b;
@@ -1485,7 +1284,6 @@ export component MainWindow inherits Window {
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
-
                             Text {
                                 text: root.op-song-price == 1
                                     ? "1 CRÉDITO"
@@ -1501,7 +1299,6 @@ export component MainWindow inherits Window {
 
                 Rectangle { height: 1px; background: #1e2438; }
 
-                // ---- 7 opções do menu ----
                 OperatorMenuRow {
                     index: 0;
                     selected-index: root.op-menu-index;
@@ -1569,7 +1366,6 @@ export component MainWindow inherits Window {
 
                 Rectangle { height: 1px; background: #1e2438; }
 
-                // Rodapé: IP da máquina (acesso remoto do operador) + mapa de teclas
                 HorizontalLayout {
                     spacing: 12px;
 
@@ -1581,7 +1377,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: "W/Q seleciona   ·   O confirma   ·   U fecha";
+                        text: "Q/W seleciona   ·   O confirma   ·   U fecha";
                         color: #64748b;
                         font-size: 12px;
                         horizontal-alignment: right;
@@ -1593,9 +1389,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // OVERLAY: Régua de seleção rápida alfabética (*) (ui-focus 6)
-    // =========================================================================
+    // ---- Régua alfabética ----
     if root.ui-focus == 6 : Rectangle {
         x: 0; y: 0;
         width: root.width;
@@ -1630,7 +1424,6 @@ export component MainWindow inherits Window {
                     alignment: center;
                     spacing: 6px;
 
-                    // Items: *, A..Z, #
                     for letter[idx] in ["*", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "#"] : Rectangle {
                         width: 26px;
                         height: 36px;
@@ -1651,9 +1444,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // OVERLAY: Submenu de dias recém-adicionados (ui-focus 7)
-    // =========================================================================
+    // ---- Submenu dias recentes ----
     if root.ui-focus == 7 : Rectangle {
         x: 0; y: 0;
         width: root.width;
@@ -1714,7 +1505,7 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
-                    text: "W/R aumenta (+5)   ·   Q/E diminui (-5)";
+                    text: "Q/R aumenta (+5)   ·   W/E diminui (-5)";
                     color: #94a3b8;
                     font-size: 14px;
                     horizontal-alignment: center;
@@ -1730,12 +1521,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // MÓDULO 8 — OVERLAY: submenu de preço (ui-focus 4)
-    // W aumenta · Q diminui · O ou U salva e volta.
-    // Mostra o valor em edição e o equivalente em R$ (1 crédito = R$ 2,00,
-    // mesmo valor do QR PIX — VALOR_PIX do Módulo 5).
-    // =========================================================================
+    // ---- Submenu de preço ----
     if root.ui-focus == 4 : Rectangle {
         x: 0; y: 0;
         width: root.width;
@@ -1768,7 +1554,6 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                 }
 
-                // Valor em edição (troca instantânea, sem animação)
                 Rectangle {
                     height: 150px;
                     background: #12131c;
@@ -1809,7 +1594,7 @@ export component MainWindow inherits Window {
                 Rectangle { height: 1px; background: #1e2438; }
 
                 Text {
-                    text: "W aumenta   ·   Q diminui";
+                    text: "Q aumenta   ·   W diminui";
                     color: #64748b;
                     font-size: 14px;
                     horizontal-alignment: center;
@@ -1825,12 +1610,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // MÓDULO 8 — OVERLAY: submenu de gêneros (ui-focus 5)
-    // W/Q navegam · O alterna o bloqueio [✓]/[✕] · U volta.
-    // Gêneros bloqueados somem do catálogo público (carrossel) na hora —
-    // recarga do modelo instantânea, sem animações (nota de performance).
-    // =========================================================================
+    // ---- Submenu de gêneros ----
     if root.ui-focus == 5 : Rectangle {
         x: 0; y: 0;
         width: root.width;
@@ -1855,7 +1635,6 @@ export component MainWindow inherits Window {
                 padding: 24px;
                 spacing: 12px;
 
-                // Cabeçalho: título + contagem de gêneros do acervo
                 HorizontalLayout {
                     spacing: 16px;
 
@@ -1878,7 +1657,6 @@ export component MainWindow inherits Window {
 
                 Rectangle { height: 1px; background: #1e2438; }
 
-                // Estado vazio (acervo sem faixas indexadas)
                 if root.op-genres.length == 0 : Rectangle {
                     vertical-stretch: 1;
                     background: #08080c;
@@ -1893,7 +1671,6 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // Lista virtualizada de gêneros (56px por linha)
                 if root.op-genres.length > 0 : Rectangle {
                     vertical-stretch: 1;
                     background: #08080c;
@@ -1907,10 +1684,8 @@ export component MainWindow inherits Window {
                             is-selected: index == root.op-genre-index;
                         }
 
-                        // Espelha a seleção para reagir a mudanças dela
                         property <int> sel: root.op-genre-index;
 
-                        // Mantém a linha selecionada visível ao navegar
                         changed sel => {
                             if (self.sel * 56px < -self.viewport-y) {
                                 self.viewport-y = 0px - self.sel * 56px;
@@ -1933,9 +1708,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // =========================================================================
-    // OVERLAY: Sincronização USB (tela cheia — Módulo 4)
-    // =========================================================================
+    // ---- Sincronização USB ----
     if root.usb-overlay-visible : Rectangle {
         x: 0; y: 0;
         width: root.width;
@@ -1957,7 +1730,6 @@ export component MainWindow inherits Window {
                 spacing: 18px;
                 alignment: start;
 
-                // ---- Estado 1: sincronizando ----
                 if root.usb-state == 1 : VerticalLayout {
                     spacing: 14px;
                     alignment: start;
@@ -1977,7 +1749,6 @@ export component MainWindow inherits Window {
                         horizontal-alignment: center;
                     }
 
-                    // Barra de progresso
                     Rectangle {
                         height: 18px;
                         border-radius: 9px;
@@ -2012,7 +1783,6 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // ---- Estado 2: concluído ----
                 if root.usb-state == 2 : VerticalLayout {
                     spacing: 14px;
                     alignment: start;
@@ -2060,7 +1830,6 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // ---- Estado 3: falha ----
                 if root.usb-state == 3 : VerticalLayout {
                     spacing: 14px;
                     alignment: start;
@@ -2108,5 +1877,3 @@ export component MainWindow inherits Window {
         }
     }
 }
-
-
