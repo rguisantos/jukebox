@@ -36,7 +36,7 @@ pub enum DbEvent {
     CycleGenre(Vec<AlbumInfo>),
     Catalog(Vec<AlbumInfo>),
     Enqueue(TrackInfo),
-    OperatorStats { partial: u32, absolute: u32, revenue: Result<i64, String>, price: u32,
+    OperatorStats { partial: i64, absolute: i64, revenue: Result<i64, String>, price: u32,
         recent_days: u32, genres: Vec<GenreInfo> },
     SongPrice(u32),
     PartialReset,

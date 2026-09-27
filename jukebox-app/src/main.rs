@@ -44,7 +44,7 @@ use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
 use storage::service::{self, DbEvent, DbHandle};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use state::models::{
-    Action, AppState, FocusState, TrackInfo, VOLUME_DEFAULT,
+    Action, AppState, FocusState, VOLUME_DEFAULT,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // 1. Banco de dados e estado inicial
     // =========================================================================
-    let mut db = match Database::open() {
+    let db = match Database::open() {
         Ok(database) => database,
         Err(err) => {
             log::error!("Erro crítico ao inicializar o banco de dados: {}", err);
