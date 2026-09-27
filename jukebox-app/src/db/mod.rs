@@ -72,6 +72,7 @@ impl Database {
         )?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS operator_settings (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cash_receipts (receipt TEXT PRIMARY KEY, cents INTEGER NOT NULL, credits INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS pix_receipts (machine_id TEXT NOT NULL, txid TEXT NOT NULL, credits INTEGER NOT NULL CHECK(credits > 0), created_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(machine_id, txid));
             CREATE TABLE IF NOT EXISTS conversion_session (id INTEGER PRIMARY KEY CHECK(id=1), cents INTEGER NOT NULL, awarded INTEGER NOT NULL);
             INSERT OR IGNORE INTO conversion_session VALUES(1,0,0);")?;
         if self
@@ -293,6 +294,29 @@ impl Database {
 
         tx.commit()?;
         Ok(new_credits.max(0) as u32)
+    }
+
+    /// A payment receipt and its credits are committed together. Replaying a
+    /// confirmation returns the current balance without granting credit again.
+    pub fn accept_pix(&mut self, machine_id: &str, txid: &str, credits: u32) -> Result<(u32, bool)> {
+        if machine_id.trim().is_empty() || txid.trim().is_empty() || credits == 0 || credits > 100_000 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO pix_receipts(machine_id,txid,credits) VALUES(?1,?2,?3)",
+            params![machine_id, txid, credits],
+        )? != 0;
+        let current: u32 = tx.query_row("SELECT value FROM system_state WHERE key='credits'", [], |r| r.get(0))?;
+        if inserted {
+            current.checked_add(credits).filter(|v| *v <= i32::MAX as u32)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            tx.execute("UPDATE system_state SET value=value+?1 WHERE key IN ('credits','partial_coins','absolute_coins')", [credits])?;
+            tx.execute("INSERT INTO credits_audit(amount) VALUES(?1)", [credits])?;
+        }
+        let balance = if inserted { current + credits } else { current };
+        tx.commit()?;
+        Ok((balance, inserted))
     }
 
     pub fn settings(&self) -> Result<Settings> {
@@ -1011,6 +1035,31 @@ mod queue_tests {
                 db.pending_tracks().unwrap()[0].1.file_path,
                 track().file_path
             );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pix_receipt_is_atomic_and_survives_reopening() {
+        let path = std::env::temp_dir().join(format!(
+            "jukebox-pix-{}-{}.db", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            let mut db = Database { conn: Connection::open(&path).unwrap() };
+            db.create_tables().unwrap();
+            assert_eq!(db.accept_pix("machine-1", "tx-1", 2).unwrap(), (2, true));
+            assert_eq!(db.accept_pix("machine-1", "tx-1", 2).unwrap(), (2, false));
+            assert_eq!(db.get_partial_coins().unwrap(), 2);
+            assert_eq!(db.get_absolute_coins().unwrap(), 2);
+        }
+        {
+            let mut db = Database { conn: Connection::open(&path).unwrap() };
+            db.create_tables().unwrap();
+            assert_eq!(db.accept_pix("machine-1", "tx-1", 2).unwrap(), (2, false));
+            assert_eq!(db.accept_pix("machine-1", "tx-2", 2).unwrap(), (4, true));
+            assert_eq!(db.get_credits().unwrap(), 4);
+            assert_eq!(db.get_partial_coins().unwrap(), 4);
         }
         std::fs::remove_file(path).unwrap();
     }

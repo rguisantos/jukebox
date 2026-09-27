@@ -8,7 +8,7 @@
 //!   [AppState] máquina de estados de foco (Módulos 7/8, state/models.rs)
 //!      │ Action::* → banco / player / USB
 //!      ▼
-//!   [Banco SQLite] — créditos: AddCredit (moedeiro+PIX), RequestPlay
+//!   [Banco SQLite] — créditos: CashPulse/AcceptPix, RequestPlay
 //!      (débito do preço vigente), SetVolume (persistente), stats do
 //!      operador (Módulo 7) e contadores antifraude/preço/gêneros (Módulo 8)
 //!      │ (débito atômico → Enqueue no player)
@@ -538,9 +538,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    PixUiEvent::Paid { credits } => {
+                    PixUiEvent::Paid { machine_id, txid, credits } => {
                         // 1) Credita no banco (thread do SQLite)
-                        if let Err(e) = db_tx.add_credit(credits) {
+                        if let Err(e) = db_tx.accept_pix(machine_id, txid, credits) {
                             log::error!("PIX: falha ao enviar crédito ao banco: {}", e);
                         }
                         // 3) O próprio serviço PIX já busca o próximo QR
