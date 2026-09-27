@@ -39,6 +39,15 @@ Não é possível adicionar uma faixa igual à última da fila, incluindo a faix
 atual quando não há outras pendentes. A sequência A/B/A é permitida. Recusas
 por repetição, falta de crédito ou fila cheia não debitam saldo.
 
+O menu do operador exibe, junto ao odômetro de créditos, a receita total
+acumulada em reais, identificada como **Moedeiro** — a soma idempotente dos recebimentos de `cash_receipts`
+formatada como `R$ X.XXX,XX`. Esse odômetro patrimonial nunca zera, nem com
+o recolhimento do caixa parcial, e serve de conferência com o moedeiro e com
+o futuro relatório de PIX. Créditos concedidos por bônus de pacote não o
+afetam: apenas os recebimentos registrados entram na soma. Não inclui o Pix
+atual nem recebimentos anteriores à criação desse registro. A atualização ocorre
+ao abrir o menu. Falhas de consulta mostram “Indisponível”, nunca R$ 0,00.
+
 ## Navegação e vídeo
 
 - O alterna gêneros na tela de álbuns e seleciona música na lista de faixas.
@@ -59,6 +68,11 @@ a imagem a 640×360, 20 fps e um frame pendente para controlar memória e carga.
 É uma escolha de desempenho que precisa ser medida na máquina mais lenta.
 O ALSA `dmix` da distro mistura música e aviso de crédito na placa 0; ajuste
 `/etc/asound.conf` se a saída de áudio do equipamento usar outra placa.
+O aviso de crédito é um arpejo ascendente de duas notas (C5 → C6, ~150ms),
+gerado internamente e reproduzido pela mesma rota do dmix. O intervalo nominal
+entre notas é 75 ms; operações de banco/mídia podem atrasar a segunda nota.
+Entradas rápidas reiniciam as duas notas e substituem o agendamento anterior,
+sem acumular uma fila de efeitos ou modificar os créditos recebidos.
 
 ## Automação e armazenamento
 

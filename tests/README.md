@@ -27,3 +27,16 @@ Ainda não executados: geração/boot da ISO, instalador em disco real, testes d
 Wi-Fi, áudio/vídeo sob carga, medição de RAM com imagens reais e homologação com
 servidor de acervo de produção. O protocolo documentado precisa ser atendido pelo
 servidor ou por um adaptador. A integração de saldo Pix com o serviço do operador continua pendente; o feedback de crédito foi ligado à confirmação local.
+
+## Ajustes da revisão do PR #4
+
+- Consulta de receita com erro mostra Indisponível e registra o erro; zero real
+  continua sendo R$ 0,00. Teste de regressão adicionado.
+- Teste de mídia usa o mesmo CreditArpeggio do comando CreditFx: verifica
+  deadline, substituição do agendamento por entradas rápidas, cancelamento da
+  nota aguda anterior, EOS e música permanecendo em Playing. O tempo do
+  agendador é controlado no teste, sem depender de sleeps de 75 ms.
+- 8 testes Python passaram e git diff --check passou nesta revisão.
+- Testes Rust/GStreamer desta atualização não foram executados: toolchain e
+  bibliotecas nativas indisponíveis; instalação de dependências bloqueada pelo
+  ambiente. Executar cargo test --locked antes do merge e homologar ALSA real.

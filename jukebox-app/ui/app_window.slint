@@ -395,6 +395,9 @@ export component MainWindow inherits Window {
     in-out property <string> op-ip: "";
     in-out property <int> op-absolute-coins: 0;
     in-out property <int> op-partial-coins: 0;
+    // Odômetro patrimonial em reais (SUM(cents) de cash_receipts), formatado
+    // "R$ X.XXX,XX" na thread do banco — a UI só espelha a string pronta.
+    in-out property <string> op-total-revenue: "Indisponível";
     in-out property <int> op-song-price: 1;
     in-out property <int> op-price-edit: 1;
     in-out property <int> op-recent-days: 30;
@@ -1270,22 +1273,37 @@ export component MainWindow inherits Window {
                         padding-left: 8px;
                         padding-right: 8px;
 
-                        HorizontalLayout {
+                        VerticalLayout {
                             alignment: center;
-                            spacing: 8px;
-                            Text {
-                                text: "ODÔMETRO:";
-                                color: #64748b;
-                                font-size: 12px;
-                                font-weight: 700;
-                                vertical-alignment: center;
+                            spacing: 2px;
+
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 8px;
+                                Text {
+                                    text: "ODÔMETRO:";
+                                    color: #64748b;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "\{root.op-absolute-coins}";
+                                    color: #fbbf24;
+                                    font-size: 20px;
+                                    font-weight: 800;
+                                    vertical-alignment: center;
+                                }
                             }
+
+                            // Receita total acumulada em R$ — conferência
+                            // patrimonial junto ao odômetro de créditos.
                             Text {
-                                text: "\{root.op-absolute-coins}";
-                                color: #fbbf24;
-                                font-size: 20px;
+                                text: "Moedeiro: " + root.op-total-revenue;
+                                color: #34d399;
+                                font-size: 13px;
                                 font-weight: 800;
-                                vertical-alignment: center;
+                                horizontal-alignment: center;
                             }
                         }
 

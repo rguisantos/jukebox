@@ -43,6 +43,7 @@ pub enum PlayerCommand {
     HideVideo,
     RestoreVideo,
 }
+
 pub enum PlayerEvent {
     CreditsChanged,
     TrackStarted {
@@ -135,6 +136,69 @@ fn uri(path: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Notas do aviso sonoro de crédito (arpejo ascendente estilo fliperama):
+/// C5 → C6 (523Hz → 1046Hz). `num-buffers=3 × 1024` amostras ≈ 64–70ms por
+/// nota conforme a taxa negociada; o par completa em ~140–150ms.
+const FX_NOTE_LO_HZ: u32 = 523;
+const FX_NOTE_HI_HZ: u32 = 1046;
+/// Intervalo entre as duas notas do arpejo (~75ms por nota).
+const FX_NOTE_GAP: Duration = Duration::from_millis(75);
+
+/// Uma nota do arpejo de crédito: tom curto via `audiotestsrc`, misturado no
+/// dmix junto com a música. Em teste (`JUKEBOX_AUDIO_SINK=fakesink`) usa a
+/// mesma topologia com saída descartada para manter o comportamento medível.
+fn credit_effect(freq: u32, fake: bool) -> Result<gst::Element, String> {
+    let sink = if fake { "fakesink sync=true" } else { "alsasink device=default" };
+    gst::parse::launch(&format!(
+        "audiotestsrc wave=sine freq={freq} num-buffers=3 samplesperbuffer=1024 volume=0.12 \
+         ! audioconvert ! audioresample ! {sink}"
+    )).map_err(|e| e.to_string())
+}
+
+/// Shared by CreditFx and tests. Rapid receipts restart the complete pair:
+/// an old high note is stopped and its deadline is replaced, never queued.
+struct CreditArpeggio {
+    lo: gst::Element,
+    hi: gst::Element,
+    hi_at: Option<Instant>,
+}
+impl CreditArpeggio {
+    fn new(fake: bool) -> Result<Self, String> {
+        Ok(Self { lo: credit_effect(FX_NOTE_LO_HZ, fake)?,
+            hi: credit_effect(FX_NOTE_HI_HZ, fake)?, hi_at: None })
+    }
+    fn trigger(&mut self, now: Instant) {
+        self.stop();
+        if self.lo.set_state(gst::State::Playing).is_ok() {
+            self.hi_at = Some(now + FX_NOTE_GAP);
+        }
+    }
+    fn tick(&mut self, now: Instant) -> bool {
+        let due = self.hi_at.map(|deadline| now >= deadline).unwrap_or(false);
+        if due {
+            self.hi_at = None;
+            let _ = self.hi.set_state(gst::State::Playing);
+        }
+        due
+    }
+    fn drain(&self) {
+        for pipe in [&self.lo, &self.hi] {
+            if let Some(bus) = pipe.bus() {
+                if bus.pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error]).is_some() {
+                    let _ = pipe.set_state(gst::State::Null);
+                }
+            }
+        }
+    }
+    fn stop(&mut self) {
+        self.hi_at = None;
+        for pipe in [&self.lo, &self.hi] { let _ = pipe.set_state(gst::State::Null); }
+    }
+}
+impl Drop for CreditArpeggio {
+    fn drop(&mut self) { self.stop(); }
+}
+
 pub fn spawn(rx: Receiver<PlayerCommand>, tx: Sender<PlayerEvent>) {
     thread::Builder::new()
         .name("jukebox-player".into())
@@ -154,7 +218,7 @@ pub fn spawn(rx: Receiver<PlayerCommand>, tx: Sender<PlayerEvent>) {
 struct Player {
     music: gst::Element,
     background: gst::Element,
-    effect: gst::Element,
+    effect: CreditArpeggio,
     db: Database,
     queue: VecDeque<(i64, TrackInfo)>,
     current: Option<TrackInfo>,
@@ -180,14 +244,8 @@ impl Player {
         background.set_property("video-sink", video_sink(2)?);
         background.set_property("audio-sink", element("fakesink")?);
         background.set_property("mute", true);
-        // Built-in short chime, no external file or license dependency.
-        let effect=gst::parse::launch("audiotestsrc wave=sine freq=880 num-buffers=8 samplesperbuffer=1024 volume=0.12 ! audioconvert ! audioresample ! queue ! fakesink sync=true name=fxsink").map_err(|e|e.to_string())?;
-        // Build a real secondary sink by using a small bin with a source and the chosen output.
-        let effect = if std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink") {
-            effect
-        } else {
-            gst::parse::launch("audiotestsrc wave=sine freq=880 num-buffers=8 samplesperbuffer=1024 volume=0.12 ! audioconvert ! audioresample ! alsasink device=default").map_err(|e|e.to_string())?
-        };
+        // Built-in two-note arcade arpeggio, no external file or license dependency.
+        let effect = CreditArpeggio::new(std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink"))?;
         let db = Database::open().map_err(|e| e.to_string())?;
         let settings = db.settings().map_err(|e| e.to_string())?;
         let queue = db.pending_tracks().map_err(|e| e.to_string())?.into();
@@ -283,6 +341,8 @@ impl Player {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 _ => {}
             }
+            // Nominal 75 ms; synchronous database/media work may delay this tick.
+            self.effect.tick(Instant::now());
             // Service EOS/errors even under continuous key input.
             if let Some(bus) = self.music.bus() {
                 while let Some(msg) =
@@ -324,14 +384,7 @@ impl Player {
                     }
                 }
             }
-            if let Some(bus) = self.effect.bus() {
-                if bus
-                    .pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
-                    .is_some()
-                {
-                    let _ = self.effect.set_state(gst::State::Null);
-                }
-            }
+            self.effect.drain();
             if self.current.is_none() && self.current_id.is_none() {
                 if let Some((id, t)) = self.queue.pop_front() {
                     self.current_id = Some(id);
@@ -364,7 +417,8 @@ impl Player {
                 }
             }
         }
-        for pipe in [&self.music, &self.background, &self.effect] {
+        self.effect.stop();
+        for pipe in [&self.music, &self.background] {
             let _ = pipe.set_state(gst::State::Null);
         }
     }
@@ -424,10 +478,7 @@ impl Player {
                 self.last_activity = Instant::now();
                 self.finish(false);
             }
-            PlayerCommand::CreditFx => {
-                let _ = self.effect.set_state(gst::State::Null);
-                let _ = self.effect.set_state(gst::State::Playing);
-            }
+            PlayerCommand::CreditFx => self.effect.trigger(Instant::now()),
             PlayerCommand::Activity => {
                 self.last_activity = Instant::now();
             }
@@ -562,20 +613,33 @@ mod media_tests {
         assert!(take_frame().is_none());
         pipeline.set_state(gst::State::Null).unwrap();
         let music = gst::parse::launch("audiotestsrc is-live=true ! fakesink sync=true").unwrap();
-        let effect = gst::parse::launch("audiotestsrc num-buffers=8 ! fakesink sync=true").unwrap();
+        let mut effect = CreditArpeggio::new(true).unwrap();
         music.set_state(gst::State::Playing).unwrap();
-        effect.set_state(gst::State::Playing).unwrap();
-        let msg = effect
-            .bus()
-            .unwrap()
-            .timed_pop_filtered(
+        let now = Instant::now();
+        effect.trigger(now);
+        assert_eq!(effect.hi.current_state(), gst::State::Null);
+        assert!(!effect.tick(now + Duration::from_millis(49)));
+        // Another receipt before the deadline restarts the pair.
+        effect.trigger(now + Duration::from_millis(50));
+        assert!(!effect.tick(now + Duration::from_millis(75)));
+        assert!(!effect.tick(now + Duration::from_millis(124)));
+        assert!(effect.tick(now + Duration::from_millis(125)));
+        assert!(!effect.tick(now + Duration::from_millis(126)));
+        // A receipt while the high note is active cancels that note as well.
+        effect.trigger(now + Duration::from_millis(130));
+        assert_eq!(effect.hi.current_state(), gst::State::Null);
+        assert!(!effect.tick(now + Duration::from_millis(204)));
+        assert!(effect.tick(now + Duration::from_millis(205)));
+        for note in [&effect.lo, &effect.hi] {
+            let msg = note.bus().unwrap().timed_pop_filtered(
                 gst::ClockTime::from_seconds(3),
                 &[gst::MessageType::Eos, gst::MessageType::Error],
-            )
-            .unwrap();
-        assert!(matches!(msg.view(), gst::MessageView::Eos(_)));
+            ).unwrap();
+            assert!(matches!(msg.view(), gst::MessageView::Eos(_)));
+        }
         assert_eq!(music.current_state(), gst::State::Playing);
+        effect.stop();
+        assert!(!effect.tick(now + Duration::from_secs(1)));
         music.set_state(gst::State::Null).unwrap();
-        effect.set_state(gst::State::Null).unwrap();
     }
 }

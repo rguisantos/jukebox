@@ -367,16 +367,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     DbCommand::QueryOperatorStats => {
-                        // MÓDULO 8 — Painel do operador: odômetro, caixa parcial,
-                        // preço vigente e a lista de gêneros para o submenu.
+                        // MÓDULO 8 — Painel do operador: odômetro (créditos + R$),
+                        // caixa parcial, preço vigente e gêneros do acervo.
                         let partial = db.get_partial_coins().unwrap_or(0);
                         let absolute = db.get_absolute_coins().unwrap_or(0);
+                        // Odômetro patrimonial em reais: soma idempotente dos
+                        // recebimentos registrados em `cash_receipts`.
+                        let total_revenue = revenue_label(db.get_total_receipts_cents());
                         let price = db.get_song_price().unwrap_or(1);
                         let recent_days = db.get_recent_days().unwrap_or(30);
                         let genres: Vec<GenreInfo> = db.get_genres().unwrap_or_default();
                         log::debug!(
-                            "Menu do operador: odômetro={}, caixa parcial={}, preço={}, recentes={}d, {} gênero(s).",
+                            "Menu do operador: odômetro={} créditos ({}), caixa parcial={}, preço={}, recentes={}d, {} gênero(s).",
                             absolute,
+                            total_revenue,
                             partial,
                             price,
                             recent_days,
@@ -389,6 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(ui) = ui_handle.upgrade() {
                                 ui.set_op_partial_coins(partial as i32);
                                 ui.set_op_absolute_coins(absolute as i32);
+                                ui.set_op_total_revenue(total_revenue.into());
                                 ui.set_op_song_price(price as i32);
                                 ui.set_op_recent_days(recent_days as i32);
 
@@ -1540,6 +1545,41 @@ fn volume_to_linear(volume: u32) -> f64 {
     fraction * fraction * fraction
 }
 
+/// A failed financial query must never be displayed as a genuine zero.
+fn revenue_label(result: rusqlite::Result<i64>) -> String {
+    match result {
+        Ok(cents) => format_brl(cents),
+        Err(error) => {
+            log::error!("Falha ao consultar recebimentos do moedeiro: {error}");
+            "Indisponível".into()
+        }
+    }
+}
+
+/// Formata centavos como moeda brasileira (`R$ 1.234,56` — ponto como
+/// separador de milhar, vírgula como decimal). Usado pelo odômetro de
+/// receita do menu do operador; nunca usa ponto-flutuante para dinheiro.
+fn format_brl(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.unsigned_abs();
+    let reais = abs / 100;
+    let centavos = abs % 100;
+    let digits = reais.to_string();
+    let mut grouped: String = digits
+        .chars()
+        .rev()
+        .enumerate()
+        .flat_map(|(i, ch)| {
+            // Insere um ponto a cada três dígitos (exceto antes do primeiro).
+            let dot = if i > 0 && i % 3 == 0 { Some('.') } else { None };
+            dot.into_iter().chain(std::iter::once(ch))
+        })
+        .collect();
+    // `flat_map` montou a sequência já invertida — só reverter de volta.
+    grouped = grouped.chars().rev().collect();
+    format!("{sign}R$ {grouped},{centavos:02}")
+}
+
 /// IP atual da máquina via `hostname -I` (primeiro endereço listado).
 /// Roda no keypress da abertura do menu — alguns milissegundos apenas.
 fn query_local_ip() -> String {
@@ -1634,4 +1674,36 @@ fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slint::Image {
         };
     }
     slint::Image::from_rgb8(buffer)
+}
+
+#[cfg(test)]
+mod brl_tests {
+    use super::{format_brl, revenue_label};
+
+    #[test]
+    fn failed_receipts_query_is_not_a_zero_balance() {
+        assert_eq!(revenue_label(Ok(0)), "R$ 0,00");
+        assert_eq!(revenue_label(Err(rusqlite::Error::InvalidQuery)), "Indisponível");
+    }
+
+    #[test]
+    fn formats_zero_and_small_amounts() {
+        assert_eq!(format_brl(0), "R$ 0,00");
+        assert_eq!(format_brl(1), "R$ 0,01");
+        assert_eq!(format_brl(150), "R$ 1,50");
+        assert_eq!(format_brl(16_050), "R$ 160,50");
+    }
+
+    #[test]
+    fn groups_thousands_with_dots() {
+        assert_eq!(format_brl(123_456), "R$ 1.234,56");
+        assert_eq!(format_brl(1_000), "R$ 10,00");
+        assert_eq!(format_brl(1_000_000), "R$ 10.000,00");
+        assert_eq!(format_brl(9_999_999_999), "R$ 99.999.999,99");
+    }
+
+    #[test]
+    fn negative_cents_keep_the_sign_before_the_currency() {
+        assert_eq!(format_brl(-50), "-R$ 0,50");
+    }
 }
