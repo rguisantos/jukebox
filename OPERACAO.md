@@ -39,6 +39,13 @@ Não é possível adicionar uma faixa igual à última da fila, incluindo a faix
 atual quando não há outras pendentes. A sequência A/B/A é permitida. Recusas
 por repetição, falta de crédito ou fila cheia não debitam saldo.
 
+O menu do operador exibe, junto ao odômetro de créditos, a receita total
+acumulada em reais — a soma idempotente dos recebimentos de `cash_receipts`
+formatada como `R$ X.XXX,XX`. Esse odômetro patrimonial nunca zera, nem com
+o recolhimento do caixa parcial, e serve de conferência com o moedeiro e com
+o futuro relatório de PIX. Créditos concedidos por bônus de pacote não o
+afetam: apenas o dinheiro efetivamente inserido entra na soma.
+
 ## Navegação e vídeo
 
 - O alterna gêneros na tela de álbuns e seleciona música na lista de faixas.

@@ -687,6 +687,18 @@ impl Database {
         self.read_counter("absolute_coins")
     }
 
+    /// Odômetro patrimonial em reais: soma de todos os recebimentos da tabela
+    /// `cash_receipts` (centavos). Diferente dos contadores legados em
+    /// créditos, esta soma é idempotente — repetir um identificador de recibo
+    /// não a infla — e serve de base para o futuro PIX em reais. NUNCA zera.
+    pub fn get_total_receipts_cents(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(SUM(cents), 0) FROM cash_receipts;",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+    }
+
     /// Zera o caixa parcial (após o operador esvaziar o moedeiro/gaveta).
     /// O odômetro absoluto permanece intacto.
     pub fn reset_partial_coins(&self) -> Result<()> {
@@ -823,6 +835,21 @@ mod queue_tests {
         db.reserve_track(&b).unwrap().unwrap();
         db.reserve_track(&track()).unwrap().unwrap();
         assert_eq!(db.get_credits().unwrap(), 0);
+    }
+    #[test]
+    fn total_receipts_cents_is_idempotent_and_survives_legacy_counters() {
+        let mut db = database();
+        // Vazio: COALESCE devolve 0, não erro.
+        assert_eq!(db.get_total_receipts_cents().unwrap(), 0);
+        db.accept_money(100, "a").unwrap();
+        // Recibo duplicado não soma duas vezes (idempotência patrimonial).
+        db.accept_money(100, "a").unwrap();
+        db.accept_money(500, "b").unwrap();
+        assert_eq!(db.get_total_receipts_cents().unwrap(), 600);
+        // Zerar o caixa parcial NUNCA toca no odômetro em reais.
+        db.reset_partial_coins().unwrap();
+        assert_eq!(db.get_total_receipts_cents().unwrap(), 600);
+        assert_eq!(db.get_partial_coins().unwrap(), 0);
     }
     #[test]
     fn incremental_cash_has_same_bonus_as_single_receipt_and_deduplicates() {
