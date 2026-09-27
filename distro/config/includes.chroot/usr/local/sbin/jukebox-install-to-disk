@@ -1,0 +1,66 @@
+#!/bin/bash
+# Interactive installer. NEVER run by the image build or application.
+set -euo pipefail
+[[ $EUID == 0 ]] || { echo 'Execute com sudo.' >&2; exit 1; }
+[[ $# == 1 ]] || { echo "Uso: $0 /dev/DISCO" >&2; lsblk -d -o NAME,SIZE,MODEL; exit 1; }
+disk=$(readlink -f -- "$1")
+[[ -b "$disk" && $(lsblk -dn -o TYPE "$disk") == disk ]] || { echo 'Informe um disco físico inteiro.' >&2; exit 1; }
+[[ $(blockdev --getsize64 "$disk") -ge 21474836480 ]] || { echo 'Disco precisa ter pelo menos 20 GiB.' >&2; exit 1; }
+# Reject the boot disk and any disk with mounted children or active swap.
+if lsblk -nr -o MOUNTPOINTS "$disk" | grep -q '[^[:space:]]'; then
+    echo 'Disco em uso. O instalador não desmonta nem apaga discos montados.' >&2; exit 1
+fi
+image=/run/live/medium/live/filesystem.squashfs
+[[ -r "$image" ]] || { echo 'Inicie pela ISO Jukebox.' >&2; exit 1; }
+lsblk -d -o NAME,SIZE,MODEL,SERIAL "$disk"
+printf 'TODOS os dados desse disco serão apagados. Digite APAGAR %s: ' "$disk"
+read -r confirmation
+[[ "$confirmation" == "APAGAR $disk" ]] || exit 1
+parted -s "$disk" mklabel gpt
+parted -s "$disk" mkpart bios 1MiB 3MiB
+parted -s "$disk" set 1 bios_grub on
+parted -s "$disk" mkpart esp fat32 3MiB 515MiB
+parted -s "$disk" set 2 esp on
+parted -s "$disk" mkpart system ext4 515MiB 12803MiB
+parted -s "$disk" mkpart data ext4 12803MiB 100%
+partprobe "$disk"
+udevadm settle
+suffix=''
+[[ "$disk" =~ [0-9]$ ]] && suffix=p
+esp="${disk}${suffix}2"
+root="${disk}${suffix}3"
+data="${disk}${suffix}4"
+mkfs.vfat -F 32 -n JUKEBOX_EFI "$esp"
+mkfs.ext4 -F -L JUKEBOX_ROOT "$root"
+mkfs.ext4 -F -L JUKEBOX_DATA "$data"
+target=$(mktemp -d /mnt/jukebox-install.XXXXXX)
+cleanup() { umount -R "$target" 2>/dev/null || true; rmdir "$target" 2>/dev/null || true; }
+trap cleanup EXIT
+mount "$root" "$target"
+unsquashfs -f -d "$target" "$image"
+mkdir -p "$target/boot/efi" "$target/dados"
+mount "$esp" "$target/boot/efi"
+mount "$data" "$target/dados"
+cat > "$target/etc/fstab" <<EOF
+UUID=$(blkid -s UUID -o value "$root") / ext4 defaults 0 1
+UUID=$(blkid -s UUID -o value "$esp") /boot/efi vfat defaults 0 2
+UUID=$(blkid -s UUID -o value "$data") /dados ext4 defaults,nosuid,nodev 0 2
+EOF
+# Only the root filesystem gets a temporary RAM overlay; /dados remains writable.
+printf 'overlayroot="tmpfs:recurse=0"\n' > "$target/etc/overlayroot.conf"
+for dir in dev proc sys run; do
+    mount --rbind "/$dir" "$target/$dir"
+    mount --make-rslave "$target/$dir"
+done
+cat > "$target/etc/default/grub" <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=2
+GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3"
+GRUB_DISABLE_OS_PROBER=true
+EOF
+chroot "$target" update-initramfs -u -k all
+chroot "$target" grub-install --target=i386-pc "$disk"
+chroot "$target" grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
+chroot "$target" update-grub
+sync
+echo 'Instalação concluída. Desligue e remova o pendrive. Secure Boot deve estar desativado.'

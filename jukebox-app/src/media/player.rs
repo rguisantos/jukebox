@@ -31,7 +31,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
 /// Limite da fila de reprodução (evita fila infinita numa noite cheia)
-const MAX_QUEUE: usize = 20;
 
 /// Ciclo do poll do GstBus — também define a latência máxima de comandos
 const BUS_POLL_INTERVAL_MS: u64 = 50;
@@ -49,7 +48,12 @@ pub enum PlayerCommand {
     SetWindowHandle(u64),
     /// Geometria atual da área de vídeo dentro da janela (px lógicos,
     /// já escalados pelo fator de escala no main.rs)
-    VideoGeometry { x: i32, y: i32, width: i32, height: i32 },
+    VideoGeometry {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
     /// Overlay USB aberto: esconde o vídeo (zera o retângulo de render)
     HideVideo,
     /// Overlay USB fechado: restaura o último retângulo conhecido
@@ -69,6 +73,7 @@ pub enum PlayerCommand {
 
 /// Eventos emitidos PELO player para a thread principal
 pub enum PlayerEvent {
+    CreditsChanged,
     /// Uma faixa começou a tocar agora
     TrackStarted {
         id: i64,
@@ -77,11 +82,16 @@ pub enum PlayerEvent {
         is_video: bool,
     },
     /// Estado da fila mudou (após enqueue ou consumo) — para o painel "A seguir"
-    QueueUpdated { upcoming: Vec<TrackInfo> },
+    QueueUpdated {
+        upcoming: Vec<TrackInfo>,
+    },
     /// Fila esgotada — UI volta ao modo catálogo
     QueueFinished,
     /// Falha no pipeline (arquivo corrompido, codec ausente...)
-    Error { context: String, detail: String },
+    Error {
+        context: String,
+        detail: String,
+    },
 }
 
 /// Sobe a thread dedicada do player. Retorna imediatamente.
@@ -155,8 +165,10 @@ struct Player {
     playbin: gst::Element,
     /// View da interface GstVideoOverlay do playbin (encaminha para o sink)
     overlay: VideoOverlay,
-    queue: VecDeque<TrackInfo>,
+    db: crate::db::Database,
+    queue: VecDeque<(i64, TrackInfo)>,
     current: Option<TrackInfo>,
+    current_id: Option<i64>,
     event_tx: Sender<PlayerEvent>,
     /// XID da janela X11 do Slint (aplicado assim que chega)
     window_handle: Option<u64>,
@@ -174,7 +186,9 @@ impl Player {
         let playbin = gst::ElementFactory::make("playbin")
             .name("jukebox-playbin")
             .build()
-            .map_err(|e| format!("playbin indisponível (gstreamer1.0-plugins-base ausente): {e}"))?;
+            .map_err(|e| {
+                format!("playbin indisponível (gstreamer1.0-plugins-base ausente): {e}")
+            })?;
 
         // ---- Saída de vídeo: xvimagesink (XVideo) com fallback ----
         let video_sink = match gst::ElementFactory::make("xvimagesink")
@@ -249,11 +263,15 @@ impl Player {
         // evita ele criar uma janela própria de vídeo
         overlay.prepare_window_handle();
 
+        let db = crate::db::Database::open().map_err(|e| e.to_string())?;
+        let queue = db.pending_tracks().map_err(|e| e.to_string())?.into();
         Ok(Self {
+            db,
             playbin,
             overlay,
-            queue: VecDeque::new(),
+            queue,
             current: None,
+            current_id: None,
             event_tx: event_tx.clone(),
             window_handle: None,
             video_rect: None,
@@ -288,13 +306,10 @@ impl Player {
                 ],
             ) {
                 match msg.view() {
-                    gst::MessageView::Eos(_) => self.on_track_end(),
+                    gst::MessageView::Eos(_) => self.on_track_end(false),
                     gst::MessageView::Error(err) => {
-                        let detail = format!(
-                            "{} ({})",
-                            err.error(),
-                            err.debug().unwrap_or_default()
-                        );
+                        let detail =
+                            format!("{} ({})", err.error(), err.debug().unwrap_or_default());
                         log::error!("Player: erro no pipeline: {}", detail);
                         let _ = self.event_tx.send(PlayerEvent::Error {
                             context: self
@@ -305,7 +320,7 @@ impl Player {
                             detail: detail.clone(),
                         });
                         // Pula para a próxima — o show não pode parar
-                        self.on_track_end();
+                        self.on_track_end(true);
                     }
                     gst::MessageView::Warning(warn) => {
                         log::warn!("Player: aviso do pipeline: {}", warn.error());
@@ -315,8 +330,9 @@ impl Player {
             }
 
             // 3. Se nenhuma faixa está ativa e a fila tem gente → toca a próxima
-            if self.current.is_none() {
-                if let Some(track) = self.queue.pop_front() {
+            if self.current_id.is_none() {
+                if let Some((id, track)) = self.queue.pop_front() {
+                    self.current_id = Some(id);
                     self.start_track(track);
                 }
             }
@@ -340,7 +356,12 @@ impl Player {
                     self.apply_video_rect();
                 }
             }
-            PlayerCommand::VideoGeometry { x, y, width, height } => {
+            PlayerCommand::VideoGeometry {
+                x,
+                y,
+                width,
+                height,
+            } => {
                 if width > 0 && height > 0 {
                     self.video_rect = Some((x, y, width, height));
                     self.apply_video_rect();
@@ -355,33 +376,47 @@ impl Player {
                 self.apply_video_rect();
             }
             PlayerCommand::Enqueue(track) => {
-                if self.queue.len() >= MAX_QUEUE {
-                    log::warn!("Player: fila cheia ({}). Faixa rejeitada.", MAX_QUEUE);
+                if !Path::new(&track.file_path).is_file() {
                     let _ = self.event_tx.send(PlayerEvent::Error {
-                        context: "Fila de reprodução".to_string(),
-                        detail: "fila cheia — tente novamente mais tarde".to_string(),
+                        context: track.title,
+                        detail: "arquivo ausente; sem débito".into(),
                     });
                     return;
                 }
-                log::info!(
-                    "Player: enfileirando '{} - {}' (posição {}).",
-                    track.artist,
-                    track.title,
-                    self.queue.len() + 1
-                );
-                self.queue.push_back(track);
-                self.emit_queue_state();
+                match self.db.reserve_track(&track) {
+                    Ok(Some((id, _balance))) => {
+                        self.queue.push_back((id, track));
+                        let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
+                        self.emit_queue_state();
+                    }
+                    result => {
+                        let _ = self.event_tx.send(PlayerEvent::Error {
+                            context: track.title,
+                            detail: format!("compra recusada (saldo insuficiente, fila cheia ou banco indisponível): {:?}", result),
+                        });
+                    }
+                }
             }
             PlayerCommand::Stop => {
                 log::info!("Player: stop + limpeza da fila.");
                 let _ = self.playbin.set_state(gst::State::Null);
-                self.queue.clear();
-                self.current = None;
-                let _ = self.event_tx.send(PlayerEvent::QueueFinished);
+                self.on_track_end(true);
+                while let Some((id, _)) = self.queue.front() {
+                    match self.db.finish_track(*id, true) {
+                        Ok(_balance) => {
+                            self.queue.pop_front();
+                            let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
+                        }
+                        Err(e) => {
+                            log::error!("Falha ao cancelar fila: {}", e);
+                            break;
+                        }
+                    }
+                }
+                self.emit_queue_state();
             }
             PlayerCommand::SkipTrack => {
-                log::info!("Player: cancelando faixa atual (skip).");
-                self.on_track_end();
+                self.on_track_end(false);
             }
             PlayerCommand::SetVolume(volume) => {
                 // Clamp defensivo: a propriedade do playbin aceita > 1.0,
@@ -416,7 +451,7 @@ impl Player {
                     context: track.title.clone(),
                     detail: "arquivo não encontrado no disco".to_string(),
                 });
-                self.current = None;
+                self.on_track_end(true);
                 return;
             }
         };
@@ -425,7 +460,7 @@ impl Player {
             Ok(uri) => uri,
             Err(e) => {
                 log::error!("Player: falha ao converter caminho em URI: {}", e);
-                self.current = None;
+                self.on_track_end(true);
                 return;
             }
         };
@@ -467,13 +502,26 @@ impl Player {
                     context: track.title.clone(),
                     detail: e.to_string(),
                 });
-                self.current = None;
+                self.on_track_end(true);
             }
         }
     }
 
     /// Fim natural (EOS) ou forçado (erro) da faixa atual
-    fn on_track_end(&mut self) {
+    fn on_track_end(&mut self, refund: bool) {
+        if let Some(id) = self.current_id {
+            match self.db.finish_track(id, refund) {
+                Ok(_balance) => {
+                    let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
+                }
+                Err(e) => {
+                    log::error!("Fila persistente indisponível: {}; reprodução suspensa", e);
+                    let _ = self.playbin.set_state(gst::State::Null);
+                    return;
+                }
+            }
+        }
+        self.current_id = None;
         self.current = None;
         let _ = self.playbin.set_state(gst::State::Null);
 
@@ -509,7 +557,7 @@ impl Player {
     /// Notifica a UI sobre o conteúdo atual da fila
     fn emit_queue_state(&self) {
         let _ = self.event_tx.send(PlayerEvent::QueueUpdated {
-            upcoming: self.queue.iter().cloned().collect(),
+            upcoming: self.queue.iter().map(|(_, track)| track.clone()).collect(),
         });
     }
 }

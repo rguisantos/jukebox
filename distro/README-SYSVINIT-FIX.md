@@ -1,3 +1,5 @@
+> Documento histórico. A árvore atual usa pinagem e verificação do backend; não executa purga de pacotes essenciais. Consulte README.md para o fluxo atual.
+
 # Correção definitiva — Conflito `systemd-sysv` ⇄ `live-config-sysvinit` no build da ISO kiosk (Debian 13 "Trixie")
 
 **Sintoma corrigido:** o build falha sistematicamente no resolvedor de dependências

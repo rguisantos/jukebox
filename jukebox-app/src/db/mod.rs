@@ -1,5 +1,5 @@
 use crate::state::models::{
-    album_initial, fnv64, AlbumInfo, GenreInfo, SONG_PRICE_MAX, SONG_PRICE_MIN, TrackInfo,
+    album_initial, fnv64, AlbumInfo, GenreInfo, TrackInfo, SONG_PRICE_MAX, SONG_PRICE_MIN,
 };
 use rusqlite::{params, Connection, Result};
 use std::collections::HashMap;
@@ -27,9 +27,10 @@ impl Database {
 
         // Otimizações críticas para performance e proteção contra quedas de energia:
         // 1. WAL (Write-Ahead Logging): Leituras e escritas simultâneas sem bloqueio de concorrência.
-        // 2. synchronous = NORMAL: Muito mais rápido que FULL, 100% seguro em sistemas de arquivos modernos.
+        // 2. FULL: sync WAL commits before acknowledging paid operations.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "cache_size", "-2000")?; // 2MB de cache em RAM
 
         let db = Self { conn };
@@ -50,6 +51,13 @@ impl Database {
 
     /// Cria as tabelas iniciais se não existirem
     fn create_tables(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS playback_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_json TEXT NOT NULL,
+            price INTEGER NOT NULL CHECK(price > 0)
+        );",
+        )?;
         // Tabela de chave-valor para estado global (créditos, configurações persistentes)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS system_state (
@@ -261,48 +269,79 @@ impl Database {
         Ok(new_credits.max(0) as u32)
     }
 
-    /// Debita créditos de forma atômica (SELECT + UPDATE dentro de uma transação).
-    /// Retorna:
-    ///   - Ok(Some(novo_saldo)) quando o débito foi efetuado com sucesso;
-    ///   - Ok(None)             quando o saldo é insuficiente (nada é alterado);
-    ///   - Err(...)             em falha grave de I/O no SQLite.
-    /// O débito é registrado na tabela de auditoria com valor negativo,
-    /// permitindo o fechamento de caixa preciso pelo operador.
-    pub fn spend_credits(&mut self, amount: u32) -> Result<Option<u32>> {
-        let tx = self.conn.transaction()?;
-
-        // Leitura do saldo atual DENTRO da transação: garante atomicidade mesmo
-        // com a thread do PIX creditando simultaneamente (write serializado).
-        let current: i64 = tx.query_row(
-            "SELECT value FROM system_state WHERE key = 'credits';",
+    /// Persist a purchase and debit in ONE transaction. Current song counts toward limit.
+    pub fn reserve_track(&mut self, track: &TrackInfo) -> Result<Option<(i64, u32)>> {
+        let json = serde_json::to_string(track)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row("SELECT count(*) FROM playback_queue", [], |r| r.get(0))?;
+        let price: i64 = tx.query_row(
+            "SELECT value FROM system_state WHERE key='song_price'",
             [],
-            |row| row.get(0),
+            |r| r.get(0),
         )?;
-
-        if current < amount as i64 {
-            // Saldo insuficiente: a transação cai fora do escopo e sofre
-            // rollback automático — nenhum dado é gravado.
+        let balance: i64 = tx.query_row(
+            "SELECT value FROM system_state WHERE key='credits'",
+            [],
+            |r| r.get(0),
+        )?;
+        if count >= 20 || price < 1 || balance < price {
             return Ok(None);
         }
-
         tx.execute(
-            "UPDATE system_state SET value = value - ?1 WHERE key = 'credits';",
-            params![amount as i64],
+            "INSERT INTO playback_queue(track_json,price) VALUES (?1,?2)",
+            params![json, price],
         )?;
-
-        // Auditoria negativa: -1 crédito por faixa tocada (fechamento de caixa)
+        let id = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO credits_audit (amount) VALUES (?1);",
-            params![-(amount as i64)],
+            "UPDATE system_state SET value=value-?1 WHERE key='credits'",
+            [price],
         )?;
-
-        let new_credits: i64 = {
-            let mut stmt = tx.prepare("SELECT value FROM system_state WHERE key = 'credits';")?;
-            stmt.query_row([], |row| row.get(0))?
-        };
-
+        tx.execute("INSERT INTO credits_audit(amount) VALUES (?1)", [-price])?;
         tx.commit()?;
-        Ok(Some(new_credits.max(0) as u32))
+        Ok(Some((id, (balance - price) as u32)))
+    }
+
+    pub fn pending_tracks(&self) -> Result<Vec<(i64, TrackInfo)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id,track_json FROM playback_queue ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            let json: String = row.get(1)?;
+            let track = serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok((row.get(0)?, track))
+        })?;
+        rows.collect()
+    }
+
+    /// Refund failures without incrementing collection counters; duplicate completion is harmless.
+    pub fn finish_track(&mut self, id: i64, refund: bool) -> Result<u32> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if refund {
+            tx.execute("UPDATE system_state SET value=value+COALESCE((SELECT price FROM playback_queue WHERE id=?1),0) WHERE key='credits'", [id])?;
+            tx.execute(
+                "INSERT INTO credits_audit(amount) SELECT price FROM playback_queue WHERE id=?1",
+                [id],
+            )?;
+        }
+        tx.execute("DELETE FROM playback_queue WHERE id=?1", [id])?;
+        let balance: i64 = tx.query_row(
+            "SELECT value FROM system_state WHERE key='credits'",
+            [],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(balance.max(0) as u32)
     }
 
     // =========================================================================
@@ -331,6 +370,30 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Batch catalog writes so FULL durability does not require one disk sync per track.
+    pub fn upsert_tracks(&mut self, tracks: &[TrackInfo]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO tracks (title,artist,album,file_path,file_type,genre)
+                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(file_path) DO UPDATE SET
+                title=excluded.title, artist=excluded.artist, album=excluded.album,
+                file_type=excluded.file_type, genre=excluded.genre",
+            )?;
+            for track in tracks {
+                insert.execute(params![
+                    track.title,
+                    track.artist,
+                    track.album,
+                    track.file_path,
+                    track.file_type,
+                    track.genre
+                ])?;
+            }
+        }
+        tx.commit()
     }
 
     /// Retorna todos os file_paths já cadastrados no banco (para o scanner incremental)
@@ -590,5 +653,86 @@ impl Database {
             params![key, value],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    fn database() -> Database {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.create_tables().unwrap();
+        db
+    }
+    fn track() -> TrackInfo {
+        TrackInfo {
+            id: 1,
+            title: "Música".into(),
+            artist: "Artista".into(),
+            album: "Álbum".into(),
+            file_path: "/dados/musicas/a.mp3".into(),
+            file_type: "mp3".into(),
+            genre: "Rock".into(),
+        }
+    }
+    #[test]
+    fn full_queue_cannot_consume_credit() {
+        let mut db = database();
+        db.increment_credits(25).unwrap();
+        for _ in 0..20 {
+            assert!(db.reserve_track(&track()).unwrap().is_some());
+        }
+        assert!(db.reserve_track(&track()).unwrap().is_none());
+        assert_eq!(db.get_credits().unwrap(), 5);
+        assert_eq!(db.pending_tracks().unwrap().len(), 20);
+    }
+    #[test]
+    fn refund_is_idempotent_and_does_not_inflate_collection() {
+        let mut db = database();
+        db.increment_credits(5).unwrap();
+        let (id, balance) = db.reserve_track(&track()).unwrap().unwrap();
+        assert_eq!(balance, 4);
+        assert_eq!(db.finish_track(id, true).unwrap(), 5);
+        assert_eq!(db.finish_track(id, true).unwrap(), 5);
+        assert_eq!(db.get_absolute_coins().unwrap(), 5);
+        assert!(db.pending_tracks().unwrap().is_empty());
+    }
+    #[test]
+    fn insufficient_balance_does_not_enqueue() {
+        let mut db = database();
+        assert!(db.reserve_track(&track()).unwrap().is_none());
+        assert!(db.pending_tracks().unwrap().is_empty());
+    }
+    #[test]
+    fn committed_queue_survives_reopening_database() {
+        let path = std::env::temp_dir().join(format!(
+            "jukebox-queue-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut db = Database {
+                conn: Connection::open(&path).unwrap(),
+            };
+            db.create_tables().unwrap();
+            db.increment_credits(3).unwrap();
+            db.reserve_track(&track()).unwrap().unwrap();
+        }
+        {
+            let db = Database {
+                conn: Connection::open(&path).unwrap(),
+            };
+            assert_eq!(db.get_credits().unwrap(), 2);
+            assert_eq!(
+                db.pending_tracks().unwrap()[0].1.file_path,
+                track().file_path
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

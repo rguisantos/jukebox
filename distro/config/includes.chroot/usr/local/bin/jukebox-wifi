@@ -1,0 +1,2 @@
+#!/bin/sh
+exec xterm -T 'Jukebox - Wi-Fi' -fa Monospace -fs 16 -e nmtui-connect

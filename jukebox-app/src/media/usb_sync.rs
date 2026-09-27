@@ -32,6 +32,7 @@ use crate::media::scanner;
 use crate::state::models::AlbumInfo;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -41,7 +42,9 @@ use std::time::Duration;
 const USB_MOUNT_POINT: &str = "/media/usb";
 
 /// Extensões aceitas na sincronização (espelha o scanner do Módulo 2)
-const SYNC_EXTENSIONS: &[&str] = &["mp3", "mp4", "wav", "wmv", "mpeg"];
+const SYNC_EXTENSIONS: &[&str] = &[
+    "mp3", "mp4", "wav", "wmv", "mpeg", "jpg", "jpeg", "png", "webp",
+];
 
 /// Intervalo de verificação do ponto de montagem (leve: apenas um stat)
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -150,6 +153,7 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
         // ------------------------------------------------------------------
         // ESTADO 2: COPIANDO — overlay aberto, vídeo ocultado pela UI
         // ------------------------------------------------------------------
+        let mounted_before = mount_signature();
         let total = files.len();
         let _ = event_tx.send(UsbSyncEvent::Started { total });
 
@@ -164,16 +168,17 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
                 .map(OsStr::to_string_lossy)
                 .unwrap_or_default()
                 .to_string();
-            let dest = dest_dir.join(&file_name);
-
-            // Sincronização idempotente: arquivo com mesmo nome já catalogado
-            // no HD é pulado (evita duplicar mídia e poupa o HD mecânico lento)
-            if dest.exists() {
+            // The first path component is the mounted device, not part of the album.
+            let relative = src.strip_prefix(USB_MOUNT_POINT).unwrap();
+            let relative: PathBuf = relative.components().skip(1).collect();
+            let dest = dest_dir.join(relative);
+            if dest.is_file()
+                && fs::metadata(src).ok().map(|m| m.len())
+                    == fs::metadata(&dest).ok().map(|m| m.len())
+            {
                 skipped += 1;
-                log::debug!("USB Sync: pulando arquivo já existente: {}", file_name);
-            } else if let Err(e) = fs::copy(src, &dest) {
-                // Erro de cópia: pendrive removido no meio, HD cheio, etc.
-                log::error!("USB Sync: falha ao copiar {:?}: {}", src, e);
+                continue;
+            } else if let Err(e) = copy_atomic(src, &dest) {
                 failure = Some(format!("{}: {}", file_name, e));
                 break;
             }
@@ -240,7 +245,7 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
                 Err(RecvTimeoutError::Disconnected) => return,
             }
 
-            if !mount_has_media() {
+            if mount_signature() != mounted_before {
                 break;
             }
         }
@@ -250,9 +255,23 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
 
 /// Verifica se o ponto de montagem existe, é um diretório e é legível.
 /// (Quando o udev desmonta, /media/usb some do sistema de arquivos.)
+fn mount_signature() -> Vec<String> {
+    let mut mounts: Vec<_> = fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .map(|p| p.starts_with("/media/usb/"))
+                .unwrap_or(false)
+        })
+        .map(str::to_owned)
+        .collect();
+    mounts.sort();
+    mounts
+}
 fn mount_has_media() -> bool {
-    let mount = Path::new(USB_MOUNT_POINT);
-    mount.is_dir() && fs::read_dir(mount).is_ok()
+    !mount_signature().is_empty()
 }
 
 /// Percorre recursivamente o pendrive coletando arquivos de mídia suportados
@@ -269,6 +288,9 @@ fn collect_media_files(dir: &Path) -> Vec<PathBuf> {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
         if path.is_dir() {
             results.extend(collect_media_files(&path));
         } else if is_syncable_media(&path) {
@@ -285,4 +307,49 @@ fn is_syncable_media(path: &Path) -> bool {
         .and_then(OsStr::to_str)
         .map(|ext| SYNC_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Same-filesystem rename publishes a complete file; partial files are retried.
+fn copy_atomic(src: &Path, dest: &Path) -> io::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    fs::create_dir_all(parent)?;
+    let tmp = dest.with_file_name(format!(
+        ".{}.usb-part",
+        dest.file_name().unwrap().to_string_lossy()
+    ));
+    let result = (|| {
+        let mut input = fs::File::open(src)?;
+        let mut output = fs::File::create(&tmp)?;
+        io::copy(&mut input, &mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        fs::rename(&tmp, dest)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn atomic_copy_keeps_original_when_source_is_missing() {
+        let dir = std::env::temp_dir().join(format!("jukebox-usb-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("song.mp3");
+        fs::write(&destination, b"original").unwrap();
+        assert!(copy_atomic(&dir.join("missing.mp3"), &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        let source = dir.join("new.mp3");
+        fs::write(&source, b"complete song").unwrap();
+        copy_atomic(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"complete song");
+        assert!(!dir.join(".song.mp3.usb-part").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

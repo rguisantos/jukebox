@@ -1,145 +1,106 @@
-# JUKEBOX OS — ISO Kiosk (Debian 13 Trixie, live-build)
+# Jukebox OS — Debian 13 mínimo
 
-Gerador oficial da imagem ISO do appliance: Debian enxuto, autologin no tty1,
-X11 sem cursor, aplicativo Rust **embutido na imagem** e rodando sob watchdog.
+A configuração do appliance está versionada em `config/`. A imagem contém
+Xorg/Openbox, Rust/Slint, GStreamer/ALSA, NetworkManager, firmwares Wi-Fi e
+ferramentas de instalação. Não há ambiente desktop completo.
 
-## Arquitetura do Módulo 6 (Deployment)
+## Compilação
 
-```
-jukebox/                        raiz do projeto
-├── build_iso.sh                ← ORQUESTRADOR (executa da raiz!)
-├── jukebox-app/                aplicativo Rust (cargo build --release)
-└── distro/                     árvore do live-build
-    ├── auto/config             parâmetros do "lb config" (build reprodutível)
-    ├── auto/clean              limpeza segura (desmonta chroot de build travado)
-    └── config/
-        ├── hooks/live/01-setup-kiosk.hook.chroot
-        │                       ← usuário jukebox + autologin tty1 + sudoers
-        │                         poweroff + /dados + systemd garantido
-        ├── includes.chroot/
-        │   ├── opt/jukebox/launcher.sh    WATCHDOG (loop infinito, sleep 3)
-        │   ├── opt/jukebox/jukebox-app    binário (copiado pelo build_iso.sh)
-        │   ├── etc/skel/                  a home do usuário nasce daqui:
-        │   │   ├── .bash_profile          tty1 sem X? → startx -- -nocursor
-        │   │   ├── .profile               fallback POSIX do autologin
-        │   │   ├── .xinitrc               log em /dados/logs + openbox-session
-        │   │   └── .config/openbox/autostart   xset (sem DPMS) + launcher &
-        │   ├── etc/jukebox/jukebox.env    template da configuração da máquina
-        │   ├── etc/udev/rules.d/99-jukebox-usb.rules   automontagem p/ USB Sync
-        │   └── etc/{overlayroot,watchdog,modules-load.d,…}
-        │                                     blindagens do appliance
-        ├── package-lists/jukebox.list.chroot   pacotes da imagem
-        └── bootloaders/                      syslinux/isolinux pinados
-                                              (fix para hosts Ubuntu)
+Use Debian 13 para compilar o aplicativo e a imagem com as mesmas bibliotecas.
+`build_iso.sh --check` verifica os arquivos mínimos sem instalar pacotes.
+
+Ambiente de build isolado:
+
+```sh
+docker build -t jukebox-builder -f distro/Dockerfile .
+docker run --rm --privileged -v "$PWD:/src" jukebox-builder
 ```
 
-## Como gerar a ISO
+O container precisa de privilégios para as montagens/chroot do live-build.
+Não execute em host compartilhado não confiável. O script não modifica o
+live-build instalado no host. A saída padrão é `distro/live-image-amd64.hybrid.iso`.
+O Rust fica fixado em 1.90.0 e a compilação usa `Cargo.lock` com `--locked`.
+Os pacotes Debian acompanham as atualizações do repositório: o build ainda não
+é idêntico byte a byte entre datas diferentes.
 
-No host de build (Debian, Ubuntu ou derivado):
+A ISO deve ser validada em BIOS e UEFI sem Secure Boot e nas placas reais antes
+de distribuição. A verificação estática não comprova boot, áudio, GPU ou Wi-Fi.
 
-```bash
-# 1) Dependências do host (uma única vez)
-sudo apt install live-build debootstrap squashfs-tools xorriso \
-     isolinux syslinux-common
-#    Para compilar o aplicativo, além do Rust (https://rustup.rs):
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-     pkg-config build-essential
+## Inicialização e armazenamento
 
-# 2) Inicializa o live-build (uma única vez por clone)
-cd distro
-lb config          # executa o auto/config: trixie, amd64, boot silencioso…
-cd ..
+`systemd → jukebox-data → sessão Xorg/Openbox → aplicativo`.
+O systemd reinicia a sessão após saída/crash em 3 segundos. Isso não detecta
+travamento interno de um processo ainda vivo; watchdog de saúde/hardware é
+uma evolução posterior.
 
-# 3) Gera a ISO — compila o Rust, embute o binário e roda o lb build
-./build_iso.sh
+Uma partição ext4 com label `JUKEBOX_DATA` é montada em `/dados`. Ela mantém
+músicas, capas, fila/créditos, configuração e conexões do NetworkManager.
+Sem essa partição, a sessão live serve para demonstração e seus dados podem
+ser descartados no reboot. Não use esse modo para receber dinheiro.
+
+A configuração da máquina é `/dados/jukebox.env`. Não coloque comandos nesse
+arquivo: ele é carregado pelo launcher como configuração shell. O padrão do
+Pix foi preservado; a integração com o serviço de saldo será tratada depois.
+
+## Instalar no disco
+
+Inicie pela ISO. Com teclado de manutenção, execute:
+
+```sh
+sudo /usr/local/sbin/jukebox-install-to-disk /dev/DISCO
 ```
 
-Resultado: **`distro/jukebox-os-trixie-amd64.hybrid.iso`** (híbrida: boota em
-BIOS legada — Sempron 145 / LGA 775 — e em UEFI).
+O instalador mostra o disco e exige a confirmação literal antes de apagar.
+Recusa discos montados ou menores que 20 GiB. Cria GPT com BIOS boot, EFI,
+12 GiB de sistema e restante para dados, extrai a imagem e instala GRUB BIOS/UEFI.
+Não foi executado em disco real neste desenvolvimento.
 
-O `build_iso.sh` também aceita `sudo ./build_iso.sh`: nesse caso o `cargo` é
-rebaixado de volta ao usuário dono do projeto (nunca compila como root, para
-não sujar o `target/`). Primeira build: 10 a 30 min (baixa o Debian inteiro).
+No sistema instalado, overlayroot protege a raiz com overlay temporário;
+`/dados` permanece gravável. Atualizações online alteram apenas o acervo,
+não o sistema operacional. Para manutenção permanente, desabilite overlayroot
+pelo parâmetro de boot `overlayroot=disabled`, faça a manutenção e reative.
 
-### Nota de compatibilidade glibc (importante)
+## Wi-Fi
 
-O binário é compilado **no seu host** e roda **dentro da ISO** (Debian 13
-trixie = glibc 2.41). Regra de ouro: glibc do host ≤ glibc da imagem.
-Debian 12/13 e Ubuntu 22.04/24.04 sempre funcionam; evite hosts Debian
-testing/sid. (Para voltar ao Debian 12 na imagem, edite `auto/config` — e
-use um host com glibc ≤ 2.36 para compilar.)
+Menu do operador → CONFIGURAR WI-FI abre `nmtui-connect` em uma janela de
+manutenção. Use teclado para selecionar a rede e informar a senha. Não é
+um teclado virtual nem uma tela nativa Slint. Ao sair, retorna à jukebox.
+NetworkManager salva a conexão e reconecta automaticamente; os perfis ficam
+em `/dados/network` com acesso exclusivo de root. Ethernet continua disponível.
+Adaptadores devem ser homologados com os firmwares presentes na imagem.
 
-## Gravação no pendrive
+## Acervo online
 
-| Método | Comando / procedimento |
-|---|---|
-| dd (Linux) | `sudo dd if=distro/jukebox-os-trixie-amd64.hybrid.iso of=/dev/sdX bs=4M status=progress oflag=sync` |
-| Ventoy | Apenas copie a ISO para o pendrive (mais rápido) |
-| Rufus (Windows) | Selecione a ISO e o **modo DD** |
+Veja `ONLINE-CATALOG.md`. Configure o endereço HTTPS do índice no arquivo da
+máquina. O cliente consulta ao iniciar e periodicamente. O menu do operador
+permite verificar manualmente e mostra progresso/erro. O aplicativo continua
+reproduzindo enquanto o worker baixa os arquivos, com taxa limitada.
 
-## Cadeia de boot do appliance e auto-recuperação
+## USB
 
-```
-BIOS → isolinux (silencioso)
-  └─ systemd → getty@tty1 (autologin jukebox)
-       └─ .bash_profile ─── tty1 sem X? → startx -- vt1 -keeptty -nocursor
-            └─ .xinitrc ─── loga em /dados/logs/xsession.log → openbox-session
-                 └─ autostart ─── xset (sem DPMS/screensaver)
-                      └─ /opt/jukebox/launcher.sh (watchdog)
-                           └─ /opt/jukebox/jukebox-app ── crash? reinicia em 3s
-```
+O udev solicita uma unidade systemd por partição USB, montada somente para
+leitura em `/media/usb/DISPOSITIVO`. Arquivos preservam a organização
+`Gênero/Artista/Álbum/arquivo`. Capas JPG/PNG/WebP também são copiadas.
+Arquivos são publicados com rename após cópia e fsync. Arquivos existentes
+com o mesmo tamanho são ignorados; não há reconciliação por hash para USB.
+Não altere pelo USB os álbuns gerenciados pelo servidor.
 
-- **App crasha** → watchdog relança em 3 segundos.
-- **Servidor X cai** → `startx` termina, o getty respawna, sessão inteira refaz.
-- **Kernel congela** → watchdog de hardware reinicia a máquina (15 s).
-- **Cursor do mouse** → oculto pelo próprio Xorg (`-nocursor`), zero software extra.
+## Comportamento após falha
 
-## Configuração por máquina: `/dados/jukebox.env`
+A reserva da música e o débito são uma transação SQLite. Limite: 20 compras
+pendentes, incluindo a faixa atual. Após reinício, a faixa interrompida recomeça
+do início e as próximas continuam na ordem; não há retomada por segundo.
+Falhas de arquivo/pipeline devolvem o crédito sem aumentar os contadores de
+arrecadação. Pular manualmente a faixa consome a compra. A fila é removida
+ao término; numa queda imediatamente antes da confirmação, a faixa pode repetir.
 
-```bash
-sudo nano /dados/jukebox.env   # e reinicie a máquina
-```
+O banco usa WAL + synchronous=FULL. Durabilidade ainda depende do armazenamento
+cumprir fsync. Os atalhos do operador foram preservados.
 
-```ini
-JUKEBOX_PIX_API=https://meu-backend.com/api/pix
-JUKEBOX_MACHINE_ID=JBOX-001
-JUKEBOX_PIX_DEMO=0    # 1 = QR + pagamento simulados, sem backend
-RUST_LOG=info
-```
+## Limites atuais
 
-Na sessão live o `/dados` é o overlay gravável (nasce com o arquivo, via hook);
-no sistema instalado em disco o `/dados` é a 3ª partição (ext4) e o launcher
-recria o arquivo a partir do template `/etc/jukebox/jukebox.env` na primeira
-inicialização. Ali também moram o banco SQLite (`jukebox.db`), as músicas
-(`musicas/`), o cache de capas (`capas/`) e os logs (`logs/`).
-
-## Modelo de segurança
-
-- **Usuário `jukebox` / senha `jukebox`** — acesso de manutenção (Alt+F2 no
-  tty2, ou SSH).
-- **sudo sem senha: SOMENTE `systemctl poweroff`** — usado pela opção
-  "Desligar Máquina" do menu do operador. Todo o resto pede senha.
-  O live-config é neutralizado duas vezes: parâmetro `noroot` na linha de
-  boot + regra restrita escrita pelo hook em `/etc/sudoers.d/live` (o
-  componente de sudo do live-config passa reto quando o arquivo já contém
-  uma regra para o usuário).
-- **root** — sem senha (travado).
-
-## Live x instalado em disco
-
-- **Live (pendrive)**: boot direto, `/` efêmero (qualquer alteração é
-  descartada no reboot — à prova de tomada arrancada), `/dados` no overlay.
-- **Disco (HD/SSD)**: rode `sudo jukebox-install-to-disk.sh` na máquina —
-  particiona (12 GB sistema + 2 GB swap + resto para /dados), clona, instala
-  o GRUB e ativa o overlayroot (sistema somente-leitura em produção).
-  Manutenção permanente do sistema: `sudo jukebox-maintenance`.
-
-## Solução de problemas
-
-| Sintoma | Onde olhar |
-|---|---|
-| Tela preta após logo do boot | tty3 (`Alt+F3`) tem os logs do kernel; `/dados/logs/xsession.log` tem a sessão X |
-| App não abre (caixa "Binário não encontrado") | O pendrive foi gravado com uma ISO antiga (sem binário embutido) — gere de novo com `./build_iso.sh` |
-| Sem áudio | `amixer` no tty2; verifique se `gstreamer1.0-alsa` está na imagem (`gst-inspect-1.0 alsasink`) |
-| GL quebrado na GMA 3150 | descomente `LIBGL_ALWAYS_SOFTWARE=1` no `.xinitrc` (via `jukebox-maintenance` no sistema instalado) |
-| Diagnóstico do player | `gst-inspect-1.0` / `gst-launch-1.0` vêm instalados (`gstreamer1.0-tools`) |
+As imagens da interface ficam limitadas a 49 álbuns próximos da seleção
+(~9,2 MiB de pixels RGB, sem contar texturas e overhead). O catálogo de metadados
+ainda é carregado inteiro; medir com o acervo real de 5.000 álbuns é obrigatório.
+O renderer por software está compilado: configure `SLINT_BACKEND=winit-software`
+para testar GPUs incompatíveis. Não há medição de RAM total/boot nesta versão.

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+mkdir -p /dados
+if [ -e /dev/disk/by-label/JUKEBOX_DATA ]; then
+    mountpoint -q /dados || mount -o nosuid,nodev /dev/disk/by-label/JUKEBOX_DATA /dados
+elif ! mountpoint -q /dados; then
+    echo 'JUKEBOX: sessão sem partição JUKEBOX_DATA; dados podem ser temporários.' >&2
+fi
+mkdir -p /dados/musicas /dados/capas /dados/logs /dados/network
+chown jukebox:jukebox /dados /dados/musicas /dados/capas /dados/logs
+chmod 0700 /dados/network
+# NetworkManager connections must survive the live overlay.
+mkdir -p /etc/NetworkManager/system-connections
+mountpoint -q /etc/NetworkManager/system-connections || mount --bind /dados/network /etc/NetworkManager/system-connections
+[ -f /dados/jukebox.env ] || install -o jukebox -g jukebox -m 0600 /etc/jukebox/jukebox.env /dados/jukebox.env

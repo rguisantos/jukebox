@@ -1,22 +1,10 @@
 #!/bin/sh
-set -e
-
-# Desmonta com segurança quaisquer pontos remanescentes dentro de chroot antes da remoção
-TARGET_DIR="$(pwd)/chroot"
-if [ -d "$TARGET_DIR" ]; then
-    for m in $(grep "$TARGET_DIR" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r); do
-        umount -lf "$m" 2>/dev/null || true
-    done
-fi
-
+set -eu
+# Do not delete a chroot while bind mounts are still active.
+build_root=$(pwd -P)
+findmnt -rn -o TARGET | sort -r | while IFS= read -r target; do
+    case "$target" in
+        "$build_root/chroot"|"$build_root/chroot/"*) umount "$target" ;;
+    esac
+done
 lb clean noauto "$@"
-
-# Garante novo desmonte caso o lb clean tenha deixado algo
-if [ -d "$TARGET_DIR" ]; then
-    for m in $(grep "$TARGET_DIR" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r); do
-        umount -lf "$m" 2>/dev/null || true
-    done
-fi
-
-rm -rf .build chroot binary cache *.iso
-

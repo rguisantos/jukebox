@@ -12,7 +12,7 @@ description = "High-performance embedded Jukebox software optimized for legacy x
 # o renderer FemtoVG (OpenGL) vem embutido como renderer padrão deste backend.
 # Correção em relação ao Cargo.toml original: os nomes "backend-x11" e
 # "renderer-femtovg" não existem no slint 1.8.0 (eram de versões antigas).
-slint = { version = "=1.8.0", default-features = false, features = ["std", "backend-winit-x11", "renderer-femtovg", "compat-1-2", "raw-window-handle-06"] }
+slint = { version = "=1.8.0", default-features = false, features = ["std", "backend-winit-x11", "renderer-femtovg", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
 
 # Acesso ao handle bruto da janela X11 (XID) — necessário para embutir o
 # vídeo do GStreamer na janela do Slint via GstVideoOverlay (Módulo 3).

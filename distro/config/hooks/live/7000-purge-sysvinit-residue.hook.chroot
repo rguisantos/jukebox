@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fail closed rather than remove essential packages in a partially built image.
+set -eu
+[ "$(dpkg-query -W -f='${Status}' systemd-sysv)" = 'install ok installed' ]
+[ "$(dpkg-query -W -f='${Status}' live-config-systemd)" = 'install ok installed' ]
+for package in sysvinit-core live-config-sysvinit; do
+    if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" = 'install ok installed' ]; then
+        echo "Backend de init incompatível: $package" >&2
+        exit 1
+    fi
+done
+[ -x /sbin/init ]

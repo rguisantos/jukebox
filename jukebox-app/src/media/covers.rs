@@ -13,7 +13,8 @@
 //! aos poucos enquanto o player continua preenchendo o buffer de áudio.
 
 use crate::state::models::{AlbumInfo, CoverArt};
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+pub static GENERATION: AtomicU64 = AtomicU64::new(0);
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -60,14 +61,21 @@ pub enum CoverCommand {
     /// Varre a lista de álbuns extraindo capas ainda não produzidas.
     /// Reemite capas já conhecidas: o modelo da UI pode ter sido trocado
     /// por uma sincronização USB e precisa receber a textura de novo.
-    Scan(Vec<AlbumInfo>),
+    Scan {
+        generation: u64,
+        albums: Vec<AlbumInfo>,
+    },
 }
 
 /// Eventos emitidos pelo serviço de capas para a UI
 pub enum CoverEvent {
     /// Capa pronta (ou reemitida para um modelo novo) — indexada pela
     /// chave do álbum ("artista|álbum")
-    Ready { key: String, art: CoverArt },
+    Ready {
+        generation: u64,
+        key: String,
+        art: CoverArt,
+    },
 }
 
 /// Sobe a thread dedicada ao serviço de capas. Retorna imediatamente.
@@ -88,47 +96,34 @@ pub fn spawn(cmd_rx: Receiver<CoverCommand>, event_tx: Sender<CoverEvent>) {
                 log::warn!("Capas: impossível criar cache {:?}: {}", cache_dir, e);
             }
 
-            // Memória do serviço: chave → Some(capa) produzida, ou None para
-            // discos sem arte (cache negativo evita reabrir MP3s)
-            let mut produced: HashMap<String, Option<CoverArt>> = HashMap::new();
-
-            while let Ok(cmd) = cmd_rx.recv() {
-                match cmd {
-                    CoverCommand::Scan(albums) => {
-                        for album in &albums {
-                            match produced.get(&album.key) {
-                                Some(Some(art)) => {
-                                    let _ = event_tx.send(CoverEvent::Ready {
-                                        key: album.key.clone(),
-                                        art: art.clone(),
-                                    });
-                                }
-                                Some(None) => {}
-                                None => {
-                                    let art = load_from_cache(&cache_dir, &album.key).or_else(|| {
-                                        let art = extract_from_album(album);
-                                        if let Some(art) = &art {
-                                            save_to_cache(&cache_dir, &album.key, art);
-                                        }
-                                        // Cede o núcleo para o decode/ALSA no Sempron
-                                        thread::sleep(DECODE_YIELD);
-                                        art
-                                    });
-                                    produced.insert(album.key.clone(), art.clone());
-                                    if let Some(art) = art {
-                                        let _ = event_tx.send(CoverEvent::Ready {
-                                            key: album.key.clone(),
-                                            art,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        log::info!(
-                            "Capas: varredura concluída ({} discos no inventário).",
-                            albums.len()
-                        );
+            while let Ok(mut cmd) = cmd_rx.recv() {
+                // Navigation supersedes work for albums that are no longer visible.
+                while let Ok(newer) = cmd_rx.try_recv() {
+                    cmd = newer;
+                }
+                let CoverCommand::Scan { generation, albums } = cmd;
+                for album in &albums {
+                    if GENERATION.load(Ordering::Relaxed) != generation {
+                        break;
                     }
+                    let art = load_from_cache(&cache_dir, &album.key).or_else(|| {
+                        let art = extract_from_album(album);
+                        if let Some(art) = &art {
+                            save_to_cache(&cache_dir, &album.key, art);
+                        }
+                        art
+                    });
+                    if let Some(art) = art {
+                        if GENERATION.load(Ordering::Relaxed) != generation {
+                            break;
+                        }
+                        let _ = event_tx.send(CoverEvent::Ready {
+                            generation,
+                            key: album.key.clone(),
+                            art,
+                        });
+                    }
+                    thread::sleep(DECODE_YIELD);
                 }
             }
         })
@@ -211,7 +206,11 @@ fn extract_from_folder(album: &AlbumInfo) -> Option<CoverArt> {
         let path = dir.join(name);
         if path.is_file() {
             if let Some(art) = read_cover_file(&path) {
-                log::info!("Capas: arquivo {:?} em '{}'.", path.file_name(), album.title);
+                log::info!(
+                    "Capas: arquivo {:?} em '{}'.",
+                    path.file_name(),
+                    album.title
+                );
                 return Some(art);
             }
         }
@@ -245,7 +244,11 @@ fn extract_from_folder(album: &AlbumInfo) -> Option<CoverArt> {
             "cover" | "folder" | "front" | "album" | "albumart" | "albumartsmall"
         ) {
             if let Some(art) = read_cover_file(&path) {
-                log::info!("Capas: arquivo {:?} em '{}'.", path.file_name(), album.title);
+                log::info!(
+                    "Capas: arquivo {:?} em '{}'.",
+                    path.file_name(),
+                    album.title
+                );
                 return Some(art);
             }
         } else if fallback.is_none() {
@@ -268,6 +271,9 @@ fn extract_from_folder(album: &AlbumInfo) -> Option<CoverArt> {
 }
 
 fn read_cover_file(path: &Path) -> Option<CoverArt> {
+    if fs::metadata(path).ok()?.len() > 16 * 1024 * 1024 {
+        return None;
+    }
     let bytes = fs::read(path).ok()?;
     decode_to_cover(&bytes)
 }
@@ -311,7 +317,18 @@ fn extract_from_id3(album: &AlbumInfo) -> Option<CoverArt> {
 /// Decodifica bytes JPEG/PNG/WebP e gera a miniatura RGB (até 256×256,
 /// proporção preservada — o Slint recorta com `ImageFit.cover`)
 fn decode_to_cover(data: &[u8]) -> Option<CoverArt> {
-    let image = image::load_from_memory(data).ok()?;
+    if data.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
     let thumbnail = image.thumbnail(COVER_SIZE, COVER_SIZE);
     let rgb = thumbnail.to_rgb8();
     let (width, height) = rgb.dimensions();
