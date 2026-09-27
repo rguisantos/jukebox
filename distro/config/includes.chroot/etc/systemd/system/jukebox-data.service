@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare persistent Jukebox data
+Before=jukebox-kiosk.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jukebox-data
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

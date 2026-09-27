@@ -9,7 +9,7 @@
 
 /// Informações de uma faixa de mídia indexada no catálogo do Jukebox.
 /// Utilizado como struct intermediária entre o banco de dados e a interface Slint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackInfo {
     /// ID único da faixa no SQLite (PRIMARY KEY)
     pub id: i64,
@@ -112,8 +112,8 @@ pub const SONG_PRICE_MAX: u32 = 10;
 
 /// Régua da seleção rápida de letras alfabética e * para recém-adicionados
 pub const ALPHABET_ITEMS: &[&str] = &[
-    "*", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "#"
+    "*", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+    "S", "T", "U", "V", "W", "X", "Y", "Z", "#",
 ];
 
 // =============================================================================
@@ -121,7 +121,7 @@ pub const ALPHABET_ITEMS: &[&str] = &[
 // =============================================================================
 
 /// Total de linhas do menu principal do operador
-pub const OPERATOR_MENU_ITEMS: usize = 7;
+pub const OPERATOR_MENU_ITEMS: usize = 9;
 
 /// Índice da linha "Sincronizar Pendrive" no menu principal
 pub const OPERATOR_MENU_SYNC: usize = 0;
@@ -199,6 +199,8 @@ impl FocusState {
 /// A máquina permanece pura: nenhum canal, banco ou UI é tocado aqui dentro.
 #[derive(Debug, Clone)]
 pub enum Action {
+    OpenWifi,
+    SyncOnline,
     /// Tecla reconhecida, porém sem efeito adicional (ex.: E já na 1ª capa)
     Noop,
     /// Moeda/noteiro (tecla Z — aceita em qualquer estado)
@@ -343,9 +345,21 @@ impl AppState {
     /// alternar o bloqueio de um gênero, quando o operador está dentro do
     /// submenu de gêneros e não pode ser expulso para o carrossel.
     pub fn replace_catalog_keep_focus(&mut self, albums: Vec<AlbumInfo>) {
+        let key = self.current_album().map(|a| a.key.clone());
+        let track = self
+            .current_album()
+            .and_then(|a| a.tracks.get(self.track_index))
+            .map(|t| t.file_path.clone());
         self.albums = albums;
-        self.album_index = 0;
-        self.track_index = 0;
+        self.album_index = key
+            .and_then(|key| self.albums.iter().position(|a| a.key == key))
+            .unwrap_or(0);
+        self.track_index = track
+            .and_then(|path| {
+                self.current_album()
+                    .and_then(|a| a.tracks.iter().position(|t| t.file_path == path))
+            })
+            .unwrap_or(0);
     }
 
     /// Pula a seleção do carrossel para o primeiro álbum correspondente à letra selecionada
@@ -365,7 +379,9 @@ impl AppState {
                 let target_char = char_str.chars().next().unwrap().to_ascii_lowercase();
                 self.albums.iter().position(|a| {
                     let first = a.artist.chars().next().or_else(|| a.title.chars().next());
-                    first.map(|c| c.to_ascii_lowercase() == target_char).unwrap_or(false)
+                    first
+                        .map(|c| c.to_ascii_lowercase() == target_char)
+                        .unwrap_or(false)
                 })
             }
         };
@@ -387,7 +403,11 @@ impl AppState {
         let lowered = raw.trim().to_lowercase();
 
         // Pressionamento longo das teclas E ou R abre a régua de seleção alfabética
-        if lowered.contains("long") || lowered.contains("hold") || lowered == "e_long" || lowered == "r_long" {
+        if lowered.contains("long")
+            || lowered.contains("hold")
+            || lowered == "e_long"
+            || lowered == "r_long"
+        {
             if self.focus == FocusState::BrowsingAlbums {
                 self.previous = FocusState::BrowsingAlbums;
                 self.focus = FocusState::AlphabetPicker;
@@ -595,6 +615,8 @@ impl AppState {
                     OPERATOR_MENU_RESET_PARTIAL => Some(Action::ResetPartialCoins),
                     OPERATOR_MENU_RESET_CREDITS => Some(Action::ResetCredits),
                     OPERATOR_MENU_POWEROFF => Some(Action::PowerOff),
+                    7 => Some(Action::OpenWifi),
+                    8 => Some(Action::SyncOnline),
                     _ => Some(Action::Noop),
                 },
                 'u' => {
@@ -705,6 +727,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_refresh_preserves_selection_in_large_library() {
+        let mut state = AppState::new(50, 1);
+        let albums: Vec<_> = (0..5000)
+            .map(|i| AlbumInfo {
+                key: format!("album-{i}"),
+                title: format!("Álbum {i}"),
+                artist: "Artista".into(),
+                genre: "Rock".into(),
+                initial: "A".into(),
+                palette: 0,
+                is_recent: false,
+                tracks: vec![],
+            })
+            .collect();
+        state.replace_catalog(albums.clone());
+        state.album_index = 4200;
+        state.focus = FocusState::BrowsingTracks;
+        let mut updated = albums;
+        updated.reverse();
+        state.replace_catalog_keep_focus(updated);
+        assert_eq!(state.current_album().unwrap().key, "album-4200");
+        assert_eq!(state.focus, FocusState::BrowsingTracks);
+    }
+
+    #[test]
     fn test_volume_toggle_with_p() {
         let mut state = AppState::new(50, 1);
         assert_eq!(state.focus, FocusState::BrowsingAlbums);
@@ -772,7 +819,7 @@ mod tests {
     #[test]
     fn test_global_keys_a_and_l() {
         let mut state = AppState::new(50, 1);
-        
+
         // 'a' zera os créditos
         let action_a = state.handle_key("a");
         assert!(matches!(action_a, Some(Action::ResetCredits)));
@@ -797,5 +844,3 @@ mod tests {
         assert!(action_not_playing.is_none());
     }
 }
-
-

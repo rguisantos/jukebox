@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+id jukebox >/dev/null 2>&1 || useradd -m -s /bin/bash -G audio,video,render,netdev,plugdev jukebox
+passwd -l jukebox
+mkdir -p /dados /media/usb
+chown jukebox:jukebox /dados
+cp -a /etc/skel/. /home/jukebox/
+chown -R jukebox:jukebox /home/jukebox
+printf 'jukebox ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/local/sbin/jukebox-install-to-disk
+' > /etc/sudoers.d/live
+chmod 0440 /etc/sudoers.d/live
+chmod +x /opt/jukebox/launcher.sh /usr/local/bin/jukebox-* /usr/local/sbin/jukebox-*
+systemctl enable systemd-timesyncd.service NetworkManager.service jukebox-data.service jukebox-kiosk.service
+systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+systemctl disable getty@tty1.service || true
+sed -i 's/^# *pt_BR.UTF-8 UTF-8/pt_BR.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen

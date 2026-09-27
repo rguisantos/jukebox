@@ -38,7 +38,10 @@ pub fn scan_media_directory(db: &mut Database) -> Vec<TrackInfo> {
 
     // Garante que o diretório de mídia exista
     if !media_dir.exists() {
-        log::warn!("Scanner: Diretório de mídia {:?} não encontrado. Criando...", media_dir);
+        log::warn!(
+            "Scanner: Diretório de mídia {:?} não encontrado. Criando...",
+            media_dir
+        );
         let _ = fs::create_dir_all(&media_dir);
     }
 
@@ -71,14 +74,13 @@ pub fn scan_media_directory(db: &mut Database) -> Vec<TrackInfo> {
             new_files.len()
         );
 
-        for file_path in &new_files {
-            let track = extract_track_info(file_path, &media_dir);
-            if let Err(e) = db.upsert_track(&track) {
-                log::error!(
-                    "Scanner: Erro ao indexar {:?}: {}",
-                    file_path.file_name().unwrap_or_default(),
-                    e
-                );
+        for chunk in new_files.chunks(128) {
+            let tracks: Vec<_> = chunk
+                .iter()
+                .map(|path| extract_track_info(path, &media_dir))
+                .collect();
+            if let Err(e) = db.upsert_tracks(&tracks) {
+                log::error!("Scanner: falha ao indexar lote: {}", e);
             }
         }
 
@@ -90,7 +92,8 @@ pub fn scan_media_directory(db: &mut Database) -> Vec<TrackInfo> {
         for mut track in all_tracks {
             let path = Path::new(&track.file_path);
             let (file_artist, _) = parse_filename(path);
-            let correct_artist = resolve_track_artist(&track.file_path, &media_dir, &file_artist, None);
+            let correct_artist =
+                resolve_track_artist(&track.file_path, &media_dir, &file_artist, None);
             let correct_album = resolve_track_album(&track.file_path, &media_dir, None);
             if track.artist != correct_artist || track.album != correct_album {
                 track.artist = correct_artist;
@@ -130,6 +133,11 @@ fn walk_directory(dir: &Path) -> Vec<PathBuf> {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true)
+            || entry.file_name().to_string_lossy().starts_with('.')
+        {
+            continue;
+        }
         if path.is_dir() {
             // Recursão em subpastas (ex: /dados/musicas/rock/, /dados/musicas/sertanejo/)
             results.extend(walk_directory(&path));
@@ -150,7 +158,12 @@ fn is_supported_media(path: &Path) -> bool {
 }
 
 /// Resolve o nome do artista preferindo a pasta do artista no sistema de arquivos (não ID3).
-pub fn resolve_track_artist(file_path: &str, media_root: &Path, file_artist: &str, id3_artist: Option<&str>) -> String {
+pub fn resolve_track_artist(
+    file_path: &str,
+    media_root: &Path,
+    file_artist: &str,
+    id3_artist: Option<&str>,
+) -> String {
     let path = Path::new(file_path);
     let from_dir = infer_from_folder(path, media_root);
     if let Some(folder_artist) = from_dir.artist.filter(|s| !s.trim().is_empty()) {
@@ -173,7 +186,11 @@ pub fn resolve_track_album(file_path: &str, media_root: &Path, id3_album: Option
         return folder_album;
     }
     if let Some(parent) = path.parent().filter(|p| *p != media_root) {
-        if let Some(folder_name) = parent.file_name().and_then(|s| s.to_str()).filter(|s| !s.trim().is_empty()) {
+        if let Some(folder_name) = parent
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.trim().is_empty())
+        {
             return folder_name.to_string();
         }
     }
@@ -316,8 +333,13 @@ mod tests {
     fn test_resolve_track_artist_uses_folder_name() {
         let media_root = Path::new("/dados/musicas");
         let track_path = "/dados/musicas/Rock/ACDC/BackInBlack/01-HellsBells.mp3";
-        let resolved = resolve_track_artist(track_path, media_root, "Parsed Artist", Some("ID3 Artist Name"));
-        
+        let resolved = resolve_track_artist(
+            track_path,
+            media_root,
+            "Parsed Artist",
+            Some("ID3 Artist Name"),
+        );
+
         // Deve priorizar a pasta do artista ("ACDC") em vez do ID3 tag ou filename
         assert_eq!(resolved, "ACDC");
     }
@@ -327,7 +349,7 @@ mod tests {
         let media_root = Path::new("/dados/musicas");
         let track_path = "/dados/musicas/Rock/ACDC/BackInBlack/01-HellsBells.mp3";
         let resolved = resolve_track_album(track_path, media_root, Some("ID3 Album Name"));
-        
+
         // Deve priorizar a pasta do álbum ("BackInBlack") em vez do ID3 tag
         assert_eq!(resolved, "BackInBlack");
     }
@@ -337,10 +359,8 @@ mod tests {
         let media_root = Path::new("/dados/musicas");
         let track_path = "/dados/musicas/01-Track.mp3";
         let resolved = resolve_track_album(track_path, media_root, Some("ID3 Album Name"));
-        
+
         // Se estiver diretamente na raiz de mídia, usa o ID3 se disponível
         assert_eq!(resolved, "ID3 Album Name");
     }
 }
-
-

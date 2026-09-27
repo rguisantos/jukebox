@@ -1,0 +1,10 @@
+[Unit]
+Description=Read-only USB media %I
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/jukebox-usb-mount %I
+ExecStop=/usr/bin/umount /media/usb/%I

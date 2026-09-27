@@ -34,11 +34,11 @@ use db::Database;
 use finance::pix::{PixConfig, PixService, PixUiEvent};
 use media::covers::{self, CoverCommand, CoverEvent};
 use media::player::{self, PlayerCommand, PlayerEvent};
-use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
 use media::scanner;
+use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use state::models::{
-    Action, AppState, AlbumInfo, CoverArt, FocusState, GenreInfo, TrackInfo, VOLUME_DEFAULT,
+    Action, AlbumInfo, AppState, CoverArt, FocusState, GenreInfo, TrackInfo, VOLUME_DEFAULT,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -58,6 +58,7 @@ enum DbCommand {
     /// Moeda (tecla Z) ou PIX confirmado: credita e alimenta os
     /// contadores antifraude (caixa parcial + odômetro — Módulo 8)
     AddCredit(u32),
+    RefreshCredits,
     /// Tecla O numa faixa: débito atômico do preço vigente (Módulo 8)
     /// + enfileiramento no player
     RequestPlay(TrackData),
@@ -80,6 +81,9 @@ enum DbCommand {
 }
 
 /// Geração do toast atual (evita que um timer antigo apague um toast novo)
+static WIFI_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ONLINE_TX: std::sync::OnceLock<mpsc::Sender<()>> = std::sync::OnceLock::new();
+static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
 static TOAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,12 +102,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let initial_credits = db.get_credits().unwrap_or(0);
-    log::info!("Créditos persistentes carregados do banco: {}", initial_credits);
+    log::info!(
+        "Créditos persistentes carregados do banco: {}",
+        initial_credits
+    );
 
     // MÓDULO 8 — Preço da música (créditos por reprodução), persistido no
     // banco: o bar ajusta uma vez e sobrevive a todos os ciclos de energia
     let initial_price = db.get_song_price().unwrap_or(1);
-    log::info!("Preço da música carregado do banco: {} crédito(s)", initial_price);
+    log::info!(
+        "Preço da música carregado do banco: {} crédito(s)",
+        initial_price
+    );
 
     // Volume persistido na tabela chave-valor (Módulo 7): o bar ajusta uma
     // vez e o valor sobrevive a todos os ciclos de energia da máquina
@@ -116,7 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Volume persistido carregado do banco: {}%", initial_volume);
 
     let initial_recent_days = db.get_recent_days().unwrap_or(30);
-    log::info!("Dias recém-adicionados carregados do banco: {}", initial_recent_days);
+    log::info!(
+        "Dias recém-adicionados carregados do banco: {}",
+        initial_recent_days
+    );
 
     // =========================================================================
     // 2. Interface Slint + máquina de estados de foco (Módulo 7)
@@ -166,6 +179,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log::info!("Thread de persistência do SQLite iniciada.");
             while let Ok(cmd) = db_rx.recv() {
                 match cmd {
+                    DbCommand::RefreshCredits => {
+                        if let Ok(balance) = db.get_credits() {
+                            update_credits_ui(&ui_handle, balance);
+                        }
+                    }
                     DbCommand::AddCredit(amount) => {
                         log::info!("Processando crédito (+{}): moeda ou PIX.", amount);
                         apply_credit(&mut db, amount, &ui_handle);
@@ -181,37 +199,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             genre: String::new(), // não usado no caminho do play
                         };
 
-                        // MÓDULO 8 — Débito atômico pelo preço VIGENTE (lido do
-                        // banco na hora: fonte única de verdade, válida também
-                        // se o operador acabou de mudar o preço no submenu)
-                        let price = db.get_song_price().unwrap_or(1).max(1);
-
-                        match db.spend_credits(price) {
-                            Ok(Some(new_total)) => {
-                                log::info!(
-                                    "Créditos debitados: -{} (saldo: {}). Enfileirando '{}'.",
-                                    price,
-                                    new_total,
-                                    track.title
-                                );
-                                update_credits_ui(&ui_handle, new_total);
-                                if let Err(e) = player_tx.send(PlayerCommand::Enqueue(track)) {
-                                    log::error!("Falha ao enviar faixa ao player: {}", e);
-                                }
-                            }
-                            Ok(None) => {
-                                log::warn!(
-                                    "Play negado: créditos insuficientes (preço: {}).",
-                                    price
-                                );
-                                show_toast(&ui_handle, "Créditos Insuficientes", 2);
-                            }
-                            Err(e) => {
-                                log::error!("Falha no débito de crédito: {}", e);
-                                show_toast(&ui_handle, "Erro no banco de créditos", 2);
-                            }
+                        if let Err(e) = player_tx.send(PlayerCommand::Enqueue(track)) {
+                            log::error!("Player indisponível: {}", e);
+                            show_toast(
+                                &ui_handle,
+                                "Player indisponível; nenhum crédito debitado",
+                                3,
+                            );
                         }
                     }
+
                     DbCommand::SetVolume(volume) => {
                         if let Err(e) = db.set_config_i64(VOLUME_CONFIG_KEY, volume as i64) {
                             log::error!("Falha ao persistir o volume: {}", e);
@@ -254,32 +251,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    DbCommand::SetSongPrice(price) => {
-                        match db.set_song_price(price) {
-                            Ok(()) => {
-                                log::info!("Preço da música atualizado: {} crédito(s).", price);
-                                let ui_for_update = ui_handle.clone();
-                                let _ = slint::invoke_from_event_loop(move || {
-                                    if let Some(ui) = ui_for_update.upgrade() {
-                                        ui.set_op_song_price(price as i32);
-                                    }
-                                });
-                                show_toast(
-                                    &ui_handle,
-                                    &format!(
-                                        "Preço atualizado: {} crédito{}",
-                                        price,
-                                        if price == 1 { "" } else { "s" }
-                                    ),
-                                    1,
-                                );
-                            }
-                            Err(e) => {
-                                log::error!("Falha ao gravar o preço da música: {}", e);
-                                show_toast(&ui_handle, "Erro ao salvar o preço", 2);
-                            }
+                    DbCommand::SetSongPrice(price) => match db.set_song_price(price) {
+                        Ok(()) => {
+                            log::info!("Preço da música atualizado: {} crédito(s).", price);
+                            let ui_for_update = ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_for_update.upgrade() {
+                                    ui.set_op_song_price(price as i32);
+                                }
+                            });
+                            show_toast(
+                                &ui_handle,
+                                &format!(
+                                    "Preço atualizado: {} crédito{}",
+                                    price,
+                                    if price == 1 { "" } else { "s" }
+                                ),
+                                1,
+                            );
                         }
-                    }
+                        Err(e) => {
+                            log::error!("Falha ao gravar o preço da música: {}", e);
+                            show_toast(&ui_handle, "Erro ao salvar o preço", 2);
+                        }
+                    },
                     DbCommand::ToggleGenre(genre) => {
                         match db.toggle_genre_block(&genre) {
                             Ok(blocked) => {
@@ -394,8 +389,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let ui_handle = main_window.as_weak();
         let state_arc = state_arc.clone();
+        let balance_tx = db_tx.clone();
         thread::spawn(move || {
             while let Ok(event) = player_event_rx.recv() {
+                if matches!(event, PlayerEvent::CreditsChanged) {
+                    let _ = balance_tx.send(DbCommand::RefreshCredits);
+                    continue;
+                }
                 let ui_handle = ui_handle.clone();
                 let state_arc = state_arc.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -404,7 +404,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => return,
                     };
                     match event {
-                        PlayerEvent::TrackStarted { id, title, artist, is_video } => {
+                        PlayerEvent::CreditsChanged => {}
+                        PlayerEvent::TrackStarted {
+                            id,
+                            title,
+                            artist,
+                            is_video,
+                        } => {
                             lock_state(&state_arc).is_playing = true;
                             ui.set_np_active(true);
                             ui.set_np_track_id(id as i32);
@@ -471,16 +477,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // estava com volume/menu abertos, fecha (MÓDULO 8:
                                 // vale para o menu principal E para os submenus)
                                 let mut st = lock_state(&state_arc);
-                                if st.focus == FocusState::VolumeControl
-                                    || st.focus.is_operator()
-                                {
+                                if st.focus == FocusState::VolumeControl || st.focus.is_operator() {
                                     st.focus = FocusState::BrowsingAlbums;
                                 }
                                 mirror_nav(&ui, &st);
                             }
                         });
                     }
-                    UsbSyncEvent::Progress { copied, total, current_file } => {
+                    UsbSyncEvent::Progress {
+                        copied,
+                        total,
+                        current_file,
+                    } => {
                         let ui_handle = ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(ui) = ui_handle.upgrade() {
@@ -491,7 +499,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    UsbSyncEvent::Finished { copied, skipped, albums } => {
+                    UsbSyncEvent::Finished {
+                        copied,
+                        skipped,
+                        albums,
+                    } => {
                         log::info!(
                             "UI: sync USB concluído ({} copiados, {} pulados).",
                             copied,
@@ -520,9 +532,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             thread::sleep(Duration::from_secs(6));
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(ui) = ui_auto.upgrade() {
-                                    if ui.get_usb_overlay_visible()
-                                        && ui.get_usb_state() == 2
-                                    {
+                                    if ui.get_usb_overlay_visible() && ui.get_usb_state() == 2 {
                                         ui.set_usb_overlay_visible(false);
                                         let _ = player_auto.send(PlayerCommand::RestoreVideo);
                                     }
@@ -560,13 +570,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui_handle = main_window.as_weak();
         thread::spawn(move || {
             while let Ok(event) = cover_event_rx.recv() {
-                let CoverEvent::Ready { key, art } = event;
+                let CoverEvent::Ready {
+                    generation,
+                    key,
+                    art,
+                } = event;
                 let ui_handle = ui_handle.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_handle.upgrade() {
-                        apply_album_cover(&ui, &key, art);
+                        if covers::GENERATION.load(Ordering::Relaxed) == generation {
+                            apply_album_cover(&ui, &key, art);
+                        }
                     }
                 });
+            }
+        });
+    }
+
+    // 49 covers max in the UI (~9.2 MiB RGB), independent of catalog size.
+    let cover_timer = slint::Timer::default();
+    {
+        let ui_handle = main_window.as_weak();
+        let state = state_arc.clone();
+        let tx = cover_cmd_tx.clone();
+        let mut previous = None;
+        cover_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(150),
+            move || {
+                let Some(ui) = ui_handle.upgrade() else {
+                    return;
+                };
+                let st = lock_state(&state);
+                let signature = (st.album_index, CATALOG_GENERATION.load(Ordering::Relaxed));
+                if previous == Some(signature) {
+                    return;
+                }
+                previous = Some(signature);
+                let start = st.album_index.saturating_sub(24);
+                let end = (st.album_index + 25).min(st.albums.len());
+                let model = ui.get_albums();
+                if let Some(rows) = model.as_any().downcast_ref::<VecModel<AlbumData>>() {
+                    for i in 0..rows.row_count() {
+                        if i < start || i >= end {
+                            if let Some(mut row) = rows.row_data(i) {
+                                if row.has_cover {
+                                    row.cover = slint::Image::default();
+                                    row.has_cover = false;
+                                    rows.set_row_data(i, row);
+                                }
+                            }
+                        }
+                    }
+                }
+                let generation = covers::GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut albums: Vec<_> = st.albums[start.min(end)..end]
+                    .iter()
+                    .map(|a| AlbumInfo {
+                        key: a.key.clone(),
+                        title: a.title.clone(),
+                        artist: a.artist.clone(),
+                        genre: a.genre.clone(),
+                        initial: a.initial.clone(),
+                        palette: a.palette,
+                        is_recent: a.is_recent,
+                        tracks: a.tracks.clone(),
+                    })
+                    .collect();
+                // Center first, then nearby albums. Only the nearby slice is cloned.
+                albums.sort_by_key(|a| {
+                    if st.current_album().map(|v| &v.key) == Some(&a.key) {
+                        0
+                    } else {
+                        1
+                    }
+                });
+                let _ = tx.send(CoverCommand::Scan { generation, albums });
+            },
+        );
+    }
+
+    {
+        let (tx, rx) = mpsc::channel();
+        let _ = ONLINE_TX.set(media::online_sync::spawn(tx));
+        let ui_handle = main_window.as_weak();
+        let state = state_arc.clone();
+        let covers = cover_cmd_tx.clone();
+        thread::spawn(move || {
+            while let Ok(event) = rx.recv() {
+                match event {
+                    media::online_sync::OnlineEvent::Status(message) => {
+                        let weak = ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_online_status(message.into());
+                            }
+                        });
+                    }
+                    media::online_sync::OnlineEvent::Catalog(albums) => {
+                        publish_albums(&ui_handle, &state, &covers, albums, true);
+                    }
+                }
             }
         });
     }
@@ -589,7 +693,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    PixUiEvent::QrReady { rgb, width, height, copia_cola } => {
+                    PixUiEvent::QrReady {
+                        rgb,
+                        width,
+                        height,
+                        copia_cola,
+                    } => {
                         // O payload "Copia e Cola" vai para o log: útil para o
                         // operador colar manualmente num celular em último caso
                         log::info!("PIX Copia e Cola: {}", copia_cola);
@@ -657,7 +766,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let usb_tx = usb_cmd_tx.clone();
 
         main_window.on_arcade_key_pressed(move |key: slint::SharedString| -> bool {
-            let Some(ui) = ui_handle.upgrade() else { return false };
+            let Some(ui) = ui_handle.upgrade() else {
+                return false;
+            };
 
             let action = {
                 let mut st = lock_state(&state_arc);
@@ -677,7 +788,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let usb_tx = usb_cmd_tx.clone();
 
         main_window.on_album_activated(move |index: i32| {
-            let Some(ui) = ui_handle.upgrade() else { return };
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
 
             let action = {
                 let mut st = lock_state(&state_arc);
@@ -701,7 +814,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let usb_tx = usb_cmd_tx.clone();
 
         main_window.on_track_activated(move |index: i32| {
-            let Some(ui) = ui_handle.upgrade() else { return };
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
 
             let action = {
                 let mut st = lock_state(&state_arc);
@@ -808,7 +923,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// thread entrar em pânico segurando o lock, recuperamos o conteúdo —
 /// um jukebox de bar não pode travar por causa de um estado inconsistente.
 fn lock_state(state_arc: &Arc<Mutex<AppState>>) -> std::sync::MutexGuard<'_, AppState> {
-    state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state_arc
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Espelha TODO o estado de navegação nas propriedades do Slint.
@@ -877,6 +994,32 @@ fn handle_ui_action(
     }
 
     match action {
+        Action::OpenWifi => {
+            if !WIFI_OPEN.swap(true, Ordering::Relaxed) {
+                let weak = ui.as_weak();
+                thread::spawn(move || {
+                    match std::process::Command::new("/usr/local/bin/jukebox-wifi").status() {
+                        Ok(status) if status.success() => {}
+                        result => {
+                            log::warn!("Configuração Wi-Fi: {:?}", result);
+                            show_toast(
+                                &weak,
+                                "Wi-Fi indisponível; verifique a instalação da distro",
+                                3,
+                            );
+                        }
+                    }
+                    WIFI_OPEN.store(false, Ordering::Relaxed);
+                });
+            }
+        }
+        Action::SyncOnline => {
+            if let Some(tx) = ONLINE_TX.get() {
+                let _ = tx.send(());
+            }
+            show_toast(&ui.as_weak(), "Verificação do acervo solicitada", 2);
+        }
+
         Action::Noop => {}
         Action::AddCredit => {
             log::debug!("Evento de moeda/tecla 'Z' detectado pela interface.");
@@ -972,7 +1115,10 @@ fn handle_ui_action(
         Action::OpenRecentDaysMenu => {}
         Action::RecentDaysSaved(days) => {
             if let Err(e) = db_tx.send(DbCommand::SetRecentDays(days)) {
-                log::error!("Erro ao enviar novos dias recém-adicionados ao banco: {}", e);
+                log::error!(
+                    "Erro ao enviar novos dias recém-adicionados ao banco: {}",
+                    e
+                );
             }
         }
         Action::PowerOff => {
@@ -1050,7 +1196,8 @@ fn track_info_to_data(t: &TrackInfo) -> TrackData {
 /// Converte um AlbumInfo (banco) em AlbumData (modelo Slint) — estrutura
 /// aninhada: cada álbum carrega seu próprio VecModel de faixas
 fn album_info_to_data(a: &AlbumInfo) -> AlbumData {
-    let tracks: Vec<TrackData> = a.tracks.iter().map(track_info_to_data).collect();
+    // Tracks are materialized only for the currently open album.
+    let tracks: Vec<TrackData> = Vec::new();
     AlbumData {
         key: a.key.clone().into(),
         title: a.title.clone().into(),
@@ -1080,12 +1227,14 @@ fn publish_albums(
 ) {
     let album_count = albums.len();
     // Cópia para o serviço de capas (o original vai para o estado)
-    let scan_list = albums.clone();
+    let _ = cover_tx;
 
     let ui_handle = ui_handle.clone();
     let state_arc = state_arc.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = ui_handle.upgrade() else { return };
+        let Some(ui) = ui_handle.upgrade() else {
+            return;
+        };
 
         let rows: Vec<AlbumData> = {
             let mut st = lock_state(&state_arc);
@@ -1102,16 +1251,11 @@ fn publish_albums(
         };
 
         ui.set_albums(ModelRc::new(VecModel::from(rows)));
+        covers::GENERATION.fetch_add(1, Ordering::Relaxed);
+        CATALOG_GENERATION.fetch_add(1, Ordering::Relaxed);
         ui.set_scanning(false);
         log::info!("Catálogo publicado na interface: {} álbuns.", album_count);
     });
-
-    // A fila do event loop preserva a ordem: esta varredura roda DEPOIS da
-    // publicação acima, então capas reemitidas encontram o modelo novo.
-    // (Discos ainda sem capa na memória são extraídos e cacheados em disco.)
-    if let Err(e) = cover_tx.send(CoverCommand::Scan(scan_list)) {
-        log::error!("Falha ao solicitar varredura de capas: {}", e);
-    }
 }
 
 /// Aplica uma capa pronta (RGB cru) na linha do álbum correspondente do
@@ -1119,7 +1263,7 @@ fn publish_albums(
 /// do Slint não pode nascer em outra thread.
 fn apply_album_cover(ui: &MainWindow, key: &str, art: CoverArt) {
     let model = ui.get_albums();
-    let row_count = model.iter().count();
+    let row_count = model.row_count();
 
     for row in 0..row_count {
         if let Some(mut data) = model.row_data(row) {
@@ -1197,7 +1341,9 @@ fn show_toast(ui_handle: &slint::Weak<MainWindow>, message: &str, kind: i32) {
 
     let ui_for_show = ui_handle.clone();
     let queued = slint::invoke_from_event_loop(move || {
-        let Some(ui) = ui_for_show.upgrade() else { return };
+        let Some(ui) = ui_for_show.upgrade() else {
+            return;
+        };
         ui.set_toast_message(message.into());
         ui.set_toast_kind(kind);
         ui.set_toast_visible(true);
@@ -1254,4 +1400,3 @@ fn x11_window_id(window: &slint::Window) -> Option<u64> {
         _ => None,
     }
 }
-

@@ -58,3 +58,7 @@ jukebox-app/target/
 
 # Logs de sessão X11 do kiosk (gerados em runtime)
 /dados/
+
+# Python verification caches
+__pycache__/
+*.pyc
