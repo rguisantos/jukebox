@@ -23,8 +23,7 @@ pub struct TrackInfo {
     pub file_path: String,
     /// Tipo de mídia: "mp3", "mp4", "wav", "wmv", "mpeg"
     pub file_type: String,
-    /// Gênero musical da tag ID3 (MÓDULO 8 — filtro do catálogo público).
-    /// String vazia no caminho RequestPlay (a UI não precisa do gênero).
+    /// Gênero musical da tag ID3, preservado inclusive no comando de reprodução.
     pub genre: String,
 }
 

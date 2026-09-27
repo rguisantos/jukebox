@@ -3,6 +3,38 @@ use crate::{
     settings::{Package, Settings},
     ConfigData,
 };
+/// Owned input at the UI boundary. Storage commands never carry Slint types.
+#[derive(Debug)]
+pub struct SettingsInput {
+    pub base_cents: String,
+    pub base_credits: String,
+    pub pack_cents: String,
+    pub pack_credits: String,
+    pub large_cents: String,
+    pub large_credits: String,
+    pub coin_cents: String,
+    pub attract_minutes: String,
+    pub low_disk_mib: String,
+    pub free_play: bool,
+    pub new_pin: String,
+}
+impl From<ConfigData> for SettingsInput {
+    fn from(form: ConfigData) -> Self {
+        Self {
+            base_cents: form.base_cents.to_string(),
+            base_credits: form.base_credits.to_string(),
+            pack_cents: form.pack_cents.to_string(),
+            pack_credits: form.pack_credits.to_string(),
+            large_cents: form.large_cents.to_string(),
+            large_credits: form.large_credits.to_string(),
+            coin_cents: form.coin_cents.to_string(),
+            attract_minutes: form.attract_minutes.to_string(),
+            low_disk_mib: form.low_disk_mib.to_string(),
+            free_play: form.free_play,
+            new_pin: form.new_pin.to_string(),
+        }
+    }
+}
 pub fn form(s: &Settings) -> ConfigData {
     ConfigData {
         base_cents: s.packages[0].cents.to_string().into(),
@@ -18,7 +50,7 @@ pub fn form(s: &Settings) -> ConfigData {
         new_pin: "".into(),
     }
 }
-pub fn parse(f: ConfigData, mut current: Settings) -> Result<Settings, String> {
+pub fn parse(f: SettingsInput, mut current: Settings) -> Result<Settings, String> {
     fn number(s: &str) -> Result<u32, String> {
         s.trim()
             .parse()
