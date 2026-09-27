@@ -32,7 +32,7 @@ use crate::media::scanner;
 use crate::state::models::AlbumInfo;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -161,8 +161,14 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
         let mut copied: usize = 0;
         let mut skipped: usize = 0;
         let mut failure: Option<String> = None;
+        // Protect publication and the subsequent scan from the online updater.
+        let catalog_lock = super::catalog_lock::CatalogLock::acquire(dest_dir.parent().unwrap());
+        if let Err(e) = &catalog_lock {
+            failure = Some(format!("Falha ao bloquear acervo: {e}"));
+        }
 
-        for src in &files {
+        if failure.is_none() {
+            for src in &files {
             let file_name = src
                 .file_name()
                 .map(OsStr::to_string_lossy)
@@ -172,10 +178,7 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
             let relative = src.strip_prefix(USB_MOUNT_POINT).unwrap();
             let relative: PathBuf = relative.components().skip(1).collect();
             let dest = dest_dir.join(relative);
-            if dest.is_file()
-                && fs::metadata(src).ok().map(|m| m.len())
-                    == fs::metadata(&dest).ok().map(|m| m.len())
-            {
+            if dest.is_file() && same_content(src, &dest).unwrap_or(false) {
                 skipped += 1;
                 continue;
             } else if let Err(e) = copy_atomic(src, &dest) {
@@ -189,6 +192,7 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
                 total,
                 current_file: file_name,
             });
+            }
         }
 
         // ------------------------------------------------------------------
@@ -232,6 +236,9 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
                 });
             }
         }
+
+        // Release before waiting for the user to remove the USB device.
+        drop(catalog_lock);
 
         // ------------------------------------------------------------------
         // ESTADO 4: AGUARDA REMOÇÃO — evita redisparar o mesmo pendrive.
@@ -309,6 +316,24 @@ fn is_syncable_media(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Equal byte length does not imply equal media; hash by chunks without
+/// loading an entire video into RAM. A read error triggers an atomic re-copy.
+fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() { return Ok(false); }
+    fn digest(path: &Path) -> io::Result<ring::digest::Digest> {
+        let mut file = fs::File::open(path)?;
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let bytes = file.read(&mut buffer)?;
+            if bytes == 0 { break; }
+            hash.update(&buffer[..bytes]);
+        }
+        Ok(hash.finish())
+    }
+    Ok(digest(a)?.as_ref() == digest(b)?.as_ref())
+}
+
 /// Same-filesystem rename publishes a complete file; partial files are retried.
 fn copy_atomic(src: &Path, dest: &Path) -> io::Result<()> {
     let parent = dest
@@ -337,6 +362,19 @@ fn copy_atomic(src: &Path, dest: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn equal_size_different_content_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("jukebox-usb-digest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("source.mp3");
+        let dst = dir.join("destination.mp3");
+        fs::write(&src, b"new!").unwrap();
+        fs::write(&dst, b"old!").unwrap();
+        assert!(!same_content(&src, &dst).unwrap());
+        copy_atomic(&src, &dst).unwrap();
+        assert!(same_content(&src, &dst).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn atomic_copy_keeps_original_when_source_is_missing() {
         let dir = std::env::temp_dir().join(format!("jukebox-usb-{}", std::process::id()));

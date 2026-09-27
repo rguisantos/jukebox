@@ -91,6 +91,8 @@ enum DbCommand {
 static WIFI_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ONLINE_TX: std::sync::OnceLock<mpsc::Sender<()>> = std::sync::OnceLock::new();
 static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ALBUM_ROW_INDEX: std::sync::OnceLock<Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
 static TOAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -757,6 +759,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state_arc.clone();
         let tx = cover_cmd_tx.clone();
         let mut previous = None;
+        let mut previous_window: Option<(usize, usize, u64)> = None;
         cover_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(150),
@@ -773,19 +776,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let start = st.album_index.saturating_sub(24);
                 let end = (st.album_index + 25).min(st.albums.len());
                 let model = ui.get_albums();
-                if let Some(rows) = model.as_any().downcast_ref::<VecModel<AlbumData>>() {
-                    for i in 0..rows.row_count() {
-                        if i < start || i >= end {
-                            if let Some(mut row) = rows.row_data(i) {
-                                if row.has_cover {
-                                    row.cover = slint::Image::default();
-                                    row.has_cover = false;
-                                    rows.set_row_data(i, row);
+                if let Some((old_start, old_end, old_generation)) = previous_window {
+                    if old_generation == signature.1 {
+                        if let Some(rows) = model.as_any().downcast_ref::<VecModel<AlbumData>>() {
+                            for i in old_start..old_end {
+                                if (i < start || i >= end) && i < rows.row_count() {
+                                    if let Some(mut row) = rows.row_data(i) {
+                                        if row.has_cover {
+                                            row.cover = slint::Image::default();
+                                            row.has_cover = false;
+                                            rows.set_row_data(i, row);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                previous_window = Some((start, end, signature.1));
                 let generation = covers::GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
                 let mut albums: Vec<_> = st.albums[start.min(end)..end]
                     .iter()
@@ -1503,6 +1511,12 @@ fn publish_albums(
             rows
         };
 
+        let mut index = std::collections::HashMap::with_capacity(rows.len());
+        for (row_number, row) in rows.iter().enumerate() {
+            index.entry(row.key.to_string()).or_insert(row_number);
+        }
+        *ALBUM_ROW_INDEX.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = index;
         ui.set_albums(ModelRc::new(VecModel::from(rows)));
         covers::GENERATION.fetch_add(1, Ordering::Relaxed);
         CATALOG_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -1516,15 +1530,14 @@ fn publish_albums(
 /// do Slint não pode nascer em outra thread.
 fn apply_album_cover(ui: &MainWindow, key: &str, art: CoverArt) {
     let model = ui.get_albums();
-    let row_count = model.row_count();
-
-    for row in 0..row_count {
-        if let Some(mut data) = model.row_data(row) {
+    let index = ALBUM_ROW_INDEX.get().and_then(|map| map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(key).copied());
+    if let Some(index) = index {
+        if let Some(mut data) = model.row_data(index) {
             if data.key.as_str() == key {
                 data.cover = rgb_buffer_to_image(art.rgb, art.width, art.height);
                 data.has_cover = true;
                 if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<AlbumData>>() {
-                    vec_model.set_row_data(row, data);
+                    vec_model.set_row_data(index, data);
                 }
                 return;
             }
