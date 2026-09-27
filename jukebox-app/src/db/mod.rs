@@ -12,6 +12,15 @@ pub struct Database {
     conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingPix {
+    pub machine_id: String,
+    pub txid: String,
+    pub api_base: String,
+    pub status_path: String,
+    pub credits: u32,
+}
+
 impl Database {
     /// Inicializa a conexão SQLite, configura o modo WAL e cria as tabelas necessárias.
     /// Tenta prioritariamente o caminho de produção `/dados/jukebox.db`.
@@ -73,6 +82,7 @@ impl Database {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS operator_settings (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cash_receipts (receipt TEXT PRIMARY KEY, cents INTEGER NOT NULL, credits INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS pix_receipts (machine_id TEXT NOT NULL, txid TEXT NOT NULL, credits INTEGER NOT NULL CHECK(credits > 0), created_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(machine_id, txid));
+            CREATE TABLE IF NOT EXISTS pending_pix (machine_id TEXT NOT NULL, txid TEXT NOT NULL, api_base TEXT NOT NULL, status_path TEXT NOT NULL, credits INTEGER NOT NULL CHECK(credits > 0), PRIMARY KEY(machine_id, txid));
             CREATE TABLE IF NOT EXISTS conversion_session (id INTEGER PRIMARY KEY CHECK(id=1), cents INTEGER NOT NULL, awarded INTEGER NOT NULL);
             INSERT OR IGNORE INTO conversion_session VALUES(1,0,0);")?;
         if self
@@ -314,9 +324,30 @@ impl Database {
             tx.execute("UPDATE system_state SET value=value+?1 WHERE key IN ('credits','partial_coins','absolute_coins')", [credits])?;
             tx.execute("INSERT INTO credits_audit(amount) VALUES(?1)", [credits])?;
         }
+        tx.execute("DELETE FROM pending_pix WHERE machine_id=?1 AND txid=?2", params![machine_id, txid])?;
         let balance = if inserted { current + credits } else { current };
         tx.commit()?;
         Ok((balance, inserted))
+    }
+    pub fn remember_pix(&self, item: &PendingPix) -> Result<()> {
+        if item.machine_id.trim().is_empty() || item.txid.trim().is_empty()
+            || item.api_base.trim().is_empty() || item.status_path.trim().is_empty()
+            || item.credits == 0 || item.credits > 100_000 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        self.conn.execute("INSERT INTO pending_pix(machine_id,txid,api_base,status_path,credits)
+            VALUES(?1,?2,?3,?4,?5) ON CONFLICT(machine_id,txid) DO NOTHING",
+            params![item.machine_id, item.txid, item.api_base, item.status_path, item.credits])?;
+        Ok(())
+    }
+    pub fn pending_pix(&self) -> Result<Vec<PendingPix>> {
+        let mut stmt = self.conn.prepare("SELECT machine_id,txid,api_base,status_path,credits FROM pending_pix ORDER BY rowid")?;
+        stmt.query_map([], |r| Ok(PendingPix { machine_id:r.get(0)?, txid:r.get(1)?,
+            api_base:r.get(2)?, status_path:r.get(3)?, credits:r.get(4)? }))?.collect()
+    }
+    pub fn forget_pix(&self, machine_id: &str, txid: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM pending_pix WHERE machine_id=?1 AND txid=?2", params![machine_id, txid])?;
+        Ok(())
     }
 
     pub fn settings(&self) -> Result<Settings> {
@@ -1060,6 +1091,31 @@ mod queue_tests {
             assert_eq!(db.accept_pix("machine-1", "tx-2", 2).unwrap(), (4, true));
             assert_eq!(db.get_credits().unwrap(), 4);
             assert_eq!(db.get_partial_coins().unwrap(), 4);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pending_pix_survives_restart_until_credit_commits() {
+        let path = std::env::temp_dir().join(format!(
+            "jukebox-pix-pending-{}-{}.db", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let item = PendingPix { machine_id: "m1".into(), txid: "payment-1".into(),
+            api_base: "https://example.test/api/pix".into(), status_path: "status/payment-1".into(), credits: 1 };
+        {
+            let db = Database { conn: Connection::open(&path).unwrap() };
+            db.create_tables().unwrap();
+            db.remember_pix(&item).unwrap();
+            assert_eq!(db.pending_pix().unwrap().len(), 1);
+        }
+        {
+            let mut db = Database { conn: Connection::open(&path).unwrap() };
+            db.create_tables().unwrap();
+            assert_eq!(db.pending_pix().unwrap()[0].txid, item.txid);
+            assert_eq!(db.accept_pix("m1", "payment-1", 1).unwrap(), (1, true));
+            assert!(db.pending_pix().unwrap().is_empty());
+            assert_eq!(db.accept_pix("m1", "payment-1", 1).unwrap(), (1, false));
         }
         std::fs::remove_file(path).unwrap();
     }
