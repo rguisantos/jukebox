@@ -397,7 +397,7 @@ export component MainWindow inherits Window {
     in-out property <int> op-partial-coins: 0;
     // Odômetro patrimonial em reais (SUM(cents) de cash_receipts), formatado
     // "R$ X.XXX,XX" na thread do banco — a UI só espelha a string pronta.
-    in-out property <string> op-total-revenue: "R$ 0,00";
+    in-out property <string> op-total-revenue: "Indisponível";
     in-out property <int> op-song-price: 1;
     in-out property <int> op-price-edit: 1;
     in-out property <int> op-recent-days: 30;
@@ -1299,7 +1299,7 @@ export component MainWindow inherits Window {
                             // Receita total acumulada em R$ — conferência
                             // patrimonial junto ao odômetro de créditos.
                             Text {
-                                text: root.op-total-revenue;
+                                text: "Moedeiro: " + root.op-total-revenue;
                                 color: #34d399;
                                 font-size: 13px;
                                 font-weight: 800;

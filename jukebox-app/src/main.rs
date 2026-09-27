@@ -373,14 +373,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let absolute = db.get_absolute_coins().unwrap_or(0);
                         // Odômetro patrimonial em reais: soma idempotente dos
                         // recebimentos registrados em `cash_receipts`.
-                        let total_cents = db.get_total_receipts_cents().unwrap_or(0);
+                        let total_revenue = revenue_label(db.get_total_receipts_cents());
                         let price = db.get_song_price().unwrap_or(1);
                         let recent_days = db.get_recent_days().unwrap_or(30);
                         let genres: Vec<GenreInfo> = db.get_genres().unwrap_or_default();
                         log::debug!(
                             "Menu do operador: odômetro={} créditos ({}), caixa parcial={}, preço={}, recentes={}d, {} gênero(s).",
                             absolute,
-                            format_brl(total_cents),
+                            total_revenue,
                             partial,
                             price,
                             recent_days,
@@ -393,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(ui) = ui_handle.upgrade() {
                                 ui.set_op_partial_coins(partial as i32);
                                 ui.set_op_absolute_coins(absolute as i32);
-                                ui.set_op_total_revenue(format_brl(total_cents).into());
+                                ui.set_op_total_revenue(total_revenue.into());
                                 ui.set_op_song_price(price as i32);
                                 ui.set_op_recent_days(recent_days as i32);
 
@@ -1545,6 +1545,17 @@ fn volume_to_linear(volume: u32) -> f64 {
     fraction * fraction * fraction
 }
 
+/// A failed financial query must never be displayed as a genuine zero.
+fn revenue_label(result: rusqlite::Result<i64>) -> String {
+    match result {
+        Ok(cents) => format_brl(cents),
+        Err(error) => {
+            log::error!("Falha ao consultar recebimentos do moedeiro: {error}");
+            "Indisponível".into()
+        }
+    }
+}
+
 /// Formata centavos como moeda brasileira (`R$ 1.234,56` — ponto como
 /// separador de milhar, vírgula como decimal). Usado pelo odômetro de
 /// receita do menu do operador; nunca usa ponto-flutuante para dinheiro.
@@ -1667,7 +1678,13 @@ fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slint::Image {
 
 #[cfg(test)]
 mod brl_tests {
-    use super::format_brl;
+    use super::{format_brl, revenue_label};
+
+    #[test]
+    fn failed_receipts_query_is_not_a_zero_balance() {
+        assert_eq!(revenue_label(Ok(0)), "R$ 0,00");
+        assert_eq!(revenue_label(Err(rusqlite::Error::InvalidQuery)), "Indisponível");
+    }
 
     #[test]
     fn formats_zero_and_small_amounts() {
