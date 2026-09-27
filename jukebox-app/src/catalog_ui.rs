@@ -152,7 +152,7 @@ fn album_info_to_data(a: &AlbumInfo) -> AlbumData {
 pub(crate) fn publish_albums(
     ui_handle: &slint::Weak<MainWindow>,
     state_arc: &Arc<Mutex<AppState>>,
-    cover_tx: &mpsc::Sender<CoverCommand>,
+    cover_tx: &Sender<CoverCommand>,
     albums: Vec<AlbumInfo>,
     keep_focus: bool,
 ) {

@@ -40,9 +40,9 @@ use catalog_ui::{publish_albums, track_info_to_data};
 use media::player::{self, PlayerCommand, PlayerEvent};
 use media::scanner;
 use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use state::models::{
-    Action, AlbumInfo, AppState, FocusState, GenreInfo, TrackInfo, VOLUME_DEFAULT,
+    Action, AlbumInfo, AppState, GenreInfo, TrackInfo, VOLUME_DEFAULT,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
