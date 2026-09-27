@@ -487,7 +487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let pix_service = PixService::start(PixConfig::from_env(), pix_event_tx);
+    let pix_service = PixService::start(PixConfig::from_env(), pix_event_tx, db_tx.clone());
 
     {
         let ui_handle = main_window.as_weak();
