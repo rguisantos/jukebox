@@ -2,6 +2,7 @@ import importlib.util
 import io
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -38,6 +39,27 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(self.run_sync())
         self.assertEqual((self.root / 'musicas/Rock/Artista/Disco/01.mp3').read_bytes(), self.data)
         self.assertEqual((self.root / 'jukebox.db').read_bytes(), b'operational database untouched')
+
+    def test_missing_or_corrupted_track_is_restored_without_version_change(self):
+        self.run_sync()
+        albumdir = self.root / 'musicas/Rock/Artista/Disco'
+        (albumdir / '01.mp3').unlink()
+        self.assertTrue(self.run_sync())
+        self.assertEqual((albumdir / '01.mp3').read_bytes(), self.data)
+        (albumdir / '01.mp3').write_bytes(b'x' * len(self.data))
+        os.utime(albumdir / '01.mp3', ns=(1, 1))
+        self.assertTrue(self.run_sync())
+        self.assertEqual((albumdir / '01.mp3').read_bytes(), self.data)
+        self.assertFalse(self.run_sync())
+
+    def test_old_marker_is_upgraded_without_republishing_album(self):
+        self.run_sync()
+        albumdir = self.root / 'musicas/Rock/Artista/Disco'
+        marker = albumdir / '.jukebox-album.json'
+        marker.write_text(json.dumps({'id': 'album-1', 'version': 'v1'}))
+        self.assertFalse(self.run_sync())
+        self.assertIn('files', json.loads(marker.read_text()))
+        self.assertFalse(self.run_sync())
 
     def test_bad_hash_never_publishes_album(self):
         self.item['sha256'] = '0' * 64
