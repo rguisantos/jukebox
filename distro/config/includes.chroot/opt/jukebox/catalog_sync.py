@@ -243,11 +243,9 @@ def main():
         return
     root.mkdir(parents=True, exist_ok=True)
     with (root / '.catalog-sync.lock').open('w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            emit('Uma atualização já está em andamento')
-            return
+        # USB imports use the same lock. Wait so a skipped check does not delay
+        # a new album until the next periodic poll.
+        fcntl.flock(lock, fcntl.LOCK_EX)
         sync(root, url, int(os.environ.get('JUKEBOX_DOWNLOAD_KIB', '512')))
 
 

@@ -223,6 +223,7 @@ struct Player {
     queue: VecDeque<(i64, TrackInfo)>,
     current: Option<TrackInfo>,
     current_id: Option<i64>,
+    pending_finish: Option<(bool, Instant)>,
     settings: crate::settings::Settings,
     tx: Sender<PlayerEvent>,
     last_activity: Instant,
@@ -237,16 +238,19 @@ struct Player {
 }
 impl Player {
     fn new(tx: Sender<PlayerEvent>) -> Result<Self, String> {
+        Self::with_database(Database::open().map_err(|e| e.to_string())?, tx,
+            std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink"))
+    }
+    fn with_database(db: Database, tx: Sender<PlayerEvent>, fake: bool) -> Result<Self, String> {
         let music = element("playbin")?;
         music.set_property("video-sink", video_sink(1)?);
-        music.set_property("audio-sink", audio_sink()?);
+        music.set_property("audio-sink", if fake { element("fakesink")? } else { audio_sink()? });
         let background = element("playbin")?;
         background.set_property("video-sink", video_sink(2)?);
         background.set_property("audio-sink", element("fakesink")?);
         background.set_property("mute", true);
         // Built-in two-note arcade arpeggio, no external file or license dependency.
-        let effect = CreditArpeggio::new(std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink"))?;
-        let db = Database::open().map_err(|e| e.to_string())?;
+        let effect = CreditArpeggio::new(fake)?;
         let settings = db.settings().map_err(|e| e.to_string())?;
         let queue = db.pending_tracks().map_err(|e| e.to_string())?.into();
         let mut p = Self {
@@ -257,6 +261,7 @@ impl Player {
             queue,
             current: None,
             current_id: None,
+            pending_finish: None,
             settings,
             tx,
             last_activity: Instant::now(),
@@ -385,6 +390,7 @@ impl Player {
                 }
             }
             self.effect.drain();
+            self.retry_finish();
             if self.current.is_none() && self.current_id.is_none() {
                 if let Some((id, t)) = self.queue.pop_front() {
                     self.current_id = Some(id);
@@ -533,22 +539,38 @@ impl Player {
         }
         self.emit_queue();
     }
+    fn retry_finish(&mut self) {
+        if let Some((refund, when)) = self.pending_finish {
+            if Instant::now() >= when { self.finish(refund); }
+        }
+    }
     fn finish(&mut self, refund: bool) {
+        // Preserve the first outcome: a later skip must not cancel an owed refund.
+        let refund = if let Some((original, when)) = self.pending_finish {
+            if Instant::now() < when { return; }
+            original
+        } else { refund };
         if let Some(id) = self.current_id {
             if let Err(e) = self.db.finish_track(id, refund) {
+                let first_failure = self.pending_finish.is_none();
+                self.pending_finish = Some((refund, Instant::now() + Duration::from_secs(2)));
+                log::warn!("Finalização pendente da faixa {id}; nova tentativa em 2s: {e}");
                 let _ = self.music.set_state(gst::State::Null);
                 let _ = self.background.set_state(gst::State::Null);
                 SOURCE.store(0, Ordering::Relaxed);
                 clear_frame();
                 let _ = self.tx.send(PlayerEvent::Visual(false));
-                let _ = self.tx.send(PlayerEvent::Error {
-                    context: "Persistência da fila".into(),
-                    detail: e.to_string(),
-                });
+                if first_failure {
+                    let _ = self.tx.send(PlayerEvent::Error {
+                        context: "Persistência da fila".into(),
+                        detail: format!("{e}; tentando recuperar automaticamente"),
+                    });
+                }
                 return;
             }
             let _ = self.tx.send(PlayerEvent::CreditsChanged);
         }
+        self.pending_finish = None;
         if let Some(t) = self.current.take() {
             self.last_path = Some(t.file_path);
             if !refund {
@@ -581,8 +603,42 @@ impl Player {
 #[cfg(test)]
 mod media_tests {
     use super::*;
+    // Both tests touch the bounded global frame mailbox.
+    static MEDIA_TEST: Mutex<()> = Mutex::new(());
+    #[test]
+    fn retries_failed_completion_and_refunds_exactly_once() {
+        let _guard = MEDIA_TEST.lock().unwrap();
+        gst::init().unwrap();
+        let mut db = Database::in_memory();
+        db.increment_credits(2).unwrap();
+        let track = TrackInfo { id: 1, title: "Test".into(), artist: "Artist".into(),
+            album: "Album".into(), file_path: "/test.mp3".into(), file_type: "mp3".into(), genre: "Rock".into() };
+        let (id, _) = db.reserve_track(&track).unwrap().unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut player = Player::with_database(db, tx, true).unwrap();
+        player.queue.clear();
+        player.current_id = Some(id); player.current = Some(track);
+        player.db.test_sql("CREATE TRIGGER fail_finish BEFORE DELETE ON playback_queue BEGIN SELECT RAISE(ABORT, 'temporary failure'); END;");
+        player.finish(true);
+        assert_eq!(player.db.get_credits().unwrap(), 1);
+        assert_eq!(player.db.pending_tracks().unwrap().len(), 1);
+        assert!(player.pending_finish.unwrap().0);
+        player.command(PlayerCommand::SkipTrack);
+        assert!(player.pending_finish.unwrap().0);
+        player.db.test_sql("DROP TRIGGER fail_finish;");
+        player.pending_finish.as_mut().unwrap().1 = Instant::now();
+        player.retry_finish();
+        assert_eq!(player.db.get_credits().unwrap(), 2);
+        assert!(player.db.pending_tracks().unwrap().is_empty());
+        assert!(player.current_id.is_none());
+        assert!(player.pending_finish.is_none());
+        player.retry_finish();
+        assert_eq!(player.db.get_credits().unwrap(), 2);
+    }
+
     #[test]
     fn composed_video_is_bounded_and_secondary_effect_does_not_pause_audio() {
+        let _guard = MEDIA_TEST.lock().unwrap();
         gst::init().unwrap();
         SOURCE.store(1, Ordering::Relaxed);
         clear_frame();

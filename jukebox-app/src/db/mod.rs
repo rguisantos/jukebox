@@ -51,7 +51,18 @@ impl Database {
     }
 
     /// Cria as tabelas iniciais se não existirem
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        let db = Self { conn: Connection::open_in_memory().unwrap() };
+        db.create_tables().unwrap();
+        db
+    }
+    #[cfg(test)]
+    pub(crate) fn test_sql(&self, sql: &str) { self.conn.execute_batch(sql).unwrap(); }
+
     fn create_tables(&self) -> Result<()> {
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS media_fingerprints (
+            file_path TEXT PRIMARY KEY, signature TEXT NOT NULL);")?;
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS playback_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -530,6 +541,28 @@ impl Database {
         tx.commit()
     }
 
+    pub fn media_fingerprints(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT f.file_path,f.signature FROM media_fingerprints f JOIN tracks t ON t.file_path=f.file_path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Metadata and fingerprint commit together; failed indexing is retried next scan.
+    pub fn index_tracks(&mut self, tracks: &[(TrackInfo, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (t, signature) in tracks {
+            tx.execute("INSERT INTO tracks(title,artist,album,file_path,file_type,genre)
+                VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(file_path) DO UPDATE SET
+                title=excluded.title,artist=excluded.artist,album=excluded.album,
+                file_type=excluded.file_type,genre=excluded.genre",
+                params![t.title,t.artist,t.album,t.file_path,t.file_type,t.genre])?;
+            tx.execute("INSERT INTO media_fingerprints VALUES(?1,?2)
+                ON CONFLICT(file_path) DO UPDATE SET signature=excluded.signature",
+                params![t.file_path,signature])?;
+        }
+        tx.commit()
+    }
+
     /// Retorna todos os file_paths já cadastrados no banco (para o scanner incremental)
     pub fn get_all_track_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT file_path FROM tracks;")?;
@@ -712,12 +745,11 @@ impl Database {
     /// Zera os créditos inseridos e ainda não gastos na máquina (créditos
     /// "abandonados" pelo freguês). O caixa parcial e o odômetro não mudam:
     /// o dinheiro já foi contado na entrada.
-    pub fn reset_current_credits(&self) -> Result<()> {
-        self.conn.execute(
-            "UPDATE system_state SET value = 0 WHERE key = 'credits';",
-            [],
-        )?;
-        Ok(())
+    pub fn reset_current_credits(&mut self) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE system_state SET value=0 WHERE key='credits'", [])?;
+        tx.execute("UPDATE conversion_session SET cents=0, awarded=0 WHERE id=1", [])?;
+        tx.commit()
     }
 
     /// Preço atual da música em créditos (padrão 1, limitado a 1..=10)
@@ -812,6 +844,22 @@ mod queue_tests {
         db.create_tables().unwrap();
         db
     }
+    #[test]
+    fn reset_credit_clears_bonus_and_fraction_without_resetting_receipts() {
+        let mut db = database();
+        let mut settings = db.settings().unwrap();
+        settings.packages[1].credits = 6;
+        settings.packages[2].credits = 12;
+        db.save_settings(&settings).unwrap();
+        db.accept_money(450, "before-reset").unwrap();
+        let revenue = db.get_total_receipts_cents().unwrap();
+        db.reset_current_credits().unwrap();
+        assert_eq!(db.get_total_receipts_cents().unwrap(), revenue);
+        assert_eq!(db.accept_money(50, "after-reset").unwrap(), (0, 0));
+        assert_eq!(db.accept_money(50, "after-reset-2").unwrap(), (1, 1));
+        assert_eq!(db.get_absolute_coins().unwrap(), 5);
+    }
+
     fn track() -> TrackInfo {
         TrackInfo {
             id: 1,

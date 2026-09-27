@@ -47,8 +47,14 @@ pub fn spawn(events: mpsc::Sender<OnlineEvent>) -> mpsc::Sender<()> {
                             }
                         }
                     }
-                    if let Err(e) = child.wait() {
-                        log::warn!("Atualização: {}", e);
+                    match child.wait() {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            let _ = events.send(OnlineEvent::Status(format!("Atualização falhou: {status}")));
+                        }
+                        Err(e) => {
+                            let _ = events.send(OnlineEvent::Status(format!("Atualização falhou: {e}")));
+                        }
                     }
                 }
                 Err(e) => {
@@ -59,7 +65,10 @@ pub fn spawn(events: mpsc::Sender<OnlineEvent>) -> mpsc::Sender<()> {
                 }
             }
             if changed {
-                match Database::open() {
+                let data_dir = super::scanner::resolve_media_dir();
+                let catalog_lock = super::catalog_lock::CatalogLock::acquire(data_dir.parent().unwrap());
+                match catalog_lock {
+                    Ok(_lock) => match Database::open() {
                     Ok(mut db) => {
                         super::scanner::scan_media_directory(&mut db);
                         match db.get_albums() {
@@ -70,6 +79,11 @@ pub fn spawn(events: mpsc::Sender<OnlineEvent>) -> mpsc::Sender<()> {
                         }
                     }
                     Err(e) => log::error!("Catálogo: {}", e),
+                    },
+                    Err(e) => {
+                        log::error!("Falha ao bloquear acervo: {}", e);
+                        let _ = events.send(OnlineEvent::Status(format!("Falha ao bloquear acervo: {e}")));
+                    }
                 }
             }
             // Collapse repeated manual clicks during a download into one check.
