@@ -342,8 +342,9 @@ impl Database {
     }
     pub fn pending_pix(&self) -> Result<Vec<PendingPix>> {
         let mut stmt = self.conn.prepare("SELECT machine_id,txid,api_base,status_path,credits FROM pending_pix ORDER BY rowid")?;
-        stmt.query_map([], |r| Ok(PendingPix { machine_id:r.get(0)?, txid:r.get(1)?,
-            api_base:r.get(2)?, status_path:r.get(3)?, credits:r.get(4)? }))?.collect()
+        let rows = stmt.query_map([], |r| Ok(PendingPix { machine_id:r.get(0)?, txid:r.get(1)?,
+            api_base:r.get(2)?, status_path:r.get(3)?, credits:r.get(4)? }))?;
+        rows.collect()
     }
     pub fn forget_pix(&self, machine_id: &str, txid: &str) -> Result<()> {
         self.conn.execute("DELETE FROM pending_pix WHERE machine_id=?1 AND txid=?2", params![machine_id, txid])?;
