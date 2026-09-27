@@ -1,563 +1,581 @@
-//! MÓDULO 3 — Player de Mídia (GStreamer playbin + fila de reprodução)
-//!
-//! Arquitetura dedicada ao hardware legado (Sempron 145, single-core):
-//!
-//!   * **playbin** cuida de decodebin/decodificadores automaticamente —
-//!     zero montagem de pipeline manual, menos superfície de erro;
-//!   * **xvimagesink** com `force-aspect-ratio`: vídeo via extensão XVideo
-//!     (composição clássica em hardware, SEM OpenGL — a GPU legada fica
-//!     livre para renderizar a interface FemtoVG);
-//!   * **alsasink**: áudio direto no ALSA (PulseAudio/PipeWire mascarados
-//!     na distro — um menos na RAM e na CPU);
-//!   * O vídeo é embutido NA PRÓPRIA janela X11 do Slint via
-//!     `GstVideoOverlay::set_window_handle()` + `set_render_rectangle()`:
-//!     o GStreamer pinta direto na janela, por cima de qualquer conteúdo
-//!     desenhado pelo Slint naquela região. Por isso, quando o overlay de
-//!     sincronização USB (Módulo 4) abre, a UI envia `HideVideo` — o
-//!     retângulo de renderização é zerado para o popup ficar 100% visível.
-//!
-//! Thread única e bloqueante: comandos chegam por canal mpsc (drenados a
-//! cada 50ms junto com o poll do GstBus) e eventos voltam por canal mpsc —
-//! a thread da interface NUNCA toca em GStreamer diretamente.
-
-use crate::state::models::TrackInfo;
+//! Bounded video composition into Slint; independent foreground, background and FX pipelines.
+use crate::{db::Database, state::models::TrackInfo};
+use gst::prelude::*;
 use gstreamer as gst;
-use gstreamer::prelude::*;
-use gstreamer_video::prelude::{VideoOverlayExt, VideoOverlayExtManual};
-use gstreamer_video::VideoOverlay;
-use std::collections::VecDeque;
-use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread;
-
-/// Limite da fila de reprodução (evita fila infinita numa noite cheia)
-
-/// Ciclo do poll do GstBus — também define a latência máxima de comandos
-const BUS_POLL_INTERVAL_MS: u64 = 50;
-
-/// Tipos considerados ÁUDIO (tudo o mais é tratado como vídeo)
-const AUDIO_TYPES: &[&str] = &["mp3", "wav"];
-
-// =============================================================================
-// Canais de comunicação com a thread principal
-// =============================================================================
-
-/// Comandos enviados PARA o player (da UI / threads de controle)
-pub enum PlayerCommand {
-    /// XID da janela X11 principal (Slint) — recebe o vídeo embutido
-    SetWindowHandle(u64),
-    /// Geometria atual da área de vídeo dentro da janela (px lógicos,
-    /// já escalados pelo fator de escala no main.rs)
-    VideoGeometry {
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
+use gstreamer_app::{AppSink, AppSinkCallbacks};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        mpsc::{Receiver, Sender},
+        Mutex, OnceLock,
     },
-    /// Overlay USB aberto: esconde o vídeo (zera o retângulo de render)
-    HideVideo,
-    /// Overlay USB fechado: restaura o último retângulo conhecido
-    RestoreVideo,
-    /// Enfileira uma faixa (o débito de crédito já foi feito pela UI/DB)
-    Enqueue(TrackInfo),
-    /// MÓDULO 7: ajusta o volume do playbin (0.0–1.0, escala linear de
-    /// amplitude — o main.rs já aplica a curva cúbica de percepção antes
-    /// de enviar). Sobrevive à troca de faixa: o elemento playbin é reutilizado
-    SetVolume(f64),
-    /// Para tudo e limpa a fila (reservado ao modo de manutenção)
-    #[allow(dead_code)]
-    Stop,
-    /// Cancela a faixa atual e toca a próxima da fila (se houver)
-    SkipTrack,
+    thread,
+    time::{Duration, Instant},
+};
+
+pub struct Frame {
+    pub rgb: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+static FRAME: OnceLock<Mutex<Option<Frame>>> = OnceLock::new();
+static SOURCE: AtomicU8 = AtomicU8::new(0);
+pub fn take_frame() -> Option<Frame> {
+    FRAME.get_or_init(|| Mutex::new(None)).lock().ok()?.take()
+}
+fn clear_frame() {
+    if let Ok(mut frame) = FRAME.get_or_init(|| Mutex::new(None)).lock() {
+        *frame = None;
+    }
 }
 
-/// Eventos emitidos PELO player para a thread principal
+pub enum PlayerCommand {
+    Enqueue(TrackInfo),
+    SetVolume(f64),
+    SkipTrack,
+    CreditFx,
+    Activity,
+    Operator(bool),
+    ReloadSettings,
+    // Older dialogs still emit these; Slint now handles visibility without stopping video.
+    HideVideo,
+    RestoreVideo,
+}
 pub enum PlayerEvent {
     CreditsChanged,
-    /// Uma faixa começou a tocar agora
     TrackStarted {
         id: i64,
         title: String,
         artist: String,
         is_video: bool,
     },
-    /// Estado da fila mudou (após enqueue ou consumo) — para o painel "A seguir"
+    Previous {
+        title: String,
+        artist: String,
+    },
+    Visual(bool),
     QueueUpdated {
         upcoming: Vec<TrackInfo>,
     },
-    /// Fila esgotada — UI volta ao modo catálogo
     QueueFinished,
-    /// Falha no pipeline (arquivo corrompido, codec ausente...)
     Error {
         context: String,
         detail: String,
     },
+    Notice(String),
 }
 
-/// Sobe a thread dedicada do player. Retorna imediatamente.
-pub fn spawn(cmd_rx: Receiver<PlayerCommand>, event_tx: Sender<PlayerEvent>) {
+fn element(name: &str) -> Result<gst::Element, String> {
+    gst::ElementFactory::make(name)
+        .build()
+        .map_err(|e| format!("{name}: {e}"))
+}
+fn video_sink(source: u8) -> Result<gst::Bin, String> {
+    // One pending RGB frame; dropped frames never create an unbounded UI backlog.
+    let sink = gst::parse::bin_from_description(
+        "videoscale add-borders=true ! video/x-raw,width=640,height=360 ! videorate ! video/x-raw,framerate=20/1 ! videoconvert ! video/x-raw,format=RGB,pixel-aspect-ratio=1/1 ! appsink name=frames max-buffers=1 drop=true sync=true", true).map_err(|e|e.to_string())?;
+    let app = sink
+        .by_name("frames")
+        .ok_or("appsink ausente")?
+        .downcast::<AppSink>()
+        .map_err(|_| "appsink inválido")?;
+    app.set_callbacks(
+        AppSinkCallbacks::builder()
+            .new_sample(move |app| {
+                let sample = app.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if SOURCE.load(Ordering::Relaxed) != source {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
+                let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                let info = gstreamer_video::VideoInfo::from_caps(caps)
+                    .map_err(|_| gst::FlowError::Error)?;
+                let buffer = sample
+                    .buffer()
+                    .ok_or(gst::FlowError::Error)?
+                    .map_readable()
+                    .map_err(|_| gst::FlowError::Error)?;
+                let width = info.width();
+                let height = info.height();
+                let stride = info.stride()[0] as usize;
+                if stride < width as usize * 3 || buffer.len() < stride * height as usize {
+                    return Err(gst::FlowError::Error);
+                }
+                let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+                for row in buffer.chunks(stride).take(height as usize) {
+                    rgb.extend_from_slice(&row[..width as usize * 3]);
+                }
+                if let Ok(mut frame) = FRAME.get_or_init(|| Mutex::new(None)).lock() {
+                    *frame = Some(Frame { rgb, width, height });
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    Ok(sink)
+}
+fn audio_sink() -> Result<gst::Element, String> {
+    // dmix in the appliance allows music + effect without grabbing the device exclusively.
+    if std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink") {
+        let sink = element("fakesink")?;
+        sink.set_property("sync", true);
+        return Ok(sink);
+    }
+    gst::ElementFactory::make("alsasink")
+        .property("device", "default")
+        .property("buffer-time", 400_000i64)
+        .build()
+        .map_err(|e| e.to_string())
+}
+fn uri(path: &Path) -> Result<String, String> {
+    let path = path.canonicalize().map_err(|e| e.to_string())?;
+    gst::glib::filename_to_uri(path, None)
+        .map(|s| s.to_string())
+        .map_err(|e| e.to_string())
+}
+
+pub fn spawn(rx: Receiver<PlayerCommand>, tx: Sender<PlayerEvent>) {
     thread::Builder::new()
-        .name("gstreamer-player".to_string())
+        .name("jukebox-player".into())
         .spawn(move || {
-            // Timer-based scheduling do ALSA no Sempron 145 single-core gera
-            // glitches quando a UI (FemtoVG) ou a thread de capas pica a CPU.
-            // Precisa estar setado ANTES do gst::init().
-            std::env::set_var("GST_ALSA_TSCHED", "0");
-
-            // Prioridade da thread do player (SCHED_FIFO se CAP_SYS_NICE;
-            // senão nice negativo). O decode do GStreamer roda em threads
-            // próprias — esta thread só conduz o pipeline, mas não pode
-            // perder o poll do bus para a UI.
-            #[cfg(target_os = "linux")]
+            if let Err(e) = gst::init()
+                .map_err(|e| e.to_string())
+                .and_then(|_| Player::new(tx.clone()).map(|mut p| p.run(rx)))
             {
-                use libc::{sched_param, sched_setscheduler, SCHED_FIFO};
-                let param = sched_param { sched_priority: 10 };
-                let res = unsafe { sched_setscheduler(0, SCHED_FIFO, &param) };
-                if res == 0 {
-                    log::info!("Player: thread promovida a SCHED_FIFO (prioridade 10).");
-                } else {
-                    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
-                    let nice = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, -10) };
-                    if nice == 0 {
-                        log::info!("Player: nice -10 aplicado (sem CAP_SYS_NICE para FIFO).");
-                    } else {
-                        log::warn!(
-                            "Player: sem SCHED_FIFO nem nice -10 (CAP_SYS_NICE ausente). Áudio compete em igualdade com a UI."
-                        );
-                    }
-                }
-            }
-
-            log::info!("Player: thread do GStreamer iniciada.");
-
-            // gst::init() é pré-requisito único e global — sem ele nada existe.
-            if let Err(e) = gst::init() {
-                log::error!("Player: falha ao inicializar GStreamer: {}", e);
-                let _ = event_tx.send(PlayerEvent::Error {
-                    context: "GStreamer".to_string(),
-                    detail: e.to_string(),
+                let _ = tx.send(PlayerEvent::Error {
+                    context: "Inicialização do player".into(),
+                    detail: e,
                 });
-                return;
             }
-
-            let mut player = match Player::build(&event_tx) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("Player: falha ao construir o pipeline: {}", e);
-                    let _ = event_tx.send(PlayerEvent::Error {
-                        context: "Pipeline".to_string(),
-                        detail: e,
-                    });
-                    return;
-                }
-            };
-
-            player.run(cmd_rx);
         })
-        .expect("Falha crítica ao criar a thread do player");
+        .expect("player thread");
 }
-
-// =============================================================================
-// Núcleo do player
-// =============================================================================
-
 struct Player {
-    playbin: gst::Element,
-    /// View da interface GstVideoOverlay do playbin (encaminha para o sink)
-    overlay: VideoOverlay,
-    db: crate::db::Database,
+    music: gst::Element,
+    background: gst::Element,
+    effect: gst::Element,
+    db: Database,
     queue: VecDeque<(i64, TrackInfo)>,
     current: Option<TrackInfo>,
     current_id: Option<i64>,
-    event_tx: Sender<PlayerEvent>,
-    /// XID da janela X11 do Slint (aplicado assim que chega)
-    window_handle: Option<u64>,
-    /// Último retângulo de vídeo informado pela UI
-    video_rect: Option<(i32, i32, i32, i32)>,
-    /// Vídeo oculto no momento (overlay USB aberto ou faixa de áudio)
-    video_hidden: bool,
+    settings: crate::settings::Settings,
+    tx: Sender<PlayerEvent>,
+    last_activity: Instant,
+    last_auto: Instant,
+    auto_retry: Instant,
+    operator: bool,
+    rng: u64,
+    last_path: Option<String>,
+    backgrounds: Vec<PathBuf>,
+    failed_backgrounds: Vec<PathBuf>,
+    current_background: Option<PathBuf>,
 }
-
 impl Player {
-    /// Constrói playbin com os sinks legados: xvimagesink → ximagesink,
-    /// alsasink → autoaudiosink (fallbacks para máquinas em campo com
-    /// pacotes de plugin faltando — o jukebox não pode parar de vender).
-    fn build(event_tx: &Sender<PlayerEvent>) -> Result<Self, String> {
-        let playbin = gst::ElementFactory::make("playbin")
-            .name("jukebox-playbin")
-            .build()
-            .map_err(|e| {
-                format!("playbin indisponível (gstreamer1.0-plugins-base ausente): {e}")
-            })?;
-
-        // ---- Saída de vídeo: xvimagesink (XVideo) com fallback ----
-        let video_sink = match gst::ElementFactory::make("xvimagesink")
-            .name("jukebox-video-sink")
-            .build()
-        {
-            Ok(sink) => {
-                // Mantém proporção correta dentro do retângulo (letterbox)
-                sink.set_property("force-aspect-ratio", true);
-                // Não rouba eventos de teclado da janela do Slint
-                sink.set_property("handle-events", false);
-                sink.set_property("handle-expose", true);
-                sink
-            }
-            Err(_) => {
-                log::warn!("Player: xvimagesink indisponível (gstreamer1.0-x ausente?). Usando ximagesink.");
-                gst::ElementFactory::make("ximagesink")
-                    .name("jukebox-video-sink")
-                    .build()
-                    .map_err(|e| format!("nenhum sink de vídeo X11 disponível: {e}"))?
-            }
+    fn new(tx: Sender<PlayerEvent>) -> Result<Self, String> {
+        let music = element("playbin")?;
+        music.set_property("video-sink", video_sink(1)?);
+        music.set_property("audio-sink", audio_sink()?);
+        let background = element("playbin")?;
+        background.set_property("video-sink", video_sink(2)?);
+        background.set_property("audio-sink", element("fakesink")?);
+        background.set_property("mute", true);
+        // Built-in short chime, no external file or license dependency.
+        let effect=gst::parse::launch("audiotestsrc wave=sine freq=880 num-buffers=8 samplesperbuffer=1024 volume=0.12 ! audioconvert ! audioresample ! queue ! fakesink sync=true name=fxsink").map_err(|e|e.to_string())?;
+        // Build a real secondary sink by using a small bin with a source and the chosen output.
+        let effect = if std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink") {
+            effect
+        } else {
+            gst::parse::launch("audiotestsrc wave=sine freq=880 num-buffers=8 samplesperbuffer=1024 volume=0.12 ! audioconvert ! audioresample ! alsasink device=default").map_err(|e|e.to_string())?
         };
-
-        // ---- Saída de áudio: ALSA direto, sem servidor de som ----
-        // Chiado em CPU alta = underrun. `tsched` NÃO é propriedade do
-        // alsasink (setar isso fazia o build falhar e cair no autoaudiosink
-        // sem buffer grande). GST_ALSA_TSCHED=0 já foi exportado acima.
-        // sync permanece true: sync=false despeja samples fora do clock e
-        // piora o chiado. Buffers grandes absorvem picos da UI/capas.
-        let audio_sink = match gst::ElementFactory::make("alsasink")
-            .name("jukebox-audio-sink")
-            .property("buffer-time", 800_000i64) // 800ms
-            .property("latency-time", 100_000i64) // 100ms período de refill
-            .property("device", "default")
-            .build()
-        {
-            Ok(sink) => sink,
-            Err(_) => {
-                log::warn!("Player: alsasink indisponível. Usando autoaudiosink.");
-                gst::ElementFactory::make("autoaudiosink")
-                    .name("jukebox-audio-sink")
-                    .build()
-                    .map_err(|e| format!("nenhum sink de áudio disponível: {e}"))?
-            }
-        };
-
-        playbin.set_property("video-sink", &video_sink);
-        playbin.set_property("audio-sink", &audio_sink);
-        playbin.set_property("volume", 1.0_f64);
-        // ~2s de pré-buffer no playbin (ns) — decode pode atrasar no Sempron
-        playbin.set_property("buffer-duration", 2_000_000_000i64);
-
-        // Fila entre decode e alsasink (thread própria). 2s em ns, sem
-        // limite de buffers/bytes — o tempo é o teto de RAM.
-        let audio_queue = gst::ElementFactory::make("queue")
-            .name("jukebox-audio-queue")
-            .property("max-size-buffers", 0u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 2_000_000_000u64)
-            .build()
-            .map_err(|e| format!("queue de áudio indisponível: {e}"))?;
-        playbin.set_property("audio-filter", &audio_queue);
-
-        // playbin implementa a interface GstVideoOverlay: repassa o handle
-        // e o retângulo para o sink real mesmo trocando de sink internamente
-        let overlay = playbin
-            .dynamic_cast_ref::<VideoOverlay>()
-            .ok_or("playbin não expõe GstVideoOverlay")?
-            .clone();
-
-        // Sinaliza ao playbin que NÓS controlamos a janela antes do READY:
-        // evita ele criar uma janela própria de vídeo
-        overlay.prepare_window_handle();
-
-        let db = crate::db::Database::open().map_err(|e| e.to_string())?;
+        let db = Database::open().map_err(|e| e.to_string())?;
+        let settings = db.settings().map_err(|e| e.to_string())?;
         let queue = db.pending_tracks().map_err(|e| e.to_string())?.into();
-        Ok(Self {
+        let mut p = Self {
+            music,
+            background,
+            effect,
             db,
-            playbin,
-            overlay,
             queue,
             current: None,
             current_id: None,
-            event_tx: event_tx.clone(),
-            window_handle: None,
-            video_rect: None,
-            video_hidden: false,
-        })
-    }
-
-    /// Loop principal: drena comandos → poll do bus → avança a fila
-    fn run(&mut self, cmd_rx: Receiver<PlayerCommand>) {
-        let bus = match self.playbin.bus() {
-            Some(bus) => bus,
-            None => {
-                log::error!("Player: playbin sem bus — encerrando thread.");
-                return;
-            }
+            settings,
+            tx,
+            last_activity: Instant::now(),
+            last_auto: Instant::now(),
+            auto_retry: Instant::now(),
+            operator: false,
+            rng: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+                | 1,
+            last_path: None,
+            backgrounds: vec![],
+            failed_backgrounds: vec![],
+            current_background: None,
         };
-
-        loop {
-            // 1. Drena todos os comandos pendentes (chegaram desde o último ciclo)
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                self.handle_command(cmd);
-            }
-
-            // 2. Poll do GstBus com timeout de 50ms — é o "clock" do loop:
-            //    bloqueia a thread (econômico no single-core) sem travar a UI
-            if let Some(msg) = bus.timed_pop_filtered(
-                gst::ClockTime::from_mseconds(BUS_POLL_INTERVAL_MS),
-                &[
-                    gst::MessageType::Eos,
-                    gst::MessageType::Error,
-                    gst::MessageType::Warning,
-                ],
-            ) {
-                match msg.view() {
-                    gst::MessageView::Eos(_) => self.on_track_end(false),
-                    gst::MessageView::Error(err) => {
-                        let detail =
-                            format!("{} ({})", err.error(), err.debug().unwrap_or_default());
-                        log::error!("Player: erro no pipeline: {}", detail);
-                        let _ = self.event_tx.send(PlayerEvent::Error {
-                            context: self
-                                .current
-                                .as_ref()
-                                .map(|t| t.title.clone())
-                                .unwrap_or_else(|| "pipeline".to_string()),
-                            detail: detail.clone(),
-                        });
-                        // Pula para a próxima — o show não pode parar
-                        self.on_track_end(true);
-                    }
-                    gst::MessageView::Warning(warn) => {
-                        log::warn!("Player: aviso do pipeline: {}", warn.error());
-                    }
-                    _ => {}
-                }
-            }
-
-            // 3. Se nenhuma faixa está ativa e a fila tem gente → toca a próxima
-            if self.current_id.is_none() {
-                if let Some((id, track)) = self.queue.pop_front() {
-                    self.current_id = Some(id);
-                    self.start_track(track);
-                }
+        p.refresh_backgrounds();
+        Ok(p)
+    }
+    fn random(&mut self, len: usize) -> usize {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng as usize) % len.max(1)
+    }
+    fn refresh_backgrounds(&mut self) {
+        let dir = super::scanner::resolve_media_dir()
+            .parent()
+            .unwrap()
+            .join("fundos");
+        self.backgrounds = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && matches!(
+                        p.extension().and_then(|s| s.to_str()),
+                        Some("mp4" | "mpeg" | "wmv")
+                    )
+            })
+            .collect();
+        self.failed_backgrounds.clear();
+    }
+    fn background_next(&mut self) {
+        let _ = self.background.set_state(gst::State::Null);
+        let mut files: Vec<_> = self
+            .backgrounds
+            .iter()
+            .filter(|p| !self.failed_backgrounds.contains(p))
+            .cloned()
+            .collect();
+        if files.len() > 1 {
+            files.retain(|p| Some(p) != self.current_background.as_ref());
+        }
+        if files.is_empty() {
+            SOURCE.store(0, Ordering::Relaxed);
+            clear_frame();
+            let _ = self.tx.send(PlayerEvent::Visual(false));
+            return;
+        }
+        let index = self.random(files.len());
+        let file = files[index].clone();
+        if let Ok(uri) = uri(&file) {
+            self.background.set_property("uri", uri);
+            self.current_background = Some(file.clone());
+            SOURCE.store(2, Ordering::Relaxed);
+            if self.background.set_state(gst::State::Playing).is_ok() {
+                let _ = self.tx.send(PlayerEvent::Visual(true));
+            } else {
+                self.failed_backgrounds.push(file);
+                let _ = self.tx.send(PlayerEvent::Visual(false));
             }
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Comandos
-    // -----------------------------------------------------------------------
-
-    fn handle_command(&mut self, cmd: PlayerCommand) {
+    fn run(&mut self, rx: Receiver<PlayerCommand>) {
+        self.emit_queue();
+        loop {
+            match rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(cmd) => self.command(cmd),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+            // Service EOS/errors even under continuous key input.
+            if let Some(bus) = self.music.bus() {
+                while let Some(msg) =
+                    bus.pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
+                {
+                    match msg.view() {
+                        gst::MessageView::Eos(_) => {
+                            self.finish(false);
+                        }
+                        gst::MessageView::Error(e) => {
+                            let _ = self.tx.send(PlayerEvent::Error {
+                                context: "Reprodução".into(),
+                                detail: e.error().to_string(),
+                            });
+                            self.finish(true);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(bus) = self.background.bus() {
+                while let Some(msg) =
+                    bus.pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
+                {
+                    if matches!(msg.view(), gst::MessageView::Error(_)) {
+                        if let Some(p) = self.current_background.take() {
+                            self.failed_backgrounds.push(p);
+                        }
+                    }
+                    if self
+                        .current
+                        .as_ref()
+                        .map(|t| !t.is_video())
+                        .unwrap_or(false)
+                    {
+                        self.background_next();
+                    } else {
+                        let _ = self.background.set_state(gst::State::Null);
+                    }
+                }
+            }
+            if let Some(bus) = self.effect.bus() {
+                if bus
+                    .pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
+                    .is_some()
+                {
+                    let _ = self.effect.set_state(gst::State::Null);
+                }
+            }
+            if self.current.is_none() && self.current_id.is_none() {
+                if let Some((id, t)) = self.queue.pop_front() {
+                    self.current_id = Some(id);
+                    self.start(t);
+                } else if Instant::now() >= self.auto_retry
+                    && crate::settings::autoplay_due(
+                        &self.settings,
+                        self.operator,
+                        self.last_activity.elapsed(),
+                        self.last_auto.elapsed(),
+                    )
+                {
+                    if self.last_auto.elapsed() >= Duration::from_millis(250) {
+                        self.last_auto = Instant::now();
+                        match self
+                            .db
+                            .random_track(self.last_path.as_deref())
+                            .and_then(|track| {
+                                if track.is_some() {
+                                    Ok(track)
+                                } else {
+                                    self.db.random_track(None)
+                                }
+                            }) {
+                            Ok(Some(t)) => self.start(t),
+                            Ok(None) => {}
+                            Err(e) => log::warn!("Attract: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+        for pipe in [&self.music, &self.background, &self.effect] {
+            let _ = pipe.set_state(gst::State::Null);
+        }
+    }
+    fn command(&mut self, cmd: PlayerCommand) {
         match cmd {
-            PlayerCommand::SetWindowHandle(xid) => {
-                if self.window_handle != Some(xid) {
-                    log::info!("Player: janela X11 do Slint registrada (xid=0x{:X}).", xid);
-                    // unsafe: contrato do GStreamer — o xid deve permanecer
-                    // válido enquanto o pipeline existir (a janela é da UI,
-                    // que vive mais que o player)
-                    unsafe { self.overlay.set_window_handle(xid as usize) };
-                    self.window_handle = Some(xid);
-                    self.apply_video_rect();
-                }
-            }
-            PlayerCommand::VideoGeometry {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                if width > 0 && height > 0 {
-                    self.video_rect = Some((x, y, width, height));
-                    self.apply_video_rect();
-                }
-            }
-            PlayerCommand::HideVideo => {
-                self.video_hidden = true;
-                self.apply_video_rect();
-            }
-            PlayerCommand::RestoreVideo => {
-                self.video_hidden = false;
-                self.apply_video_rect();
-            }
-            PlayerCommand::Enqueue(track) => {
-                if !Path::new(&track.file_path).is_file() {
-                    let _ = self.event_tx.send(PlayerEvent::Error {
-                        context: track.title,
-                        detail: "arquivo ausente; sem débito".into(),
-                    });
+            PlayerCommand::Enqueue(t) => {
+                self.last_activity = Instant::now();
+                if !Path::new(&t.file_path).is_file() {
+                    let _ = self.tx.send(PlayerEvent::Notice(
+                        "Arquivo indisponível; nenhum crédito debitado".into(),
+                    ));
                     return;
                 }
-                match self.db.reserve_track(&track) {
-                    Ok(Some((id, _balance))) => {
-                        self.queue.push_back((id, track));
-                        let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
-                        self.emit_queue_state();
+                let tail = self
+                    .queue
+                    .back()
+                    .map(|(_, t)| t.file_path.as_str())
+                    .or_else(|| self.current.as_ref().map(|t| t.file_path.as_str()));
+                if tail == Some(t.file_path.as_str()) {
+                    let _ = self.tx.send(PlayerEvent::Notice(
+                        "Esta música já é a última da fila".into(),
+                    ));
+                    return;
+                }
+                match self.db.reserve_track(&t) {
+                    Ok(Some((id, _))) => {
+                        self.queue.push_back((id, t));
+                        let _ = self.tx.send(PlayerEvent::CreditsChanged);
+                        if self.current.is_some() && self.current_id.is_none() {
+                            self.finish(false);
+                        }
+                        self.emit_queue();
                     }
-                    result => {
-                        let _ = self.event_tx.send(PlayerEvent::Error {
-                            context: track.title,
-                            detail: format!("compra recusada (saldo insuficiente, fila cheia ou banco indisponível): {:?}", result),
+                    Ok(None) => {
+                        let message = if !self.settings.free_play
+                            && self.db.get_credits().unwrap_or(0)
+                                < self.db.get_song_price().unwrap_or(1)
+                        {
+                            "Créditos insuficientes. Insira saldo para escolher uma música."
+                        } else {
+                            "Fila cheia ou música repetida; nenhum crédito debitado"
+                        };
+                        let _ = self.tx.send(PlayerEvent::Notice(message.into()));
+                    }
+                    Err(e) => {
+                        let _ = self.tx.send(PlayerEvent::Error {
+                            context: "Compra".into(),
+                            detail: e.to_string(),
                         });
                     }
                 }
             }
-            PlayerCommand::Stop => {
-                log::info!("Player: stop + limpeza da fila.");
-                let _ = self.playbin.set_state(gst::State::Null);
-                self.on_track_end(true);
-                while let Some((id, _)) = self.queue.front() {
-                    match self.db.finish_track(*id, true) {
-                        Ok(_balance) => {
-                            self.queue.pop_front();
-                            let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
-                        }
-                        Err(e) => {
-                            log::error!("Falha ao cancelar fila: {}", e);
-                            break;
-                        }
-                    }
-                }
-                self.emit_queue_state();
+            PlayerCommand::SetVolume(v) => {
+                self.music.set_property("volume", v.clamp(0., 1.));
             }
             PlayerCommand::SkipTrack => {
-                self.on_track_end(false);
+                self.last_activity = Instant::now();
+                self.finish(false);
             }
-            PlayerCommand::SetVolume(volume) => {
-                // Clamp defensivo: a propriedade do playbin aceita > 1.0,
-                // mas amplificar além de 100% distorce em alto-falantes de bar
-                let clamped = volume.clamp(0.0, 1.0);
-                self.playbin.set_property("volume", clamped);
-                log::debug!("Player: volume ajustado para {:.2}.", clamped);
+            PlayerCommand::CreditFx => {
+                let _ = self.effect.set_state(gst::State::Null);
+                let _ = self.effect.set_state(gst::State::Playing);
             }
+            PlayerCommand::Activity => {
+                self.last_activity = Instant::now();
+            }
+            PlayerCommand::Operator(open) => {
+                self.operator = open;
+                self.last_activity = Instant::now();
+            }
+            PlayerCommand::ReloadSettings => {
+                if let Ok(s) = self.db.settings() {
+                    self.settings = s;
+                }
+                self.refresh_backgrounds();
+                self.last_auto = Instant::now();
+            }
+            PlayerCommand::HideVideo | PlayerCommand::RestoreVideo => {}
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Controle de faixa
-    // -----------------------------------------------------------------------
-
-    /// Inicia a reprodução de uma faixa (vinda do topo da fila)
-    fn start_track(&mut self, track: TrackInfo) {
-        let is_video = !AUDIO_TYPES.contains(&track.file_type.as_str());
-
-        // URI file:// escapada (arquivos com espaço/acento no nome quebram
-        // URI ingênua); canonicalize garante caminho absoluto e existente
-        let path = Path::new(&track.file_path);
-        let absolute = match std::fs::canonicalize(path) {
-            Ok(abs) => abs,
+    fn start(&mut self, t: TrackInfo) {
+        let _ = self.music.set_state(gst::State::Null);
+        let _ = self.background.set_state(gst::State::Null);
+        clear_frame();
+        let is_video = t.is_video();
+        self.current = Some(t.clone());
+        match uri(Path::new(&t.file_path)) {
+            Ok(uri) => {
+                self.music.set_property("uri", uri);
+            }
             Err(e) => {
-                log::error!(
-                    "Player: arquivo não encontrado {:?}: {} — pulando faixa.",
-                    track.file_path,
-                    e
-                );
-                let _ = self.event_tx.send(PlayerEvent::Error {
-                    context: track.title.clone(),
-                    detail: "arquivo não encontrado no disco".to_string(),
+                let _ = self.tx.send(PlayerEvent::Error {
+                    context: t.title.clone(),
+                    detail: e,
                 });
-                self.on_track_end(true);
+                self.finish(true);
                 return;
             }
-        };
-
-        let uri = match gst::glib::filename_to_uri(&absolute, None) {
-            Ok(uri) => uri,
-            Err(e) => {
-                log::error!("Player: falha ao converter caminho em URI: {}", e);
-                self.on_track_end(true);
-                return;
-            }
-        };
-
-        // Reset do pipeline para trocar de mídia com estado limpo
-        let _ = self.playbin.set_state(gst::State::Null);
-        self.playbin.set_property("uri", uri);
-
-        // Antes do 1º frame: garante que o vídeo não "vaze" para a janela
-        // inteira. Faixa de vídeo usa o último retângulo da UI (se houver);
-        // faixa de áudio (ou retângulo desconhecido) fica com retângulo zerado
-        if is_video && self.video_rect.is_some() {
-            self.video_hidden = false;
-        } else {
-            self.video_hidden = true;
         }
-        self.apply_video_rect();
-
-        match self.playbin.set_state(gst::State::Playing) {
-            Ok(_) => {
-                log::info!(
-                    "Player: tocando '{}' [{}] (fila restante: {}).",
-                    track.title,
-                    if is_video { "vídeo" } else { "áudio" },
-                    self.queue.len()
-                );
-                let _ = self.event_tx.send(PlayerEvent::TrackStarted {
-                    id: track.id,
-                    title: track.title.clone(),
-                    artist: track.artist.clone(),
-                    is_video,
-                });
-                self.current = Some(track);
-                self.emit_queue_state();
-            }
-            Err(e) => {
-                log::error!("Player: falha ao iniciar reprodução: {}", e);
-                let _ = self.event_tx.send(PlayerEvent::Error {
-                    context: track.title.clone(),
+        SOURCE.store(if is_video { 1 } else { 0 }, Ordering::Relaxed);
+        if self.music.set_state(gst::State::Playing).is_err() {
+            self.finish(true);
+            return;
+        }
+        let _ = self.tx.send(PlayerEvent::TrackStarted {
+            id: t.id,
+            title: t.title,
+            artist: t.artist,
+            is_video,
+        });
+        if is_video {
+            let _ = self.tx.send(PlayerEvent::Visual(true));
+        } else {
+            self.background_next();
+        }
+        self.emit_queue();
+    }
+    fn finish(&mut self, refund: bool) {
+        if let Some(id) = self.current_id {
+            if let Err(e) = self.db.finish_track(id, refund) {
+                let _ = self.music.set_state(gst::State::Null);
+                let _ = self.background.set_state(gst::State::Null);
+                SOURCE.store(0, Ordering::Relaxed);
+                clear_frame();
+                let _ = self.tx.send(PlayerEvent::Visual(false));
+                let _ = self.tx.send(PlayerEvent::Error {
+                    context: "Persistência da fila".into(),
                     detail: e.to_string(),
                 });
-                self.on_track_end(true);
+                return;
             }
+            let _ = self.tx.send(PlayerEvent::CreditsChanged);
         }
-    }
-
-    /// Fim natural (EOS) ou forçado (erro) da faixa atual
-    fn on_track_end(&mut self, refund: bool) {
-        if let Some(id) = self.current_id {
-            match self.db.finish_track(id, refund) {
-                Ok(_balance) => {
-                    let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
-                }
-                Err(e) => {
-                    log::error!("Fila persistente indisponível: {}; reprodução suspensa", e);
-                    let _ = self.playbin.set_state(gst::State::Null);
-                    return;
-                }
+        if let Some(t) = self.current.take() {
+            self.last_path = Some(t.file_path);
+            if !refund {
+                let _ = self.tx.send(PlayerEvent::Previous {
+                    title: t.title,
+                    artist: t.artist,
+                });
             }
         }
         self.current_id = None;
-        self.current = None;
-        let _ = self.playbin.set_state(gst::State::Null);
-
-        // Zera o retângulo de vídeo imediatamente: o XVideo pinta numa
-        // subjanela da janela do Slint que SOBREVIVE ao pipeline — sem isso,
-        // o último frame ficaria estampado sobre o catálogo.
-        self.video_hidden = true;
-        self.apply_video_rect();
-
-        if self.queue.is_empty() {
-            log::info!("Player: fila esgotada.");
-            let _ = self.event_tx.send(PlayerEvent::QueueFinished);
+        self.last_auto = Instant::now();
+        if refund {
+            self.auto_retry = Instant::now() + Duration::from_secs(5);
         }
-        // A próxima faixa sobe no passo 3 do loop principal
+        let _ = self.music.set_state(gst::State::Null);
+        let _ = self.background.set_state(gst::State::Null);
+        SOURCE.store(0, Ordering::Relaxed);
+        clear_frame();
+        let _ = self.tx.send(PlayerEvent::Visual(false));
+        let _ = self.tx.send(PlayerEvent::QueueFinished);
+        self.emit_queue();
     }
-
-    /// Aplica o retângulo de vídeo atual (respeitando o estado hidden)
-    fn apply_video_rect(&mut self) {
-        let rect = if self.video_hidden {
-            (0, 0, 0, 0)
-        } else {
-            self.video_rect.unwrap_or((0, 0, 0, 0))
-        };
-
-        let (x, y, w, h) = rect;
-        if let Err(e) = self.overlay.set_render_rectangle(x, y, w, h) {
-            log::warn!("Player: falha ao aplicar retângulo de vídeo: {}", e);
-        }
-        // Repinta a região na hora (evita frame velho parado na tela)
-        self.overlay.expose();
-    }
-
-    /// Notifica a UI sobre o conteúdo atual da fila
-    fn emit_queue_state(&self) {
-        let _ = self.event_tx.send(PlayerEvent::QueueUpdated {
-            upcoming: self.queue.iter().map(|(_, track)| track.clone()).collect(),
+    fn emit_queue(&self) {
+        let _ = self.tx.send(PlayerEvent::QueueUpdated {
+            upcoming: self.queue.iter().map(|(_, t)| t.clone()).collect(),
         });
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    #[test]
+    fn composed_video_is_bounded_and_secondary_effect_does_not_pause_audio() {
+        gst::init().unwrap();
+        SOURCE.store(1, Ordering::Relaxed);
+        clear_frame();
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 5i32)
+            .build()
+            .unwrap();
+        let sink = video_sink(1).unwrap();
+        pipeline.add_many([&source, sink.upcast_ref()]).unwrap();
+        source.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let message = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(5),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("video pipeline timeout");
+        assert!(
+            matches!(message.view(), gst::MessageView::Eos(_)),
+            "{message:?}"
+        );
+        let frame = take_frame().expect("RGB frame");
+        assert_eq!((frame.width, frame.height), (640, 360));
+        assert_eq!(frame.rgb.len(), 640 * 360 * 3);
+        assert!(take_frame().is_none());
+        pipeline.set_state(gst::State::Null).unwrap();
+        let music = gst::parse::launch("audiotestsrc is-live=true ! fakesink sync=true").unwrap();
+        let effect = gst::parse::launch("audiotestsrc num-buffers=8 ! fakesink sync=true").unwrap();
+        music.set_state(gst::State::Playing).unwrap();
+        effect.set_state(gst::State::Playing).unwrap();
+        let msg = effect
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(3),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .unwrap();
+        assert!(matches!(msg.view(), gst::MessageView::Eos(_)));
+        assert_eq!(music.current_state(), gst::State::Playing);
+        music.set_state(gst::State::Null).unwrap();
+        effect.set_state(gst::State::Null).unwrap();
     }
 }

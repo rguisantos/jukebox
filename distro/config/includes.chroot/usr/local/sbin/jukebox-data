@@ -6,8 +6,8 @@ if [ -e /dev/disk/by-label/JUKEBOX_DATA ]; then
 elif ! mountpoint -q /dados; then
     echo 'JUKEBOX: sessão sem partição JUKEBOX_DATA; dados podem ser temporários.' >&2
 fi
-mkdir -p /dados/musicas /dados/capas /dados/logs /dados/network
-chown jukebox:jukebox /dados /dados/musicas /dados/capas /dados/logs
+mkdir -p /dados/musicas /dados/capas /dados/fundos /dados/logs /dados/network
+chown jukebox:jukebox /dados /dados/musicas /dados/capas /dados/fundos /dados/logs
 chmod 0700 /dados/network
 # NetworkManager connections must survive the live overlay.
 mkdir -p /etc/NetworkManager/system-connections

@@ -28,6 +28,12 @@ pub struct TrackInfo {
     pub genre: String,
 }
 
+impl TrackInfo {
+    pub fn is_video(&self) -> bool {
+        matches!(self.file_type.as_str(), "mp4" | "wmv" | "mpeg")
+    }
+}
+
 /// Um disco do catálogo: agrupamento de faixas por (artista, álbum).
 /// Base da navegação em duas camadas do Módulo 7 — primeiro escolhe-se o
 /// disco no carrossel de capas, depois a faixa dentro dele.
@@ -121,7 +127,7 @@ pub const ALPHABET_ITEMS: &[&str] = &[
 // =============================================================================
 
 /// Total de linhas do menu principal do operador
-pub const OPERATOR_MENU_ITEMS: usize = 9;
+pub const OPERATOR_MENU_ITEMS: usize = 10;
 
 /// Índice da linha "Sincronizar Pendrive" no menu principal
 pub const OPERATOR_MENU_SYNC: usize = 0;
@@ -148,6 +154,8 @@ pub const OPERATOR_MENU_POWEROFF: usize = 6;
 /// para a propriedade `ui-focus` do Slint (que decide qual camada desenhar).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FocusState {
+    OperatorAuth,
+    OperatorSettings,
     /// Camada 1 — carrossel de capas (E/R/W/Q navegam, I abre o disco)
     BrowsingAlbums,
     /// Camada 2 — faixas do álbum aberto (W/Q navegam, O toca, I volta)
@@ -170,6 +178,8 @@ impl FocusState {
     /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=7)
     pub fn as_i32(self) -> i32 {
         match self {
+            FocusState::OperatorAuth => 8,
+            FocusState::OperatorSettings => 9,
             FocusState::BrowsingAlbums => 0,
             FocusState::BrowsingTracks => 1,
             FocusState::VolumeControl => 2,
@@ -187,7 +197,9 @@ impl FocusState {
     pub fn is_operator(self) -> bool {
         matches!(
             self,
-            FocusState::OperatorMainMenu
+            FocusState::OperatorAuth
+                | FocusState::OperatorSettings
+                | FocusState::OperatorMainMenu
                 | FocusState::OperatorPriceMenu
                 | FocusState::OperatorGenreMenu
                 | FocusState::OperatorRecentDaysMenu
@@ -199,6 +211,8 @@ impl FocusState {
 /// A máquina permanece pura: nenhum canal, banco ou UI é tocado aqui dentro.
 #[derive(Debug, Clone)]
 pub enum Action {
+    CycleGenre,
+    OpenSettings,
     OpenWifi,
     SyncOnline,
     /// Tecla reconhecida, porém sem efeito adicional (ex.: E já na 1ª capa)
@@ -286,6 +300,11 @@ pub struct AppState {
     pub genre_index: usize,
     /// Indica se há uma música sendo reproduzida no momento
     pub is_playing: bool,
+    pub operator_unlocked: bool,
+    pub active_genre: String,
+    pub pin_entry: String,
+    pub last_navigation: std::time::Instant,
+    pub fullscreen: bool,
 }
 
 impl AppState {
@@ -306,6 +325,11 @@ impl AppState {
             genres: Vec::new(),
             genre_index: 0,
             is_playing: false,
+            operator_unlocked: false,
+            active_genre: String::new(),
+            pin_entry: String::new(),
+            last_navigation: std::time::Instant::now(),
+            fullscreen: false,
         }
     }
 
@@ -434,7 +458,9 @@ impl AppState {
         }
 
         match self.focus {
+            FocusState::OperatorAuth | FocusState::OperatorSettings => None,
             FocusState::BrowsingAlbums => match key {
+                'o' => Some(Action::CycleGenre),
                 'e' => {
                     if !self.albums.is_empty() {
                         self.album_index = self.album_index.saturating_sub(1);
@@ -477,7 +503,9 @@ impl AppState {
                 }
                 'x' => {
                     self.previous = FocusState::BrowsingAlbums;
-                    self.focus = FocusState::OperatorMainMenu;
+                    self.focus = FocusState::OperatorAuth;
+                    self.operator_unlocked = false;
+                    self.pin_entry.clear();
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
                 }
@@ -549,7 +577,9 @@ impl AppState {
                 }
                 'x' => {
                     self.previous = FocusState::BrowsingTracks;
-                    self.focus = FocusState::OperatorMainMenu;
+                    self.focus = FocusState::OperatorAuth;
+                    self.operator_unlocked = false;
+                    self.pin_entry.clear();
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
                 }
@@ -592,11 +622,7 @@ impl AppState {
                     Some(Action::Noop)
                 }
                 'o' => match self.menu_index {
-                    OPERATOR_MENU_SYNC => {
-                        let previous = self.previous;
-                        self.focus = previous;
-                        Some(Action::ForceSync)
-                    }
+                    OPERATOR_MENU_SYNC => Some(Action::ForceSync),
                     OPERATOR_MENU_PRICE => {
                         self.price_value = self.song_price;
                         self.focus = FocusState::OperatorPriceMenu;
@@ -617,9 +643,14 @@ impl AppState {
                     OPERATOR_MENU_POWEROFF => Some(Action::PowerOff),
                     7 => Some(Action::OpenWifi),
                     8 => Some(Action::SyncOnline),
+                    9 => {
+                        self.focus = FocusState::OperatorSettings;
+                        Some(Action::OpenSettings)
+                    }
                     _ => Some(Action::Noop),
                 },
                 'u' => {
+                    self.operator_unlocked = false;
                     self.focus = self.previous;
                     Some(Action::CloseOperatorMenu)
                 }

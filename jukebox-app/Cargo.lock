@@ -1132,6 +1132,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1405,6 +1411,34 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "gstreamer-app"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1363313eb1931d66ac0b82c9b477fdd066af9dc118ea844966f85b6d99f261fd"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "glib",
+ "gstreamer",
+ "gstreamer-app-sys",
+ "gstreamer-base",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-app-sys"
+version = "0.22.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed667453517b47754b9f9d28c096074e5d565f1cc48c6fa2483b1ea10d7688d3"
+dependencies = [
+ "glib-sys",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps",
 ]
 
 [[package]]
@@ -2303,6 +2337,7 @@ version = "1.0.0"
 dependencies = [
  "env_logger",
  "gstreamer",
+ "gstreamer-app",
  "gstreamer-video",
  "id3",
  "image 0.25.10",
@@ -2311,6 +2346,7 @@ dependencies = [
  "qrcode",
  "raw-window-handle",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

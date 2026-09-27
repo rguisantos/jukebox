@@ -1,7 +1,8 @@
+use crate::settings::Settings;
 use crate::state::models::{
     album_initial, fnv64, AlbumInfo, GenreInfo, TrackInfo, SONG_PRICE_MAX, SONG_PRICE_MIN,
 };
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,20 @@ impl Database {
             price INTEGER NOT NULL CHECK(price > 0)
         );",
         )?;
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS operator_settings (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS cash_receipts (receipt TEXT PRIMARY KEY, cents INTEGER NOT NULL, credits INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS conversion_session (id INTEGER PRIMARY KEY CHECK(id=1), cents INTEGER NOT NULL, awarded INTEGER NOT NULL);
+            INSERT OR IGNORE INTO conversion_session VALUES(1,0,0);")?;
+        if self
+            .conn
+            .prepare("SELECT is_free FROM playback_queue LIMIT 0")
+            .is_err()
+        {
+            self.conn.execute(
+                "ALTER TABLE playback_queue ADD COLUMN is_free INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // Tabela de chave-valor para estado global (créditos, configurações persistentes)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS system_state (
@@ -269,13 +284,123 @@ impl Database {
         Ok(new_credits.max(0) as u32)
     }
 
+    pub fn settings(&self) -> Result<Settings> {
+        let json: Option<String> = self
+            .conn
+            .query_row("SELECT json FROM operator_settings WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        match json {
+            None => Ok(Settings::default()),
+            Some(json) => serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            }),
+        }
+    }
+    pub fn save_settings(&mut self, settings: &Settings) -> Result<()> {
+        settings
+            .validate()
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e))?;
+        let old = self.settings()?;
+        let tx = self.conn.transaction()?;
+        if old.packages != settings.packages {
+            let cents: u64 =
+                tx.query_row("SELECT cents FROM conversion_session WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+            tx.execute(
+                "UPDATE conversion_session SET cents=?1, awarded=0 WHERE id=1",
+                [old.convert(cents).1],
+            )?;
+        }
+        tx.execute("INSERT INTO operator_settings(id,json) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET json=excluded.json", [serde_json::to_string(settings).unwrap()])?;
+        tx.commit()
+    }
+    /// Deduplicated money receipt; incremental deposits receive package bonus only once.
+    pub fn accept_money(&mut self, cents: u32, receipt: &str) -> Result<(u32, u32)> {
+        if cents == 0 || cents > 100_000 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "Valor inválido".into(),
+            ));
+        }
+        let settings = self.settings()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let seen: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cash_receipts WHERE receipt=?1)",
+            [receipt],
+            |r| r.get(0),
+        )?;
+        let balance: u32 = tx.query_row(
+            "SELECT value FROM system_state WHERE key='credits'",
+            [],
+            |r| r.get(0),
+        )?;
+        if seen {
+            return Ok((balance, 0));
+        }
+        let (total, awarded): (u64, u64) = tx.query_row(
+            "SELECT cents,awarded FROM conversion_session WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let total = total
+            .checked_add(cents as u64)
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        let converted = settings.convert(total).0;
+        let delta = u32::try_from(converted.saturating_sub(awarded))
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let new_balance = balance
+            .checked_add(delta)
+            .filter(|b| *b <= i32::MAX as u32)
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        tx.execute(
+            "UPDATE conversion_session SET cents=?1,awarded=?2 WHERE id=1",
+            params![total, converted],
+        )?;
+        tx.execute(
+            "INSERT INTO cash_receipts VALUES(?1,?2,?3)",
+            params![receipt, cents, delta],
+        )?;
+        tx.execute("UPDATE system_state SET value=value+?1 WHERE key IN ('credits','partial_coins','absolute_coins')", [delta])?;
+        tx.execute("INSERT INTO credits_audit(amount) VALUES(?1)", [delta])?;
+        tx.commit()?;
+        Ok((new_balance, delta))
+    }
+    pub fn random_track(&self, exclude: Option<&str>) -> Result<Option<TrackInfo>> {
+        self.conn.query_row("SELECT id,title,artist,album,file_path,file_type,genre FROM tracks
+            WHERE genre NOT IN (SELECT genre FROM blocked_genres) AND (?1 IS NULL OR file_path != ?1)
+            ORDER BY RANDOM() LIMIT 1", [exclude], |r|Ok(TrackInfo{id:r.get(0)?,title:r.get(1)?,artist:r.get(2)?,album:r.get(3)?,file_path:r.get(4)?,file_type:r.get(5)?,genre:r.get(6)?})).optional()
+    }
+
     /// Persist a purchase and debit in ONE transaction. Current song counts toward limit.
     pub fn reserve_track(&mut self, track: &TrackInfo) -> Result<Option<(i64, u32)>> {
         let json = serde_json::to_string(track)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let settings = self.settings()?;
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let last: Option<String> = tx
+            .query_row(
+                "SELECT track_json FROM playback_queue ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if last
+            .and_then(|j| serde_json::from_str::<TrackInfo>(&j).ok())
+            .map(|t| t.file_path == track.file_path)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
         let count: i64 = tx.query_row("SELECT count(*) FROM playback_queue", [], |r| r.get(0))?;
         let price: i64 = tx.query_row(
             "SELECT value FROM system_state WHERE key='song_price'",
@@ -287,19 +412,28 @@ impl Database {
             [],
             |r| r.get(0),
         )?;
-        if count >= 20 || price < 1 || balance < price {
+        if count >= 20 || price < 1 || (!settings.free_play && balance < price) {
             return Ok(None);
         }
         tx.execute(
-            "INSERT INTO playback_queue(track_json,price) VALUES (?1,?2)",
-            params![json, price],
+            "INSERT INTO playback_queue(track_json,price,is_free) VALUES (?1,?2,?3)",
+            params![json, price, settings.free_play],
         )?;
         let id = tx.last_insert_rowid();
+        let price = if settings.free_play { 0 } else { price };
         tx.execute(
             "UPDATE system_state SET value=value-?1 WHERE key='credits'",
             [price],
         )?;
         tx.execute("INSERT INTO credits_audit(amount) VALUES (?1)", [-price])?;
+        let total: u64 =
+            tx.query_row("SELECT cents FROM conversion_session WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        tx.execute(
+            "UPDATE conversion_session SET cents=?1,awarded=0 WHERE id=1",
+            [settings.convert(total).1],
+        )?;
         tx.commit()?;
         Ok(Some((id, (balance - price) as u32)))
     }
@@ -328,9 +462,9 @@ impl Database {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if refund {
-            tx.execute("UPDATE system_state SET value=value+COALESCE((SELECT price FROM playback_queue WHERE id=?1),0) WHERE key='credits'", [id])?;
+            tx.execute("UPDATE system_state SET value=value+COALESCE((SELECT CASE WHEN is_free=1 THEN 0 ELSE price END FROM playback_queue WHERE id=?1),0) WHERE key='credits'", [id])?;
             tx.execute(
-                "INSERT INTO credits_audit(amount) SELECT price FROM playback_queue WHERE id=?1",
+                "INSERT INTO credits_audit(amount) SELECT CASE WHEN is_free=1 THEN 0 ELSE price END FROM playback_queue WHERE id=?1",
                 [id],
             )?;
         }
@@ -678,11 +812,81 @@ mod queue_tests {
         }
     }
     #[test]
+    fn duplicate_tail_does_not_debit_but_a_b_a_is_allowed() {
+        let mut db = database();
+        db.increment_credits(3).unwrap();
+        assert!(db.reserve_track(&track()).unwrap().is_some());
+        assert!(db.reserve_track(&track()).unwrap().is_none());
+        assert_eq!(db.get_credits().unwrap(), 2);
+        let mut b = track();
+        b.file_path = "/b.mp3".into();
+        db.reserve_track(&b).unwrap().unwrap();
+        db.reserve_track(&track()).unwrap().unwrap();
+        assert_eq!(db.get_credits().unwrap(), 0);
+    }
+    #[test]
+    fn incremental_cash_has_same_bonus_as_single_receipt_and_deduplicates() {
+        let mut a = database();
+        let mut b = database();
+        let mut s = Settings::default();
+        s.packages[1].credits = 6;
+        s.packages[2].credits = 14;
+        a.save_settings(&s).unwrap();
+        b.save_settings(&s).unwrap();
+        for i in 0..5 {
+            a.accept_money(100, &format!("receipt-{i}")).unwrap();
+        }
+        b.accept_money(500, "single").unwrap();
+        assert_eq!(a.get_credits().unwrap(), 6);
+        assert_eq!(a.get_credits().unwrap(), b.get_credits().unwrap());
+        assert_eq!(a.accept_money(100, "receipt-4").unwrap(), (6, 0));
+        a.reserve_track(&track()).unwrap().unwrap();
+        assert_eq!(a.accept_money(100, "next-session").unwrap(), (6, 1));
+    }
+    #[test]
+    fn fractional_remainder_survives_a_purchase() {
+        let mut db = database();
+        db.increment_credits(1).unwrap();
+        assert_eq!(db.accept_money(50, "half").unwrap(), (1, 0));
+        db.reserve_track(&track()).unwrap().unwrap();
+        assert_eq!(db.accept_money(50, "other-half").unwrap(), (1, 1));
+    }
+    #[test]
+    fn free_play_neither_debits_nor_refunds_unpaid_credit() {
+        let mut db = database();
+        let mut s = Settings::default();
+        s.free_play = true;
+        db.save_settings(&s).unwrap();
+        let (id, balance) = db.reserve_track(&track()).unwrap().unwrap();
+        assert_eq!(balance, 0);
+        assert_eq!(db.finish_track(id, true).unwrap(), 0);
+        assert_eq!(db.get_absolute_coins().unwrap(), 0);
+    }
+    #[test]
+    fn settings_and_pin_persist_without_plaintext_password() {
+        let mut db = database();
+        let mut s = Settings::default();
+        s.set_pin("123456").unwrap();
+        s.attract_minutes = 5;
+        db.save_settings(&s).unwrap();
+        let loaded = db.settings().unwrap();
+        assert!(loaded.verify_pin("123456"));
+        assert_eq!(loaded.attract_minutes, 5);
+        let json: String = db
+            .conn
+            .query_row("SELECT json FROM operator_settings", [], |r| r.get(0))
+            .unwrap();
+        assert!(!json.contains("123456"));
+    }
+
+    #[test]
     fn full_queue_cannot_consume_credit() {
         let mut db = database();
         db.increment_credits(25).unwrap();
-        for _ in 0..20 {
-            assert!(db.reserve_track(&track()).unwrap().is_some());
+        for i in 0..20 {
+            let mut t = track();
+            t.file_path = format!("/{i}.mp3");
+            assert!(db.reserve_track(&t).unwrap().is_some());
         }
         assert!(db.reserve_track(&track()).unwrap().is_none());
         assert_eq!(db.get_credits().unwrap(), 5);

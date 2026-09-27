@@ -13,7 +13,7 @@
 //!      operador (Módulo 7) e contadores antifraude/preço/gêneros (Módulo 8)
 //!      │ (débito atômico → Enqueue no player)
 //!      ▼
-//!   [Player GStreamer] — playbin/xvimagesink/alsasink + fila (Módulo 3)
+//!   [Player GStreamer] — playbin/appsink/alsasink + fila (Módulo 3)
 //!   [USB Sync]         — detecta /media/usb, copia, reescaneia (Módulo 4);
 //!      também executa a "Sincronizar Pendrive" do menu do operador
 //!   [Capas de Álbum]   — ID3 APIC → miniaturas RGB + cache (Módulo 7)
@@ -28,6 +28,8 @@
 mod db;
 mod finance;
 mod media;
+mod operator;
+mod settings;
 mod state;
 
 use db::Database;
@@ -58,6 +60,11 @@ enum DbCommand {
     /// Moeda (tecla Z) ou PIX confirmado: credita e alimenta os
     /// contadores antifraude (caixa parcial + odômetro — Módulo 8)
     AddCredit(u32),
+    CashPulse,
+    Authenticate(String),
+    LoadSettings,
+    SaveSettings(ConfigData),
+    CycleGenre,
     RefreshCredits,
     /// Tecla O numa faixa: débito atômico do preço vigente (Módulo 8)
     /// + enfileiramento no player
@@ -101,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let initial_settings = db.settings()?;
     let initial_credits = db.get_credits().unwrap_or(0);
     log::info!(
         "Créditos persistentes carregados do banco: {}",
@@ -136,6 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     let main_window = MainWindow::new()?;
     main_window.set_credits(initial_credits as i32);
+    main_window.set_free_play(initial_settings.free_play);
+    main_window.set_auth_setup(!initial_settings.has_pin());
+    main_window.set_config_data(operator::form(&initial_settings));
     main_window.set_volume_value(initial_volume as i32);
     main_window.set_op_song_price(initial_price as i32);
     main_window.set_op_recent_days(initial_recent_days as i32);
@@ -176,6 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cover_tx = cover_cmd_tx.clone();
 
         thread::spawn(move || {
+            let mut auth_failures = 0u32;
+            let mut blocked_until = std::time::Instant::now();
             log::info!("Thread de persistência do SQLite iniciada.");
             while let Ok(cmd) = db_rx.recv() {
                 match cmd {
@@ -184,9 +197,148 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             update_credits_ui(&ui_handle, balance);
                         }
                     }
-                    DbCommand::AddCredit(amount) => {
-                        log::info!("Processando crédito (+{}): moeda ou PIX.", amount);
-                        apply_credit(&mut db, amount, &ui_handle);
+                    DbCommand::CashPulse => {
+                        let result = db.settings().and_then(|s| {
+                            let stamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos();
+                            db.accept_money(
+                                s.coin_cents,
+                                &format!("coin-{}-{stamp}", std::process::id()),
+                            )
+                        });
+                        match result {
+                            Ok((balance, added)) => {
+                                update_credits_ui(&ui_handle, balance);
+                                credit_feedback(&ui_handle, &player_tx, added);
+                            }
+                            Err(e) => {
+                                show_toast(&ui_handle, &format!("Falha ao registrar saldo: {e}"), 2)
+                            }
+                        }
+                    }
+                    DbCommand::AddCredit(amount) => match db.increment_credits(amount) {
+                        Ok(balance) => {
+                            update_credits_ui(&ui_handle, balance);
+                            credit_feedback(&ui_handle, &player_tx, amount);
+                        }
+                        Err(e) => {
+                            show_toast(&ui_handle, &format!("Falha ao registrar crédito: {e}"), 2)
+                        }
+                    },
+                    DbCommand::Authenticate(pin) => {
+                        if std::time::Instant::now() < blocked_until {
+                            show_toast(
+                                &ui_handle,
+                                "Aguarde 30 segundos antes de tentar novamente",
+                                2,
+                            );
+                            continue;
+                        }
+                        let result = (|| -> Result<bool, String> {
+                            let mut settings = db.settings().map_err(|e| e.to_string())?;
+                            if !settings.has_pin() {
+                                settings.set_pin(&pin)?;
+                                db.save_settings(&settings).map_err(|e| e.to_string())?;
+                                Ok(true)
+                            } else {
+                                Ok(settings.verify_pin(&pin))
+                            }
+                        })();
+                        match result {
+                            Ok(true) => {
+                                auth_failures = 0;
+                                let weak = ui_handle.clone();
+                                let state = state_arc.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = weak.upgrade() {
+                                        let mut st = lock_state(&state);
+                                        if st.focus == FocusState::OperatorAuth {
+                                            st.operator_unlocked = true;
+                                            st.focus = FocusState::OperatorMainMenu;
+                                            ui.set_auth_setup(false);
+                                            mirror_nav(&ui, &st);
+                                        }
+                                    }
+                                });
+                            }
+                            other => {
+                                auth_failures += 1;
+                                if auth_failures >= 5 {
+                                    blocked_until =
+                                        std::time::Instant::now() + Duration::from_secs(30);
+                                    auth_failures = 0;
+                                }
+                                show_toast(
+                                    &ui_handle,
+                                    &other.err().unwrap_or("Senha incorreta".into()),
+                                    2,
+                                );
+                            }
+                        }
+                    }
+                    DbCommand::LoadSettings => {
+                        if let Ok(settings) = db.settings() {
+                            let weak = ui_handle.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.set_auth_setup(!settings.has_pin());
+                                    ui.set_config_data(operator::form(&settings));
+                                }
+                            });
+                        }
+                    }
+                    DbCommand::SaveSettings(form) => {
+                        if !lock_state(&state_arc).operator_unlocked {
+                            continue;
+                        }
+                        let result = db
+                            .settings()
+                            .map_err(|e| e.to_string())
+                            .and_then(|old| operator::parse(form, old))
+                            .and_then(|settings| {
+                                db.save_settings(&settings).map_err(|e| e.to_string())?;
+                                Ok(settings)
+                            });
+                        match result {
+                            Ok(settings) => {
+                                let _ = player_tx.send(PlayerCommand::ReloadSettings);
+                                let weak = ui_handle.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = weak.upgrade() {
+                                        ui.set_free_play(settings.free_play);
+                                        ui.set_config_data(operator::form(&settings));
+                                    }
+                                });
+                                show_toast(&ui_handle, "Configurações salvas", 1);
+                            }
+                            Err(e) => show_toast(&ui_handle, &e, 2),
+                        }
+                    }
+                    DbCommand::CycleGenre => {
+                        if let Ok(albums) = db.get_albums() {
+                            let genres: Vec<_> = albums
+                                .iter()
+                                .map(|a| a.genre.clone())
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .into_iter()
+                                .collect();
+                            {
+                                let mut st = lock_state(&state_arc);
+                                st.active_genre = if st.active_genre.is_empty() {
+                                    genres.first().cloned().unwrap_or_default()
+                                } else {
+                                    genres
+                                        .iter()
+                                        .position(|g| g == &st.active_genre)
+                                        .and_then(|i| genres.get(i + 1))
+                                        .cloned()
+                                        .unwrap_or_default()
+                                };
+                            }
+                            publish_albums(&ui_handle, &state_arc, &cover_tx, albums, true);
+                        }
                     }
                     DbCommand::RequestPlay(track_data) => {
                         let track = TrackInfo {
@@ -405,6 +557,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     match event {
                         PlayerEvent::CreditsChanged => {}
+                        PlayerEvent::Notice(message) => show_toast(&ui_handle, &message, 2),
+                        PlayerEvent::Previous { title, artist } => {
+                            ui.set_previous_title(title.into());
+                            ui.set_previous_artist(artist.into());
+                        }
+                        PlayerEvent::Visual(active) => {
+                            ui.set_video_available(active);
+                            if !active {
+                                ui.set_video_frame(slint::Image::default());
+                            }
+                        }
                         PlayerEvent::TrackStarted {
                             id,
                             title,
@@ -433,11 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         PlayerEvent::Error { context, detail } => {
                             log::error!("UI: erro do player em '{}': {}", context, detail);
-                            show_toast(
-                                &ui_handle,
-                                &format!("Não foi possível tocar: {}", context),
-                                2,
-                            );
+                            show_toast(&ui_handle, &format!("{}: {}", context, detail), 2);
                         }
                     }
                 });
@@ -460,8 +619,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(event) = usb_event_rx.recv() {
                 match event {
                     UsbSyncEvent::Started { total } => {
-                        // O vídeo XVideo pinta ACIMA do desenho do Slint:
-                        // escondê-lo é pré-requisito para o popup ficar visível
+                        // O overlay USB é composto sobre o vídeo pelo Slint.
                         let _ = player_tx.send(PlayerCommand::HideVideo);
                         let ui_handle = ui_handle.clone();
                         let state_arc = state_arc.clone();
@@ -477,7 +635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // estava com volume/menu abertos, fecha (MÓDULO 8:
                                 // vale para o menu principal E para os submenus)
                                 let mut st = lock_state(&state_arc);
-                                if st.focus == FocusState::VolumeControl || st.focus.is_operator() {
+                                if st.focus == FocusState::VolumeControl {
                                     st.focus = FocusState::BrowsingAlbums;
                                 }
                                 mirror_nav(&ui, &st);
@@ -731,19 +889,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = db_tx.send(DbCommand::AddCredit(credits)) {
                             log::error!("PIX: falha ao enviar crédito ao banco: {}", e);
                         }
-                        // 2) Toast de confirmação
-                        let ui_handle = ui_handle.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            show_toast(
-                                &ui_handle,
-                                &format!(
-                                    "PIX Recebido! +{} Crédito{}",
-                                    credits,
-                                    if credits == 1 { "" } else { "s" }
-                                ),
-                                1,
-                            );
-                        });
                         // 3) O próprio serviço PIX já busca o próximo QR
                     }
                 }
@@ -770,6 +915,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return false;
             };
 
+            let _ = player_tx.send(PlayerCommand::Activity);
+            {
+                let mut st = lock_state(&state_arc);
+                if st.focus == FocusState::OperatorAuth {
+                    match key.as_str() {
+                        "auth-submit" => {
+                            let pin = std::mem::take(&mut st.pin_entry);
+                            let _ = db_tx.send(DbCommand::Authenticate(pin));
+                        }
+                        "auth-cancel" => {
+                            st.pin_entry.clear();
+                            st.operator_unlocked = false;
+                            st.focus = st.previous;
+                            let _ = player_tx.send(PlayerCommand::Operator(false));
+                        }
+                        "auth-backspace" => {
+                            st.pin_entry.pop();
+                        }
+                        text => {
+                            if text.len() == 1
+                                && text.as_bytes()[0].is_ascii_alphanumeric()
+                                && st.pin_entry.len() < 16
+                            {
+                                st.pin_entry.push_str(text);
+                            }
+                        }
+                    }
+                    mirror_nav(&ui, &st);
+                    return true;
+                }
+                if st.focus == FocusState::OperatorSettings {
+                    return false;
+                }
+                if st.focus != FocusState::VolumeControl
+                    && matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "q" | "w" | "e" | "r" | "i" | "o"
+                    )
+                {
+                    st.last_navigation = std::time::Instant::now();
+                    st.fullscreen = false;
+                    ui.set_video_fullscreen(false);
+                }
+            }
             let action = {
                 let mut st = lock_state(&state_arc);
                 st.handle_key(key.as_str())
@@ -788,6 +977,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let usb_tx = usb_cmd_tx.clone();
 
         main_window.on_album_activated(move |index: i32| {
+            let _ = player_tx.send(PlayerCommand::Activity);
+            {
+                let mut st = lock_state(&state_arc);
+                st.last_navigation = std::time::Instant::now();
+                st.fullscreen = false;
+            }
             let Some(ui) = ui_handle.upgrade() else {
                 return;
             };
@@ -814,6 +1009,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let usb_tx = usb_cmd_tx.clone();
 
         main_window.on_track_activated(move |index: i32| {
+            let _ = player_tx.send(PlayerCommand::Activity);
+            {
+                let mut st = lock_state(&state_arc);
+                st.last_navigation = std::time::Instant::now();
+                st.fullscreen = false;
+            }
             let Some(ui) = ui_handle.upgrade() else {
                 return;
             };
@@ -856,59 +1057,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Geometria da área de vídeo (o Slint reporta px lógicos; o XVideo
-    // trabalha em px físicos da janela — converte pelo fator de escala)
+    let media_timer = slint::Timer::default();
     {
-        let ui_handle = main_window.as_weak();
-        let tx_player = player_cmd_tx.clone();
-        main_window.on_video_geometry_changed(move |x: f32, y: f32, width: f32, height: f32| {
-            let scale = ui_handle
-                .upgrade()
-                .map(|ui| ui.window().scale_factor())
-                .unwrap_or(1.0);
-            let _ = tx_player.send(PlayerCommand::VideoGeometry {
-                x: (x * scale).round() as i32,
-                y: (y * scale).round() as i32,
-                width: (width * scale).round() as i32,
-                height: (height * scale).round() as i32,
-            });
-        });
-    }
-
-    // =========================================================================
-    // 10. Handle da janela X11 → player (o vídeo é embutido via GstVideoOverlay)
-    // =========================================================================
-    if let Err(e) = main_window.show() {
-        log::error!("Falha ao mapear a janela X11: {}", e);
-    }
-    {
-        // Um Timer do próprio event loop consulta o xid periodicamente: o
-        // acesso ao handle bruto precisa ocorrer na thread da UI, e a
-        // janela pode levar alguns ciclos até ser mapeada pelo X11.
-        // O player ignora xids repetidos — o timer eterno é barato (2Hz).
-        let ui_handle = main_window.as_weak();
-        let tx_player = player_cmd_tx.clone();
-        let timer = slint::Timer::default();
-        timer.start(
+        let weak = main_window.as_weak();
+        let state = state_arc.clone();
+        media_timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(500),
+            Duration::from_millis(50),
             move || {
-                if let Some(ui) = ui_handle.upgrade() {
-                    if let Some(xid) = x11_window_id(ui.window()) {
-                        let _ = tx_player.send(PlayerCommand::SetWindowHandle(xid));
+                let Some(ui) = weak.upgrade() else { return };
+                if let Some(frame) = player::take_frame() {
+                    ui.set_video_frame(rgb_buffer_to_image(frame.rgb, frame.width, frame.height));
+                }
+                let mut st = lock_state(&state);
+                if !st.focus.is_operator()
+                    && st.focus != FocusState::VolumeControl
+                    && !ui.get_usb_overlay_visible()
+                {
+                    if st.last_navigation.elapsed() >= Duration::from_secs(10)
+                        && ui.get_video_available()
+                    {
+                        st.fullscreen = true;
                     }
                 }
+                ui.set_video_fullscreen(
+                    st.fullscreen
+                        && ui.get_video_available()
+                        && !st.focus.is_operator()
+                        && !ui.get_usb_overlay_visible(),
+                );
             },
         );
-        // O timer precisa viver enquanto a aplicação viver — sem esta raiz
-        // ele seria cancelado ao sair do escopo
-        std::mem::forget(timer);
     }
-
-    // =========================================================================
-    // 11. Loop principal da interface (bloqueia até a janela fechar)
-    // =========================================================================
-    log::info!("Interface Slint pronta. Entrando no loop principal de eventos X11.");
+    {
+        let weak = main_window.as_weak();
+        thread::spawn(move || loop {
+            let directory = scanner::resolve_media_dir();
+            let directory = directory.parent().unwrap();
+            let threshold = Database::open()
+                .and_then(|db| db.settings())
+                .map(|s| s.low_disk_mib as u64 * 1024 * 1024)
+                .unwrap_or(1024 * 1024 * 1024);
+            let result = settings::available_bytes(directory);
+            let weak = weak.clone();
+            if slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    match result {
+                        Ok(bytes) => {
+                            ui.set_disk_low(bytes < threshold);
+                            ui.set_disk_status(
+                                format!("Disco: {:.1} GiB livres", bytes as f64 / 1073741824.)
+                                    .into(),
+                            );
+                        }
+                        Err(_) => {
+                            ui.set_disk_low(true);
+                            ui.set_disk_status("Não foi possível consultar o disco".into());
+                        }
+                    }
+                }
+            })
+            .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_secs(30));
+        });
+    }
+    {
+        let tx = db_tx.clone();
+        main_window.on_save_config(move |form| {
+            let _ = tx.send(DbCommand::SaveSettings(form));
+        });
+        let weak = main_window.as_weak();
+        let state = state_arc.clone();
+        main_window.on_close_config(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut st = lock_state(&state);
+                st.focus = FocusState::OperatorMainMenu;
+                mirror_nav(&ui, &st);
+            }
+        });
+    }
+    main_window.show()?;
     main_window.run()?;
 
     log::info!("Jukebox OS finalizado com sucesso.");
@@ -935,6 +1166,12 @@ fn mirror_nav(ui: &MainWindow, st: &AppState) {
     ui.set_ui_focus(st.focus.as_i32());
     ui.set_selected_album(st.album_index as i32);
     ui.set_selected_track(st.track_index as i32);
+    ui.set_active_genre(if st.active_genre.is_empty() {
+        "Todos os gêneros".into()
+    } else {
+        st.active_genre.clone().into()
+    });
+    ui.set_pin_mask("•".repeat(st.pin_entry.len()).into());
     ui.set_volume_value(st.volume as i32);
     ui.set_op_menu_index(st.menu_index as i32);
 
@@ -1020,10 +1257,16 @@ fn handle_ui_action(
             show_toast(&ui.as_weak(), "Verificação do acervo solicitada", 2);
         }
 
+        Action::CycleGenre => {
+            let _ = db_tx.send(DbCommand::CycleGenre);
+        }
+        Action::OpenSettings => {
+            let _ = db_tx.send(DbCommand::LoadSettings);
+        }
         Action::Noop => {}
         Action::AddCredit => {
             log::debug!("Evento de moeda/tecla 'Z' detectado pela interface.");
-            if let Err(e) = db_tx.send(DbCommand::AddCredit(1)) {
+            if let Err(e) = db_tx.send(DbCommand::CashPulse) {
                 log::error!("Erro ao enviar comando de moeda para a fila: {}", e);
             }
         }
@@ -1048,21 +1291,22 @@ fn handle_ui_action(
             std::process::exit(0);
         }
         Action::OpenOperatorMenu => {
+            let _ = player_tx.send(PlayerCommand::Operator(true));
+            let _ = db_tx.send(DbCommand::LoadSettings);
             // IP calculado na hora (dhcp pode mudar entre aberturas do menu)
             ui.set_op_ip(query_local_ip().into());
             // MÓDULO 8 — Stats do operador (odômetro, caixa parcial, preço) e
             // lista de gêneros vêm do banco pela thread de persistência
             let _ = db_tx.send(DbCommand::QueryOperatorStats);
-            // O diálogo cobre a área do vídeo XVideo: esconde o vídeo para
-            // o menu ficar visível (mesma regra do overlay USB)
+            // A camada administrativa permanece sobre o vídeo.
             let _ = player_tx.send(PlayerCommand::HideVideo);
         }
         Action::CloseOperatorMenu => {
+            let _ = player_tx.send(PlayerCommand::Operator(false));
             let _ = player_tx.send(PlayerCommand::RestoreVideo);
         }
         Action::ForceSync => {
-            // Restaura o vídeo (o menu fechou); se houver pendrive, o overlay
-            // de sincronização abre em seguida e esconde o vídeo de novo
+            // Sincroniza sem encerrar a sessão administrativa.
             let _ = player_tx.send(PlayerCommand::RestoreVideo);
             if let Err(e) = usb_tx.send(UsbSyncCommand::ForceSync) {
                 log::error!("Erro ao solicitar sincronização forçada: {}", e);
@@ -1238,7 +1482,11 @@ fn publish_albums(
 
         let rows: Vec<AlbumData> = {
             let mut st = lock_state(&state_arc);
-            if keep_focus {
+            let mut albums = albums;
+            if !st.active_genre.is_empty() {
+                albums.retain(|a| a.genre == st.active_genre);
+            }
+            if keep_focus || st.focus.is_operator() {
                 st.replace_catalog_keep_focus(albums);
             } else {
                 st.replace_catalog(albums);
@@ -1307,17 +1555,23 @@ fn query_local_ip() -> String {
     }
 }
 
-/// Aplica um crédito no banco e reflete o novo saldo na UI
-fn apply_credit(db: &mut Database, amount: u32, ui_handle: &slint::Weak<MainWindow>) {
-    match db.increment_credits(amount) {
-        Ok(new_total) => {
-            log::info!("Créditos atualizados no SQLite: {}", new_total);
-            update_credits_ui(ui_handle, new_total);
-        }
-        Err(e) => {
-            log::error!("Falha ao gravar crédito no SQLite: {}", e);
-        }
-    }
+/// Feedback is only scheduled after durable credit acceptance.
+fn credit_feedback(
+    weak: &slint::Weak<MainWindow>,
+    player: &mpsc::Sender<PlayerCommand>,
+    added: u32,
+) {
+    let _ = player.send(PlayerCommand::Activity);
+    let _ = player.send(PlayerCommand::CreditFx);
+    show_toast(
+        weak,
+        &if added > 0 {
+            format!("Saldo recebido! +{added} crédito(s)")
+        } else {
+            "Saldo recebido; complete o valor do próximo crédito".into()
+        },
+        1,
+    );
 }
 
 /// Atualiza o badge de créditos (thread-safe: sempre dentro do event loop)
@@ -1380,23 +1634,4 @@ fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slint::Image {
         };
     }
     slint::Image::from_rgb8(buffer)
-}
-
-/// Obtém o XID da janela X11 da UI (para o GstVideoOverlay do player).
-/// Retorna None se a janela ainda não estiver mapeada ou não for X11.
-/// Deve ser chamada na thread do event loop (o handle bruto não é Send).
-fn x11_window_id(window: &slint::Window) -> Option<u64> {
-    // Acesso ao backend bruto via traço raw-window-handle 0.6 — habilitado
-    // pelo feature `raw-window-handle-06` do slint
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let handle = window.window_handle();
-    let raw = handle.window_handle().ok()?;
-    match raw.as_raw() {
-        // Xlib (winit/x11): window é c_ulong (u64 em x86_64)
-        RawWindowHandle::Xlib(h) => Some(h.window as u64),
-        // Xcb: window é NonZeroU32
-        RawWindowHandle::Xcb(h) => Some(h.window.get() as u64),
-        _ => None,
-    }
 }

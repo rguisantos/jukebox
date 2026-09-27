@@ -6,6 +6,8 @@ authors = ["Jukebox Embedded Project"]
 description = "High-performance embedded Jukebox software optimized for legacy x86 hardware"
 
 [dependencies]
+ring = "0.17"
+gstreamer-app = "0.22"
 # GUI Framework
 # Fixado em 1.8.0 (a partir do 1.9 o suporte a X11 mudou de novo).
 # backend-winit-x11 = backend X11 puro via winit, SEM Wayland (binário menor);
@@ -14,9 +16,7 @@ description = "High-performance embedded Jukebox software optimized for legacy x
 # "renderer-femtovg" não existem no slint 1.8.0 (eram de versões antigas).
 slint = { version = "=1.8.0", default-features = false, features = ["std", "backend-winit-x11", "renderer-femtovg", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
 
-# Acesso ao handle bruto da janela X11 (XID) — necessário para embutir o
-# vídeo do GStreamer na janela do Slint via GstVideoOverlay (Módulo 3).
-# Mesma versão que o slint usa internamente (unificada pelo cargo).
+# Handle de janela compatível com o backend Slint/X11.
 raw-window-handle = "0.6"
 
 # Asynchronous Runtime (Configurado estritamente para eficiência em Single-Core)
@@ -31,7 +31,7 @@ id3 = "1.14"
 
 # =============================================================================
 # MÓDULO 3 — Player de Mídia (GStreamer)
-# Playbin + xvimagesink (saída de vídeo via XVideo, sem composição OpenGL)
+# Playbin + appsink RGB limitado (vídeo composto no Slint com overlays)
 # + alsasink (áudio direto no ALSA, sem PulseAudio/PipeWire).
 # Versão 0.22 exige GStreamer >= 1.20 (Debian 12 Bookworm roda 1.22).
 # =============================================================================
