@@ -43,6 +43,7 @@ pub enum PlayerCommand {
     HideVideo,
     RestoreVideo,
 }
+
 pub enum PlayerEvent {
     CreditsChanged,
     TrackStarted {
@@ -135,6 +136,33 @@ fn uri(path: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Notas do aviso sonoro de crédito (arpejo ascendente estilo fliperama):
+/// C5 → C6 (523Hz → 1046Hz). `num-buffers=3 × 1024` amostras ≈ 64–70ms por
+/// nota conforme a taxa negociada; o par completa em ~140–150ms.
+const FX_NOTE_LO_HZ: u32 = 523;
+const FX_NOTE_HI_HZ: u32 = 1046;
+/// Intervalo entre as duas notas do arpejo (~75ms por nota).
+const FX_NOTE_GAP: Duration = Duration::from_millis(75);
+
+/// Uma nota do arpejo de crédito: tom curto via `audiotestsrc`, misturado no
+/// dmix junto com a música. Em teste (`JUKEBOX_AUDIO_SINK=fakesink`) usa a
+/// mesma topologia com saída descartada para manter o comportamento medível.
+fn credit_effect(freq: u32) -> Result<gst::Element, String> {
+    if std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink") {
+        gst::parse::launch(&format!(
+            "audiotestsrc wave=sine freq={freq} num-buffers=3 samplesperbuffer=1024 volume=0.12 \
+             ! audioconvert ! audioresample ! queue ! fakesink sync=true"
+        ))
+        .map_err(|e| e.to_string())
+    } else {
+        gst::parse::launch(&format!(
+            "audiotestsrc wave=sine freq={freq} num-buffers=3 samplesperbuffer=1024 volume=0.12 \
+             ! audioconvert ! audioresample ! alsasink device=default"
+        ))
+        .map_err(|e| e.to_string())
+    }
+}
+
 pub fn spawn(rx: Receiver<PlayerCommand>, tx: Sender<PlayerEvent>) {
     thread::Builder::new()
         .name("jukebox-player".into())
@@ -154,7 +182,12 @@ pub fn spawn(rx: Receiver<PlayerCommand>, tx: Sender<PlayerEvent>) {
 struct Player {
     music: gst::Element,
     background: gst::Element,
-    effect: gst::Element,
+    /// Primeira nota do arpejo de crédito (C5 — 523Hz).
+    effect_lo: gst::Element,
+    /// Segunda nota do arpejo (C6 — 1046Hz), disparada ~75ms depois.
+    effect_hi: gst::Element,
+    /// Deadline da segunda nota; `None` quando nenhum arpejo está em curso.
+    fx_hi_at: Option<Instant>,
     db: Database,
     queue: VecDeque<(i64, TrackInfo)>,
     current: Option<TrackInfo>,
@@ -180,21 +213,18 @@ impl Player {
         background.set_property("video-sink", video_sink(2)?);
         background.set_property("audio-sink", element("fakesink")?);
         background.set_property("mute", true);
-        // Built-in short chime, no external file or license dependency.
-        let effect=gst::parse::launch("audiotestsrc wave=sine freq=880 num-buffers=8 samplesperbuffer=1024 volume=0.12 ! audioconvert ! audioresample ! queue ! fakesink sync=true name=fxsink").map_err(|e|e.to_string())?;
-        // Build a real secondary sink by using a small bin with a source and the chosen output.
-        let effect = if std::env::var("JUKEBOX_AUDIO_SINK").as_deref() == Ok("fakesink") {
-            effect
-        } else {
-            gst::parse::launch("audiotestsrc wave=sine freq=880 num-buffers=8 samplesperbuffer=1024 volume=0.12 ! audioconvert ! audioresample ! alsasink device=default").map_err(|e|e.to_string())?
-        };
+        // Built-in two-note arcade arpeggio, no external file or license dependency.
+        let effect_lo = credit_effect(FX_NOTE_LO_HZ)?;
+        let effect_hi = credit_effect(FX_NOTE_HI_HZ)?;
         let db = Database::open().map_err(|e| e.to_string())?;
         let settings = db.settings().map_err(|e| e.to_string())?;
         let queue = db.pending_tracks().map_err(|e| e.to_string())?.into();
         let mut p = Self {
             music,
             background,
-            effect,
+            effect_lo,
+            effect_hi,
+            fx_hi_at: None,
             db,
             queue,
             current: None,
@@ -283,6 +313,16 @@ impl Player {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 _ => {}
             }
+            // Segunda nota do arpejo de crédito: dispara no deadline agendado.
+            // O poll de 25ms acrescenta no máximo um ciclo de atraso — o ouvido
+            // percebe apenas um arpejo contínuo de duas notas.
+            if let Some(deadline) = self.fx_hi_at {
+                if Instant::now() >= deadline {
+                    self.fx_hi_at = None;
+                    let _ = self.effect_hi.set_state(gst::State::Null);
+                    let _ = self.effect_hi.set_state(gst::State::Playing);
+                }
+            }
             // Service EOS/errors even under continuous key input.
             if let Some(bus) = self.music.bus() {
                 while let Some(msg) =
@@ -324,12 +364,14 @@ impl Player {
                     }
                 }
             }
-            if let Some(bus) = self.effect.bus() {
-                if bus
-                    .pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
-                    .is_some()
-                {
-                    let _ = self.effect.set_state(gst::State::Null);
+            for pipe in [&self.effect_lo, &self.effect_hi] {
+                if let Some(bus) = pipe.bus() {
+                    if bus
+                        .pop_filtered(&[gst::MessageType::Eos, gst::MessageType::Error])
+                        .is_some()
+                    {
+                        let _ = pipe.set_state(gst::State::Null);
+                    }
                 }
             }
             if self.current.is_none() && self.current_id.is_none() {
@@ -364,7 +406,7 @@ impl Player {
                 }
             }
         }
-        for pipe in [&self.music, &self.background, &self.effect] {
+        for pipe in [&self.music, &self.background, &self.effect_lo, &self.effect_hi] {
             let _ = pipe.set_state(gst::State::Null);
         }
     }
@@ -425,8 +467,12 @@ impl Player {
                 self.finish(false);
             }
             PlayerCommand::CreditFx => {
-                let _ = self.effect.set_state(gst::State::Null);
-                let _ = self.effect.set_state(gst::State::Playing);
+                // Arpejo ascendente de duas notas (C5 → C6): a segunda é
+                // agendada ~75ms depois; o dmix mistura as notas com a
+                // música sem interromper a reprodução em andamento.
+                let _ = self.effect_lo.set_state(gst::State::Null);
+                let _ = self.effect_lo.set_state(gst::State::Playing);
+                self.fx_hi_at = Some(Instant::now() + FX_NOTE_GAP);
             }
             PlayerCommand::Activity => {
                 self.last_activity = Instant::now();
@@ -562,20 +608,35 @@ mod media_tests {
         assert!(take_frame().is_none());
         pipeline.set_state(gst::State::Null).unwrap();
         let music = gst::parse::launch("audiotestsrc is-live=true ! fakesink sync=true").unwrap();
-        let effect = gst::parse::launch("audiotestsrc num-buffers=8 ! fakesink sync=true").unwrap();
+        // As duas notas do arpejo de crédito com a topologia real (C5 → C6):
+        // cada uma encerra sozinha (EOS) sem pausar a música — as rotas de
+        // áudio seguem independentes, exatamente como no dmix do appliance.
+        let lo = gst::parse::launch(
+            "audiotestsrc wave=sine freq=523 num-buffers=3 samplesperbuffer=1024 volume=0.12 \
+             ! audioconvert ! audioresample ! queue ! fakesink sync=true",
+        )
+        .unwrap();
+        let hi = gst::parse::launch(
+            "audiotestsrc wave=sine freq=1046 num-buffers=3 samplesperbuffer=1024 volume=0.12 \
+             ! audioconvert ! audioresample ! queue ! fakesink sync=true",
+        )
+        .unwrap();
         music.set_state(gst::State::Playing).unwrap();
-        effect.set_state(gst::State::Playing).unwrap();
-        let msg = effect
-            .bus()
-            .unwrap()
-            .timed_pop_filtered(
-                gst::ClockTime::from_seconds(3),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            )
-            .unwrap();
-        assert!(matches!(msg.view(), gst::MessageView::Eos(_)));
+        lo.set_state(gst::State::Playing).unwrap();
+        hi.set_state(gst::State::Playing).unwrap();
+        for note in [&lo, &hi] {
+            let msg = note
+                .bus()
+                .unwrap()
+                .timed_pop_filtered(
+                    gst::ClockTime::from_seconds(3),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                )
+                .unwrap();
+            assert!(matches!(msg.view(), gst::MessageView::Eos(_)));
+            note.set_state(gst::State::Null).unwrap();
+        }
         assert_eq!(music.current_state(), gst::State::Playing);
         music.set_state(gst::State::Null).unwrap();
-        effect.set_state(gst::State::Null).unwrap();
     }
 }

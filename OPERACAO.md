@@ -66,6 +66,8 @@ a imagem a 640×360, 20 fps e um frame pendente para controlar memória e carga.
 É uma escolha de desempenho que precisa ser medida na máquina mais lenta.
 O ALSA `dmix` da distro mistura música e aviso de crédito na placa 0; ajuste
 `/etc/asound.conf` se a saída de áudio do equipamento usar outra placa.
+O aviso de crédito é um arpejo ascendente de duas notas (C5 → C6, ~150ms),
+gerado internamente e reproduzido pela mesma rota do dmix.
 
 ## Automação e armazenamento
 
