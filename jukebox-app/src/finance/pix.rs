@@ -12,7 +12,7 @@
 //!   3. Um loop de polling faz GET em `/api/pix/status/{txid}` a cada 4s
 //!      (sem IP público, sem webhook — a máquina só consulta).
 //!   4. Quando o status volta "PAID": emite `PixUiEvent::Paid`, a thread
-//!      principal credita via `DbCommand::AddCredit`, exibe o Toast
+//!      principal credita via recibo idempotente no SQLite, exibe o Toast
 //!      "PIX Recebido! +N Créditos" e o serviço já solicita um NOVO
 //!      QR Code automaticamente para a próxima venda.
 //!
@@ -98,7 +98,7 @@ pub enum PixUiEvent {
     Offline { reason: String },
     /// Pagamento confirmado! A UI credita, mostra o Toast e este serviço
     /// já busca um QR novo para a próxima venda.
-    Paid { credits: u32 },
+    Paid { machine_id: String, txid: String, credits: u32 },
 }
 
 /// Comandos aceitos pelo serviço (oriundos da interface)
@@ -320,6 +320,8 @@ async fn pix_main_loop(
                         Ok(PixStatus::Paid) => {
                             log::info!("PIX: pagamento CONFIRMADO (txid={}).", qr.txid);
                             let _ = event_tx.send(PixUiEvent::Paid {
+                                machine_id: config.machine_id.clone(),
+                                txid: qr.txid.clone(),
                                 credits: CREDITOS_POR_PIX,
                             });
                             // Sai para a FASE 1: novo QR para a próxima venda
@@ -367,9 +369,11 @@ async fn demo_main_loop(
     log::warn!("PIX: MODO DEMO ativo — pagamentos são SIMULADOS (nenhuma cobrança real!)");
 
     let mut seq: u64 = 0;
+    let session = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     loop {
         seq += 1;
-        let txid = format!("DEMO-{:04}", seq);
+        let txid = format!("DEMO-{session}-{seq:04}");
         let payload = format!(
             "PIX-MODO-DEMO | maquina={} | txid={} | R$ {:.2} | \
              PAGAMENTO SIMULADO — NAO PAGAR",
@@ -404,6 +408,8 @@ async fn demo_main_loop(
                     CREDITOS_POR_PIX
                 );
                 let _ = event_tx.send(PixUiEvent::Paid {
+                    machine_id: config.machine_id.clone(),
+                    txid,
                     credits: CREDITOS_POR_PIX,
                 });
             }

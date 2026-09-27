@@ -10,7 +10,7 @@ const VOLUME_CONFIG_KEY: &str = "volume";
 enum DbCommand {
     RefreshCredits,
     CashPulse,
-    AddCredit(u32),
+    AcceptPix { machine_id: String, txid: String, credits: u32 },
     Authenticate(String),
     LockOperator,
     LoadSettings,
@@ -50,7 +50,9 @@ impl DbHandle {
     }
     pub fn refresh_credits(&self) -> Result<(), String> { self.send(DbCommand::RefreshCredits) }
     pub fn cash_pulse(&self) -> Result<(), String> { self.send(DbCommand::CashPulse) }
-    pub fn add_credit(&self, amount: u32) -> Result<(), String> { self.send(DbCommand::AddCredit(amount)) }
+    pub fn accept_pix(&self, machine_id: String, txid: String, credits: u32) -> Result<(), String> {
+        self.send(DbCommand::AcceptPix { machine_id, txid, credits })
+    }
     pub fn authenticate(&self, pin: String) -> Result<(), String> { self.send(DbCommand::Authenticate(pin)) }
     pub fn lock_operator(&self) -> Result<(), String> { self.send(DbCommand::LockOperator) }
     pub fn load_settings(&self) -> Result<(), String> { self.send(DbCommand::LoadSettings) }
@@ -93,9 +95,10 @@ pub fn spawn(mut db: Database) -> (DbHandle, Receiver<DbEvent>) {
                         Err(e) => toast(&events, format!("Falha ao registrar saldo: {e}"), 2),
                     }
                 }
-                DbCommand::AddCredit(amount) => match db.increment_credits(amount) {
-                    Ok(balance) => { let _ = events.send(DbEvent::CreditAccepted { balance, added: amount }); }
-                    Err(e) => toast(&events, format!("Falha ao registrar crédito: {e}"), 2),
+                DbCommand::AcceptPix { machine_id, txid, credits } => match db.accept_pix(&machine_id, &txid, credits) {
+                    Ok((balance, true)) => { let _ = events.send(DbEvent::CreditAccepted { balance, added: credits }); }
+                    Ok((balance, false)) => { log::info!("PIX repetido ignorado: máquina {machine_id}, txid {txid}"); let _ = events.send(DbEvent::Balance(balance)); }
+                    Err(e) => toast(&events, format!("Falha ao registrar PIX: {e}"), 2),
                 },
                 DbCommand::Authenticate(pin) => {
                     if Instant::now() < blocked_until {
