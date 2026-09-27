@@ -18,3 +18,15 @@ P volume, Z crédito, X operador, A zera saldo, L sai do aplicativo.
 
 Validações de boot BIOS/UEFI, Wi-Fi, áudio sob carga e desempenho com 5.000 álbuns
 em hardware real são necessárias antes de instalar em produção.
+
+### Estrutura do aplicativo
+
+`jukebox-app/src/main.rs` inicializa os serviços e despacha ações.
+`catalog_ui.rs` publica o catálogo no event loop do Slint, traduz faixas e
+álbuns para os modelos visuais e limita o carregamento de capas à janela de
+álbuns visível. Comandos entre a seleção e o player carregam `TrackInfo`,
+preservando metadados do domínio fora dos tipos gerados pela interface.
+`db/`, `media/` e `state/` mantêm respectivamente persistência, mídia e
+transições de navegação. O próximo corte estrutural natural é mover o
+despacho dos comandos de banco ainda presente em `main.rs` para um serviço
+próprio, com uma API que também possa atender a futura integração Pix.
