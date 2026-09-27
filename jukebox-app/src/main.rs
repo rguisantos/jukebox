@@ -31,6 +31,7 @@ mod finance;
 mod media;
 mod operator;
 mod settings;
+mod storage;
 mod state;
 
 use db::Database;
@@ -40,9 +41,10 @@ use catalog_ui::{publish_albums, track_info_to_data};
 use media::player::{self, PlayerCommand, PlayerEvent};
 use media::scanner;
 use media::usb_sync::{self, UsbSyncCommand, UsbSyncEvent};
+use storage::service::{self, DbEvent, DbHandle};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use state::models::{
-    Action, AppState, FocusState, GenreInfo, TrackInfo, VOLUME_DEFAULT,
+    Action, AppState, FocusState, VOLUME_DEFAULT,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -52,47 +54,11 @@ use std::time::Duration;
 // Carrega as structs geradas a partir do arquivo ui/app_window.slint
 slint::include_modules!();
 
-/// Chave da tabela chave-valor onde o volume persiste entre reinicializações
-const VOLUME_CONFIG_KEY: &str = "volume";
-
-/// Comandos despachados da UI/PIX para a thread do banco de dados.
-/// Único dono da conexão SQLite principal → zero corrida de escrita.
-#[derive(Debug)]
-enum DbCommand {
-    /// Moeda (tecla Z) ou PIX confirmado: credita e alimenta os
-    /// contadores antifraude (caixa parcial + odômetro — Módulo 8)
-    AddCredit(u32),
-    CashPulse,
-    Authenticate(String),
-    LoadSettings,
-    SaveSettings(ConfigData),
-    CycleGenre,
-    RefreshCredits,
-    /// Tecla O numa faixa: débito atômico do preço vigente (Módulo 8)
-    /// + enfileiramento no player
-    RequestPlay(TrackInfo),
-    /// Fechamento do overlay de volume: persiste o valor (Módulo 7)
-    SetVolume(u32),
-    /// Abertura do menu do operador: caixa parcial, odômetro, preço e
-    /// gêneros do acervo (Módulo 8 — substitui o QueryCollected do Módulo 7)
-    QueryOperatorStats,
-    /// Submenu de preço: grava o novo preço da música (Módulo 8)
-    SetSongPrice(u32),
-    /// Submenu de gêneros: alterna o bloqueio e recarrega o catálogo
-    /// público com o filtro aplicado (Módulo 8)
-    ToggleGenre(String),
-    /// "Zerar Caixa Parcial": zera o contador de recolhimento (Módulo 8)
-    ResetPartial,
-    /// "Zerar Créditos Atuais": zera os créditos não gastos (Módulo 8)
-    ResetCredits,
-    /// Submenu de dias recém-adicionados: grava os dias para filtro de recentes (*)
-    SetRecentDays(u32),
-}
-
 /// Geração do toast atual (evita que um timer antigo apague um toast novo)
 static WIFI_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ONLINE_TX: std::sync::OnceLock<mpsc::Sender<()>> = std::sync::OnceLock::new();
 static TOAST_GENERATION: AtomicU64 = AtomicU64::new(0);
+const VOLUME_CONFIG_KEY: &str = "volume";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -101,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // 1. Banco de dados e estado inicial
     // =========================================================================
-    let mut db = match Database::open() {
+    let db = match Database::open() {
         Ok(database) => database,
         Err(err) => {
             log::error!("Erro crítico ao inicializar o banco de dados: {}", err);
@@ -166,7 +132,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // 3. Canais de comunicação entre as threads
     // =========================================================================
-    let (db_tx, db_rx) = mpsc::channel::<DbCommand>();
     let (player_cmd_tx, player_cmd_rx) = mpsc::channel::<PlayerCommand>();
     let (player_event_tx, player_event_rx) = mpsc::channel::<PlayerEvent>();
     let (usb_cmd_tx, usb_cmd_rx) = mpsc::channel::<UsbSyncCommand>();
@@ -176,317 +141,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cover_event_tx, cover_event_rx) = mpsc::channel::<CoverEvent>();
 
     // =========================================================================
-    // 4. Thread do Banco de Dados (único escritor do SQLite principal)
+    // 4. SQLite service and its UI/player event bridge
     // =========================================================================
-    // MÓDULO 8: além do player (enfileiramento pós-débito), a thread também
-    // recebe o estado de navegação e a fila de capas — necessários para
-    // recarregar o catálogo público após alternar o bloqueio de um gênero.
+    let (db_tx, db_events) = service::spawn(db);
     {
-        let player_tx = player_cmd_tx.clone();
-        let ui_handle = main_window.as_weak();
-        let state_arc = state_arc.clone();
-        let cover_tx = cover_cmd_tx.clone();
-
+        let weak = main_window.as_weak();
+        let state = state_arc.clone();
+        let covers = cover_cmd_tx.clone();
+        let player = player_cmd_tx.clone();
+        let storage = db_tx.clone();
         thread::spawn(move || {
-            let mut auth_failures = 0u32;
-            let mut blocked_until = std::time::Instant::now();
-            log::info!("Thread de persistência do SQLite iniciada.");
-            while let Ok(cmd) = db_rx.recv() {
-                match cmd {
-                    DbCommand::RefreshCredits => {
-                        if let Ok(balance) = db.get_credits() {
-                            update_credits_ui(&ui_handle, balance);
-                        }
+            while let Ok(event) = db_events.recv() {
+                if let DbEvent::Enqueue(track) = event {
+                    if let Err(e) = player.send(PlayerCommand::Enqueue(track)) {
+                        log::error!("Player indisponível: {e}");
+                        show_toast(&weak, "Player indisponível; nenhum crédito debitado", 2);
                     }
-                    DbCommand::CashPulse => {
-                        let result = db.settings().and_then(|s| {
-                            let stamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            db.accept_money(
-                                s.coin_cents,
-                                &format!("coin-{}-{stamp}", std::process::id()),
-                            )
-                        });
-                        match result {
-                            Ok((balance, added)) => {
-                                update_credits_ui(&ui_handle, balance);
-                                credit_feedback(&ui_handle, &player_tx, added);
-                            }
-                            Err(e) => {
-                                show_toast(&ui_handle, &format!("Falha ao registrar saldo: {e}"), 2)
-                            }
+                    continue;
+                }
+                let weak = weak.clone();
+                let state = state.clone();
+                let covers = covers.clone();
+                let player = player.clone();
+                let storage = storage.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else { return };
+                    match event {
+                        DbEvent::Balance(balance) => ui.set_credits(balance as i32),
+                        DbEvent::CreditAccepted { balance, added } => {
+                            ui.set_credits(balance as i32);
+                            credit_feedback(&weak, &player, added);
                         }
-                    }
-                    DbCommand::AddCredit(amount) => match db.increment_credits(amount) {
-                        Ok(balance) => {
-                            update_credits_ui(&ui_handle, balance);
-                            credit_feedback(&ui_handle, &player_tx, amount);
-                        }
-                        Err(e) => {
-                            show_toast(&ui_handle, &format!("Falha ao registrar crédito: {e}"), 2)
-                        }
-                    },
-                    DbCommand::Authenticate(pin) => {
-                        if std::time::Instant::now() < blocked_until {
-                            show_toast(
-                                &ui_handle,
-                                "Aguarde 30 segundos antes de tentar novamente",
-                                2,
-                            );
-                            continue;
-                        }
-                        let result = (|| -> Result<bool, String> {
-                            let mut settings = db.settings().map_err(|e| e.to_string())?;
-                            if !settings.has_pin() {
-                                settings.set_pin(&pin)?;
-                                db.save_settings(&settings).map_err(|e| e.to_string())?;
-                                Ok(true)
+                        DbEvent::Toast { message, kind } => show_toast(&weak, &message, kind),
+                        DbEvent::Authenticated => {
+                            let mut st = lock_state(&state);
+                            if st.focus == FocusState::OperatorAuth {
+                                st.operator_unlocked = true;
+                                st.focus = FocusState::OperatorMainMenu;
+                                ui.set_auth_setup(false);
+                                mirror_nav(&ui, &st);
                             } else {
-                                Ok(settings.verify_pin(&pin))
-                            }
-                        })();
-                        match result {
-                            Ok(true) => {
-                                auth_failures = 0;
-                                let weak = ui_handle.clone();
-                                let state = state_arc.clone();
-                                let _ = slint::invoke_from_event_loop(move || {
-                                    if let Some(ui) = weak.upgrade() {
-                                        let mut st = lock_state(&state);
-                                        if st.focus == FocusState::OperatorAuth {
-                                            st.operator_unlocked = true;
-                                            st.focus = FocusState::OperatorMainMenu;
-                                            ui.set_auth_setup(false);
-                                            mirror_nav(&ui, &st);
-                                        }
-                                    }
-                                });
-                            }
-                            other => {
-                                auth_failures += 1;
-                                if auth_failures >= 5 {
-                                    blocked_until =
-                                        std::time::Instant::now() + Duration::from_secs(30);
-                                    auth_failures = 0;
-                                }
-                                show_toast(
-                                    &ui_handle,
-                                    &other.err().unwrap_or("Senha incorreta".into()),
-                                    2,
-                                );
+                                let _ = storage.lock_operator();
                             }
                         }
-                    }
-                    DbCommand::LoadSettings => {
-                        if let Ok(settings) = db.settings() {
-                            let weak = ui_handle.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(ui) = weak.upgrade() {
-                                    ui.set_auth_setup(!settings.has_pin());
-                                    ui.set_config_data(operator::form(&settings));
-                                }
-                            });
+                        DbEvent::SettingsLoaded(settings) => {
+                            ui.set_auth_setup(!settings.has_pin());
+                            ui.set_config_data(operator::form(&settings));
                         }
-                    }
-                    DbCommand::SaveSettings(form) => {
-                        if !lock_state(&state_arc).operator_unlocked {
-                            continue;
+                        DbEvent::SettingsSaved(settings) => {
+                            let _ = player.send(PlayerCommand::ReloadSettings);
+                            ui.set_free_play(settings.free_play);
+                            ui.set_config_data(operator::form(&settings));
                         }
-                        let result = db
-                            .settings()
-                            .map_err(|e| e.to_string())
-                            .and_then(|old| operator::parse(form, old))
-                            .and_then(|settings| {
-                                db.save_settings(&settings).map_err(|e| e.to_string())?;
-                                Ok(settings)
-                            });
-                        match result {
-                            Ok(settings) => {
-                                let _ = player_tx.send(PlayerCommand::ReloadSettings);
-                                let weak = ui_handle.clone();
-                                let _ = slint::invoke_from_event_loop(move || {
-                                    if let Some(ui) = weak.upgrade() {
-                                        ui.set_free_play(settings.free_play);
-                                        ui.set_config_data(operator::form(&settings));
-                                    }
-                                });
-                                show_toast(&ui_handle, "Configurações salvas", 1);
-                            }
-                            Err(e) => show_toast(&ui_handle, &e, 2),
-                        }
-                    }
-                    DbCommand::CycleGenre => {
-                        if let Ok(albums) = db.get_albums() {
-                            let genres: Vec<_> = albums
-                                .iter()
-                                .map(|a| a.genre.clone())
-                                .collect::<std::collections::BTreeSet<_>>()
-                                .into_iter()
-                                .collect();
+                        DbEvent::CycleGenre(albums) => {
+                            let genres: Vec<_> = albums.iter().map(|a| a.genre.clone())
+                                .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
                             {
-                                let mut st = lock_state(&state_arc);
+                                let mut st = lock_state(&state);
                                 st.active_genre = if st.active_genre.is_empty() {
                                     genres.first().cloned().unwrap_or_default()
                                 } else {
-                                    genres
-                                        .iter()
-                                        .position(|g| g == &st.active_genre)
-                                        .and_then(|i| genres.get(i + 1))
-                                        .cloned()
-                                        .unwrap_or_default()
+                                    genres.iter().position(|g| g == &st.active_genre)
+                                        .and_then(|i| genres.get(i + 1)).cloned().unwrap_or_default()
                                 };
                             }
-                            publish_albums(&ui_handle, &state_arc, &cover_tx, albums, true);
+                            publish_albums(&weak, &state, &covers, albums, true);
                         }
+                        DbEvent::Catalog(albums) => publish_albums(&weak, &state, &covers, albums, true),
+                        DbEvent::OperatorStats { partial, absolute, revenue, price, recent_days, genres } => {
+                            ui.set_op_partial_coins(partial as i32);
+                            ui.set_op_absolute_coins(absolute as i32);
+                            ui.set_op_total_revenue(revenue_label(revenue).into());
+                            ui.set_op_song_price(price as i32);
+                            ui.set_op_recent_days(recent_days as i32);
+                            let mut st = lock_state(&state);
+                            st.song_price = price;
+                            st.recent_days = recent_days;
+                            st.genres = genres;
+                            mirror_nav(&ui, &st);
+                        }
+                        DbEvent::SongPrice(price) => ui.set_op_song_price(price as i32),
+                        DbEvent::PartialReset => ui.set_op_partial_coins(0),
+                        DbEvent::Enqueue(_) => unreachable!(),
                     }
-                    DbCommand::RequestPlay(track) => {
-                        if let Err(e) = player_tx.send(PlayerCommand::Enqueue(track)) {
-                            log::error!("Player indisponível: {}", e);
-                            show_toast(
-                                &ui_handle,
-                                "Player indisponível; nenhum crédito debitado",
-                                3,
-                            );
-                        }
-                    }
-
-                    DbCommand::SetVolume(volume) => {
-                        if let Err(e) = db.set_config_i64(VOLUME_CONFIG_KEY, volume as i64) {
-                            log::error!("Falha ao persistir o volume: {}", e);
-                        }
-                    }
-                    DbCommand::QueryOperatorStats => {
-                        // MÓDULO 8 — Painel do operador: odômetro (créditos + R$),
-                        // caixa parcial, preço vigente e gêneros do acervo.
-                        let partial = db.get_partial_coins().unwrap_or(0);
-                        let absolute = db.get_absolute_coins().unwrap_or(0);
-                        // Odômetro patrimonial em reais: soma idempotente dos
-                        // recebimentos registrados em `cash_receipts`.
-                        let total_revenue = revenue_label(db.get_total_receipts_cents());
-                        let price = db.get_song_price().unwrap_or(1);
-                        let recent_days = db.get_recent_days().unwrap_or(30);
-                        let genres: Vec<GenreInfo> = db.get_genres().unwrap_or_default();
-                        log::debug!(
-                            "Menu do operador: odômetro={} créditos ({}), caixa parcial={}, preço={}, recentes={}d, {} gênero(s).",
-                            absolute,
-                            total_revenue,
-                            partial,
-                            price,
-                            recent_days,
-                            genres.len()
-                        );
-
-                        let ui_handle = ui_handle.clone();
-                        let state_arc = state_arc.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_handle.upgrade() {
-                                ui.set_op_partial_coins(partial as i32);
-                                ui.set_op_absolute_coins(absolute as i32);
-                                ui.set_op_total_revenue(total_revenue.into());
-                                ui.set_op_song_price(price as i32);
-                                ui.set_op_recent_days(recent_days as i32);
-
-                                // Espelha no estado: o submenu de preço semeia
-                                // sua edição com o valor vigente e o submenu de
-                                // gêneros navega na lista recém-carregada
-                                let mut st = lock_state(&state_arc);
-                                st.song_price = price;
-                                st.recent_days = recent_days;
-                                st.genres = genres;
-                                mirror_nav(&ui, &st);
-                            }
-                        });
-                    }
-                    DbCommand::SetSongPrice(price) => match db.set_song_price(price) {
-                        Ok(()) => {
-                            log::info!("Preço da música atualizado: {} crédito(s).", price);
-                            let ui_for_update = ui_handle.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(ui) = ui_for_update.upgrade() {
-                                    ui.set_op_song_price(price as i32);
-                                }
-                            });
-                            show_toast(
-                                &ui_handle,
-                                &format!(
-                                    "Preço atualizado: {} crédito{}",
-                                    price,
-                                    if price == 1 { "" } else { "s" }
-                                ),
-                                1,
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("Falha ao gravar o preço da música: {}", e);
-                            show_toast(&ui_handle, "Erro ao salvar o preço", 2);
-                        }
-                    },
-                    DbCommand::ToggleGenre(genre) => {
-                        match db.toggle_genre_block(&genre) {
-                            Ok(blocked) => {
-                                log::info!(
-                                    "Gênero '{}' {} pelo operador.",
-                                    genre,
-                                    if blocked { "BLOQUEADO" } else { "liberado" }
-                                );
-                                // Recarrega o catálogo público com o filtro
-                                // aplicado — SEM expulsar o operador do submenu
-                                // (a troca de linha do modelo é instantânea,
-                                // sem animações — nota de performance Mód. 8)
-                                let albums = db.get_albums().unwrap_or_else(|e| {
-                                    log::error!("Falha ao recarregar catálogo: {}", e);
-                                    Vec::new()
-                                });
-                                publish_albums(&ui_handle, &state_arc, &cover_tx, albums, true);
-                            }
-                            Err(e) => {
-                                log::error!("Falha ao alternar bloqueio do gênero: {}", e);
-                                show_toast(&ui_handle, "Erro ao bloquear gênero", 2);
-                            }
-                        }
-                    }
-                    DbCommand::ResetPartial => match db.reset_partial_coins() {
-                        Ok(()) => {
-                            log::info!("Caixa parcial zerado pelo operador (odômetro intacto).");
-                            let ui_for_update = ui_handle.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(ui) = ui_for_update.upgrade() {
-                                    ui.set_op_partial_coins(0);
-                                }
-                            });
-                            show_toast(&ui_handle, "Caixa parcial zerado", 1);
-                        }
-                        Err(e) => {
-                            log::error!("Falha ao zerar o caixa parcial: {}", e);
-                            show_toast(&ui_handle, "Erro ao zerar caixa", 2);
-                        }
-                    },
-                    DbCommand::ResetCredits => match db.reset_current_credits() {
-                        Ok(()) => {
-                            log::info!("Créditos atuais zerados pelo operador.");
-                            update_credits_ui(&ui_handle, 0);
-                            show_toast(&ui_handle, "Créditos atuais zerados", 1);
-                        }
-                        Err(e) => {
-                            log::error!("Falha ao zerar os créditos atuais: {}", e);
-                            show_toast(&ui_handle, "Erro ao zerar créditos", 2);
-                        }
-                    },
-                    DbCommand::SetRecentDays(days) => match db.set_recent_days(days) {
-                        Ok(()) => {
-                            log::info!("Dias recém-adicionados atualizados: {}.", days);
-                            show_toast(&ui_handle, &format!("Dias recentes: {}", days), 1);
-                            let albums = db.get_albums().unwrap_or_default();
-                            publish_albums(&ui_handle, &state_arc, &cover_tx, albums, true);
-                        }
-                        Err(e) => {
-                            log::error!("Falha ao salvar dias recém-adicionados: {}", e);
-                            show_toast(&ui_handle, "Erro ao salvar dias recentes", 2);
-                        }
-                    },
-                }
+                });
             }
         });
     }
@@ -541,7 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::spawn(move || {
             while let Ok(event) = player_event_rx.recv() {
                 if matches!(event, PlayerEvent::CreditsChanged) {
-                    let _ = balance_tx.send(DbCommand::RefreshCredits);
+                    let _ = balance_tx.refresh_credits();
                     continue;
                 }
                 let ui_handle = ui_handle.clone();
@@ -802,7 +540,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     PixUiEvent::Paid { credits } => {
                         // 1) Credita no banco (thread do SQLite)
-                        if let Err(e) = db_tx.send(DbCommand::AddCredit(credits)) {
+                        if let Err(e) = db_tx.add_credit(credits) {
                             log::error!("PIX: falha ao enviar crédito ao banco: {}", e);
                         }
                         // 3) O próprio serviço PIX já busca o próximo QR
@@ -838,9 +576,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match key.as_str() {
                         "auth-submit" => {
                             let pin = std::mem::take(&mut st.pin_entry);
-                            let _ = db_tx.send(DbCommand::Authenticate(pin));
+                            let _ = db_tx.authenticate(pin);
                         }
                         "auth-cancel" => {
+                            let _ = db_tx.lock_operator();
                             st.pin_entry.clear();
                             st.operator_unlocked = false;
                             st.focus = st.previous;
@@ -1043,7 +782,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let tx = db_tx.clone();
         main_window.on_save_config(move |form| {
-            let _ = tx.send(DbCommand::SaveSettings(form));
+            let _ = tx.save_settings(form.into());
         });
         let weak = main_window.as_weak();
         let state = state_arc.clone();
@@ -1134,7 +873,7 @@ fn handle_ui_action(
     ui: &MainWindow,
     state_arc: &Arc<Mutex<AppState>>,
     action: Option<Action>,
-    db_tx: &mpsc::Sender<DbCommand>,
+    db_tx: &DbHandle,
     player_tx: &mpsc::Sender<PlayerCommand>,
     usb_tx: &mpsc::Sender<UsbSyncCommand>,
 ) -> bool {
@@ -1174,20 +913,20 @@ fn handle_ui_action(
         }
 
         Action::CycleGenre => {
-            let _ = db_tx.send(DbCommand::CycleGenre);
+            let _ = db_tx.cycle_genre();
         }
         Action::OpenSettings => {
-            let _ = db_tx.send(DbCommand::LoadSettings);
+            let _ = db_tx.load_settings();
         }
         Action::Noop => {}
         Action::AddCredit => {
             log::debug!("Evento de moeda/tecla 'Z' detectado pela interface.");
-            if let Err(e) = db_tx.send(DbCommand::CashPulse) {
+            if let Err(e) = db_tx.cash_pulse() {
                 log::error!("Erro ao enviar comando de moeda para a fila: {}", e);
             }
         }
         Action::PlayTrack(track) => {
-            if let Err(e) = db_tx.send(DbCommand::RequestPlay(track)) {
+            if let Err(e) = db_tx.request_play(track) {
                 log::error!("Erro ao enviar faixa para débito: {}", e);
             }
         }
@@ -1197,7 +936,7 @@ fn handle_ui_action(
         Action::VolumeClosed(volume) => {
             // Aplica no player e persiste no banco (sobrevive ao reboot)
             let _ = player_tx.send(PlayerCommand::SetVolume(volume_to_linear(volume)));
-            let _ = db_tx.send(DbCommand::SetVolume(volume));
+            let _ = db_tx.set_volume(volume);
         }
         Action::SkipTrack => {
             let _ = player_tx.send(PlayerCommand::SkipTrack);
@@ -1208,16 +947,17 @@ fn handle_ui_action(
         }
         Action::OpenOperatorMenu => {
             let _ = player_tx.send(PlayerCommand::Operator(true));
-            let _ = db_tx.send(DbCommand::LoadSettings);
+            let _ = db_tx.load_settings();
             // IP calculado na hora (dhcp pode mudar entre aberturas do menu)
             ui.set_op_ip(query_local_ip().into());
             // MÓDULO 8 — Stats do operador (odômetro, caixa parcial, preço) e
             // lista de gêneros vêm do banco pela thread de persistência
-            let _ = db_tx.send(DbCommand::QueryOperatorStats);
+            let _ = db_tx.operator_stats();
             // A camada administrativa permanece sobre o vídeo.
             let _ = player_tx.send(PlayerCommand::HideVideo);
         }
         Action::CloseOperatorMenu => {
+            let _ = db_tx.lock_operator();
             let _ = player_tx.send(PlayerCommand::Operator(false));
             let _ = player_tx.send(PlayerCommand::RestoreVideo);
         }
@@ -1236,7 +976,7 @@ fn handle_ui_action(
         }
         Action::PriceSaved(price) => {
             // Persiste o novo preço (a thread do banco confirma com toast)
-            if let Err(e) = db_tx.send(DbCommand::SetSongPrice(price)) {
+            if let Err(e) = db_tx.set_song_price(price) {
                 log::error!("Erro ao enviar novo preço ao banco: {}", e);
             }
         }
@@ -1251,17 +991,17 @@ fn handle_ui_action(
         Action::ToggleGenreBlock(genre) => {
             // Grava o bloqueio e recarrega o catálogo público (a thread do
             // banco chama publish_albums com foco preservado)
-            if let Err(e) = db_tx.send(DbCommand::ToggleGenre(genre)) {
+            if let Err(e) = db_tx.toggle_genre(genre) {
                 log::error!("Erro ao enviar bloqueio de gênero ao banco: {}", e);
             }
         }
         Action::ResetPartialCoins => {
-            if let Err(e) = db_tx.send(DbCommand::ResetPartial) {
+            if let Err(e) = db_tx.reset_partial() {
                 log::error!("Erro ao enviar zeramento do caixa parcial: {}", e);
             }
         }
         Action::ResetCredits => {
-            if let Err(e) = db_tx.send(DbCommand::ResetCredits) {
+            if let Err(e) = db_tx.reset_credits() {
                 log::error!("Erro ao enviar zeramento de créditos: {}", e);
             }
         }
@@ -1274,7 +1014,7 @@ fn handle_ui_action(
         Action::ConfirmLetter(_idx) => {}
         Action::OpenRecentDaysMenu => {}
         Action::RecentDaysSaved(days) => {
-            if let Err(e) = db_tx.send(DbCommand::SetRecentDays(days)) {
+            if let Err(e) = db_tx.set_recent_days(days) {
                 log::error!(
                     "Erro ao enviar novos dias recém-adicionados ao banco: {}",
                     e
@@ -1354,7 +1094,7 @@ fn volume_to_linear(volume: u32) -> f64 {
 }
 
 /// A failed financial query must never be displayed as a genuine zero.
-fn revenue_label(result: rusqlite::Result<i64>) -> String {
+fn revenue_label(result: Result<i64, String>) -> String {
     match result {
         Ok(cents) => format_brl(cents),
         Err(error) => {
@@ -1491,7 +1231,7 @@ mod brl_tests {
     #[test]
     fn failed_receipts_query_is_not_a_zero_balance() {
         assert_eq!(revenue_label(Ok(0)), "R$ 0,00");
-        assert_eq!(revenue_label(Err(rusqlite::Error::InvalidQuery)), "Indisponível");
+        assert_eq!(revenue_label(Err("database unavailable".into())), "Indisponível");
     }
 
     #[test]
