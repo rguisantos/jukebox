@@ -1,0 +1,32 @@
+name: Validate jukebox
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      JUKEBOX_AUDIO_SINK: fakesink
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native libraries and test plugins
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base libx11-dev libxkbcommon-dev \
+            libfontconfig1-dev libudev-dev
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+      - name: Compile Slint and run Rust and GStreamer tests
+        run: cargo +1.90.0 test --locked --manifest-path jukebox-app/Cargo.toml
+      - name: Test catalog synchronization
+        run: python3 -m unittest discover -s tests -v

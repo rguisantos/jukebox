@@ -90,3 +90,24 @@ A escolha automática evita a faixa anterior se houver alternativas; com uma
 O espaço disponível é consultado a cada 30 segundos. Abaixo do limite configurado
 (padrão 1024 MiB), o cabeçalho e o vídeo em tela cheia exibem alerta. A checagem
 não apaga arquivos. Sincronização e importação preservam suas verificações próprias.
+
+## Recuperação e reindexação
+
+“Zerar créditos” também descarta centavos e progresso de bônus ainda acumulados,
+na mesma transação. Recibos, caixa e odômetro são preservados.
+
+Se a finalização de uma faixa falhar no banco, o player suspende a reprodução e
+tenta concluir novamente a cada dois segundos, além do tempo gasto na consulta.
+A primeira decisão de estorno é preservada mesmo que U seja pressionado durante
+a recuperação. A próxima faixa só inicia após a confirmação no banco.
+
+O scanner compara tamanho, inode, dispositivo e horários de modificação/alteração
+com precisão de nanossegundos. Arquivos novos ou modificados têm suas tags relidas;
+faixas existentes mantêm o identificador. Na primeira varredura após a atualização,
+o catálogo anterior ganha essas assinaturas, exigindo uma releitura das tags.
+Arquivos alterados durante a leitura ficam para a próxima varredura. Isso não
+remove faixas ausentes nem altera a fila já reservada.
+
+O workflow Validate jukebox compila Rust/Slint e executa testes de GStreamer com
+saída simulada, além dos testes de sincronização, em cada PR e atualização da main.
+Ele não substitui os testes de queda de energia e ALSA no equipamento real.
