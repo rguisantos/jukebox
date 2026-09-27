@@ -4,11 +4,19 @@
 // Teclas verticais: Q = cima, W = baixo (remapeadas conforme solicitado).
 // =============================================================================
 
-import { ListView, Spinner } from "std-widgets.slint";
+import { ListView, Spinner, LineEdit, Button, CheckBox, ScrollView } from "std-widgets.slint";
 
 // -----------------------------------------------------------------------------
 // Estruturas compartilhadas com Rust
 // -----------------------------------------------------------------------------
+export struct ConfigData {
+    base-cents: string, base-credits: string,
+    pack-cents: string, pack-credits: string,
+    large-cents: string, large-credits: string,
+    coin-cents: string, attract-minutes: string, low-disk-mib: string,
+    free-play: bool, new-pin: string,
+}
+
 export struct TrackData {
     id: int,
     title: string,
@@ -82,6 +90,10 @@ component TrackRow inherits Rectangle {
             horizontal-alignment: center;
         }
 
+        if track.file-type == "mp4" || track.file-type == "wmv" || track.file-type == "mpeg" : Rectangle {
+            width: 55px; height: 24px; background:#064e3b; border-radius:5px;
+            Text { text:"CLIPE"; color:#6ee7b7; font-size:10px; font-weight:700; horizontal-alignment:center; vertical-alignment:center; }
+        }
         Text {
             text: track.title;
             color: is-playing ? #6ee7b7 : (is-selected && has-focus-list ? #f8fafc : #e5e7eb);
@@ -243,7 +255,7 @@ component OperatorMenuRow inherits Rectangle {
     in property <bool> actionable;
     in property <bool> danger;
 
-    height: 38px;
+    height: 34px;
     background: root.index == root.selected-index ? #1c2033 : #101118;
     border-width: root.index == root.selected-index ? 2px : 1px;
     border-color: root.index == root.selected-index
@@ -415,13 +427,51 @@ export component MainWindow inherits Window {
     in property <string> usb-current-file: "";
     in property <string> usb-error-text: "";
 
+    in property <string> previous-title: "";
+    in property <string> previous-artist: "";
+    in property <image> video-frame;
+    in property <bool> video-available: false;
+    in property <bool> video-fullscreen: false;
+    in property <bool> free-play: false;
+    in property <string> active-genre: "Todos os gêneros";
+    in property <bool> disk-low: false;
+    in property <string> disk-status: "Consultando disco...";
+    in property <bool> auth-setup: false;
+    in property <string> pin-mask: "";
+    in-out property <ConfigData> config-data;
+    in-out property <string> cfg-base-cents;
+    in-out property <string> cfg-base-credits;
+    in-out property <string> cfg-pack-cents;
+    in-out property <string> cfg-pack-credits;
+    in-out property <string> cfg-large-cents;
+    in-out property <string> cfg-large-credits;
+    in-out property <string> cfg-coin-cents;
+    in-out property <string> cfg-attract-minutes;
+    in-out property <string> cfg-low-disk-mib;
+    in-out property <bool> cfg-free-play;
+    in-out property <string> cfg-new-pin;
+    changed config-data => {
+        root.cfg-base-cents = root.config-data.base-cents;
+        root.cfg-base-credits = root.config-data.base-credits;
+        root.cfg-pack-cents = root.config-data.pack-cents;
+        root.cfg-pack-credits = root.config-data.pack-credits;
+        root.cfg-large-cents = root.config-data.large-cents;
+        root.cfg-large-credits = root.config-data.large-credits;
+        root.cfg-coin-cents = root.config-data.coin-cents;
+        root.cfg-attract-minutes = root.config-data.attract-minutes;
+        root.cfg-low-disk-mib = root.config-data.low-disk-mib;
+        root.cfg-free-play = root.config-data.free-play;
+        root.cfg-new-pin = root.config-data.new-pin;
+    }
+    callback save-config(ConfigData);
+    callback close-config();
+
     // ---- Callbacks ----
     callback arcade-key-pressed(string) -> bool;
     callback album-activated(int);
     callback track-activated(int);
     callback pix-retry();
     callback usb-close();
-    callback video-geometry-changed(length, length, length, length);
 
     forward-focus: keyboard-handler;
 
@@ -456,6 +506,14 @@ export component MainWindow inherits Window {
         }
 
         key-pressed(event) => {
+            if root.ui-focus == 8 {
+                if event.text == Key.Return { root.arcade-key-pressed("auth-submit"); }
+                else if event.text == Key.Escape { root.arcade-key-pressed("auth-cancel"); }
+                else if event.text == Key.Backspace { root.arcade-key-pressed("auth-backspace"); }
+                else { root.arcade-key-pressed(event.text); }
+                return accept;
+            }
+
             if (root.ui-focus == 0 && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
                 if (keyboard-handler.last-key != event.text) {
                     keyboard-handler.last-key = event.text;
@@ -505,7 +563,14 @@ export component MainWindow inherits Window {
     // =========================================================================
     // Layout principal
     // =========================================================================
-    VerticalLayout {
+    Image {
+        width: root.width;
+        height: root.height;
+        source: root.video-frame;
+        image-fit: contain;
+        visible: root.video-available;
+    }
+    if !root.video-fullscreen : VerticalLayout {
         padding: 0px;
         spacing: 0px;
 
@@ -514,6 +579,16 @@ export component MainWindow inherits Window {
             height: 56px;
             background: #0a0b10;
 
+            Text {
+                x:16px; y:8px; width:parent.width - 245px; height:20px;
+                text: "O · " + root.active-genre;
+                color:#cbd5e1; font-size:14px; overflow:elide;
+            }
+            Text {
+                x:16px; y:31px; width:parent.width - 245px; height:18px;
+                text: root.disk-low ? "ARMAZENAMENTO BAIXO · " + root.disk-status : root.disk-status;
+                color:root.disk-low ? #fb7185 : #64748b; font-size:12px; overflow:elide;
+            }
             Rectangle {
                 x: parent.width - self.width - 24px;
                 y: (parent.height - self.height) / 2;
@@ -531,7 +606,7 @@ export component MainWindow inherits Window {
                     spacing: 10px;
 
                     Text {
-                        text: "CRÉDITOS:";
+                        text: root.free-play ? "FESTA:" : "CRÉDITOS:";
                         color: #9ca3af;
                         font-size: 15px;
                         font-weight: 700;
@@ -539,7 +614,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: "\{root.credits}";
+                        text: root.free-play ? "LIVRE" : "\{root.credits}";
                         color: #fbbf24;
                         font-size: 20px;
                         font-weight: 800;
@@ -562,28 +637,9 @@ export component MainWindow inherits Window {
                 horizontal-stretch: 1;
 
                 // Área de vídeo (fundo)
-                video-area := Rectangle {
-                    background: #000000;
-
-                    property <bool> video-active: root.np-video;
-                    changed video-active => {
-                        if (self.video-active) {
-                            root.video-geometry-changed(self.x, self.y, self.width, self.height);
-                        }
-                    }
-                    changed x      => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
-                    changed y      => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
-                    changed width  => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
-                    changed height => { root.video-geometry-changed(self.x, self.y, self.width, self.height); }
-
-                    Text {
-                        text: "▶  REPRODUZINDO VÍDEO";
-                        color: #334155;
-                        font-size: 16px;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                Rectangle {
+                    background: #000;
+                    Image { source: root.video-frame; image-fit: contain; width:parent.width; height:parent.height; }
                 }
 
                 // =============================================================
@@ -592,7 +648,7 @@ export component MainWindow inherits Window {
                 // Sem barra de cabeçalho — o grid ocupa toda a área.
                 // As capas crescem até o máximo que caiba 4×2 na tela.
                 // =============================================================
-                if !root.np-video && root.ui-focus != 1 && !root.scanning && root.albums.length > 0 : Rectangle {
+                if root.ui-focus != 1 && !root.scanning && root.albums.length > 0 : Rectangle {
                     VerticalLayout {
                         padding: 0px;
                         spacing: 0px;
@@ -748,7 +804,7 @@ export component MainWindow inherits Window {
                 // =============================================================
                 // CAMADA 2 (ui-focus 1): FAIXAS DO ÁLBUM
                 // =============================================================
-                if !root.np-video && root.ui-focus == 1 && !root.scanning : Rectangle {
+                if root.ui-focus == 1 && !root.scanning : Rectangle {
                     VerticalLayout {
                         padding: 0px;
                         spacing: 0px;
@@ -804,7 +860,7 @@ export component MainWindow inherits Window {
                                     track: track;
                                     is-selected: index == root.selected-track;
                                     is-playing: track.id == root.np-track-id;
-                                    has-focus-list: root.ui-focus == 1 && !root.np-video;
+                                    has-focus-list: root.ui-focus == 1;
                                     activated(i) => { root.track-activated(i); }
                                 }
 
@@ -823,7 +879,7 @@ export component MainWindow inherits Window {
                 }
 
                 // Estado vazio
-                if !root.np-video && root.albums.length == 0 && !root.scanning : Rectangle {
+                if root.albums.length == 0 && !root.scanning : Rectangle {
                     VerticalLayout {
                         alignment: center;
                         spacing: 12px;
@@ -846,7 +902,7 @@ export component MainWindow inherits Window {
                 }
 
                 // Estado de escaneamento
-                if !root.np-video && root.scanning : Rectangle {
+                if root.scanning : Rectangle {
                     VerticalLayout {
                         alignment: center;
                         spacing: 16px;
@@ -920,6 +976,16 @@ export component MainWindow inherits Window {
                                 font-size: 11px;
                                 font-weight: 700;
                             }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 82px; background:#12131c; border-radius:10px;
+                        VerticalLayout {
+                            padding:12px; spacing:4px;
+                            Text { text:"TOCADA ANTERIOR"; color:#94a3b8; font-size:11px; font-weight:700; }
+                            Text { text:root.previous-title != "" ? root.previous-title : "—"; color:#e2e8f0; font-size:14px; overflow:elide; }
+                            Text { text:root.previous-artist; color:#64748b; font-size:12px; overflow:elide; }
                         }
                     }
 
@@ -1099,35 +1165,6 @@ export component MainWindow inherits Window {
     // =========================================================================
     // OVERLAYS
     // =========================================================================
-
-    // ---- Toast ----
-    if root.toast-visible : Rectangle {
-        x: root.width - 310px + (310px - self.width) / 2;
-        y: 80px;
-        height: 56px;
-        width: min(toast-text.preferred-width + 56px, 294px);
-        border-radius: 14px;
-        background: root.toast-kind == 1 ? #065f46 : (root.toast-kind == 2 ? #7f1d1d : #312e81);
-        drop-shadow-blur: 14px;
-        drop-shadow-color: #00000080;
-        drop-shadow-offset-y: 3px;
-
-        HorizontalLayout {
-            padding-left: 20px;
-            padding-right: 20px;
-            alignment: center;
-
-            toast-text := Text {
-                text: root.toast-message;
-                color: #f8fafc;
-                font-size: 16px;
-                font-weight: 800;
-                vertical-alignment: center;
-                horizontal-alignment: center;
-                overflow: elide;
-            }
-        }
-    }
 
     // ---- Volume ----
     if root.ui-focus == 2 : Rectangle {
@@ -1380,6 +1417,10 @@ export component MainWindow inherits Window {
                     value: "verificar agora";
                     actionable: true;
                     danger: false;
+                }
+                OperatorMenuRow {
+                    index:9; selected-index:root.op-menu-index;
+                    label:"PACOTES, FESTA E AUTOMAÇÃO"; value:"configurar"; actionable:true; danger:false;
                 }
                 Text {
                     text: root.online-status;
@@ -1900,4 +1941,120 @@ export component MainWindow inherits Window {
             }
         }
     }
+    if root.ui-focus == 8 : Rectangle {
+        width:root.width; height:root.height; background:#08080cf5;
+        Rectangle {
+            width:min(520px,root.width - 32px); height:300px;
+            x:(parent.width - self.width)/2; y:(parent.height - self.height)/2;
+            background:#111827; border-radius:14px;
+            VerticalLayout {
+                padding:28px; spacing:18px;
+                Text { text:root.auth-setup ? "CRIAR SENHA DO OPERADOR" : "ACESSO DO OPERADOR"; color:#fbbf24; font-size:20px; font-weight:700; }
+                Text { text:"Digite 4 a 16 letras/números no teclado de manutenção."; color:#94a3b8; font-size:13px; wrap:word-wrap; }
+                Text { text:root.pin-mask + "_"; color:#fff; font-size:28px; }
+                HorizontalLayout {
+                    Button { text:root.auth-setup ? "Criar senha" : "Entrar"; clicked=>{root.arcade-key-pressed("auth-submit");} }
+                    Button { text:"Cancelar"; clicked=>{root.arcade-key-pressed("auth-cancel");} }
+                }
+                Text { text:"Enter confirma · Backspace apaga · Esc cancela"; color:#64748b; font-size:12px; }
+            }
+        }
+    }
+    if root.ui-focus == 9 : Rectangle {
+        width:root.width; height:root.height; background:#0a0b10;
+        VerticalLayout {
+            padding:20px; spacing:10px;
+            Text { text:"CONFIGURAÇÕES DO OPERADOR"; color:#fbbf24; font-size:22px; font-weight:700; }
+            Text { text:"Valores em centavos (100 = R$ 1). Pacotes maiores devem ser múltiplos dos menores."; color:#94a3b8; font-size:13px; wrap:word-wrap; }
+            ScrollView {
+                vertical-stretch:1;
+                VerticalLayout {
+                    spacing:10px;
+                    HorizontalLayout {
+                        Text { text:"Pacote base"; color:#e2e8f0; width:190px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-base-cents; placeholder-text:"Centavos"; }
+                        Text { text:"→ créditos"; color:#94a3b8; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-base-credits; placeholder-text:"Créditos"; }
+                    }
+                    HorizontalLayout {
+                        Text { text:"Pacote intermediário"; color:#e2e8f0; width:190px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-pack-cents; placeholder-text:"Centavos"; }
+                        Text { text:"→ créditos"; color:#94a3b8; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-pack-credits; placeholder-text:"Créditos"; }
+                    }
+                    HorizontalLayout {
+                        Text { text:"Pacote maior"; color:#e2e8f0; width:190px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-large-cents; placeholder-text:"Centavos"; }
+                        Text { text:"→ créditos"; color:#94a3b8; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-large-credits; placeholder-text:"Créditos"; }
+                    }
+                    HorizontalLayout {
+                        Text { text:"Valor do pulso Z (centavos)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-coin-cents; }
+                    }
+                    HorizontalLayout {
+                        Text { text:"Attract: intervalo em minutos (0 desliga)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-attract-minutes; }
+                    }
+                    HorizontalLayout {
+                        Text { text:"Alerta de disco: mínimo livre (MiB)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-low-disk-mib; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle { width: 40px; height: 32px; background: #e2e8f0; border-radius: 4px;
+                            CheckBox { text: ""; checked <=> root.cfg-free-play; }
+                        }
+                        Text { text: "Modo Festa — reprodução contínua sem consumir créditos"; color: #e2e8f0; vertical-alignment: center; }
+                    }
+                    HorizontalLayout {
+                        Text { text:"Nova senha (vazio mantém a atual)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
+                        LineEdit { text <=> root.cfg-new-pin; input-type:password; }
+                    }
+                    Text { text:"Fundos de vídeo: /dados/fundos · Este menu permanece aberto até você sair."; color:#94a3b8; font-size:12px; wrap:word-wrap; }
+                }
+            }
+            HorizontalLayout {
+                Button { text:"Salvar configurações"; clicked=>{root.save-config({base-cents: root.cfg-base-cents, base-credits: root.cfg-base-credits, pack-cents: root.cfg-pack-cents, pack-credits: root.cfg-pack-credits, large-cents: root.cfg-large-cents, large-credits: root.cfg-large-credits, coin-cents: root.cfg-coin-cents, attract-minutes: root.cfg-attract-minutes, low-disk-mib: root.cfg-low-disk-mib, free-play: root.cfg-free-play, new-pin: root.cfg-new-pin});} }
+                Button { text:"Voltar ao menu"; clicked=>{root.close-config();} }
+            }
+        }
+    }
+    if root.video-fullscreen && root.disk-low : Rectangle {
+        x: 20px; y: 20px; width: min(root.width - 40px, 520px); height: 36px;
+        background: #7f1d1dcc; border-radius: 8px;
+        Text { text: "ARMAZENAMENTO BAIXO · " + root.disk-status;
+            color: #ffffff; font-size: 14px; horizontal-alignment: center;
+            vertical-alignment: center; overflow: elide; }
+    }
+    // ---- Toast ----
+    if root.toast-visible : Rectangle {
+        x: (root.width - self.width) / 2;
+        y: 80px;
+        height: 56px;
+        width: min(root.width - 40px, 560px);
+        border-radius: 14px;
+        background: root.toast-kind == 1 ? #065f46 : (root.toast-kind == 2 ? #7f1d1d : #312e81);
+        drop-shadow-blur: 14px;
+        drop-shadow-color: #00000080;
+        drop-shadow-offset-y: 3px;
+
+        HorizontalLayout {
+            padding-left: 20px;
+            padding-right: 20px;
+            alignment: center;
+
+            toast-text := Text {
+                text: root.toast-message;
+                color: #f8fafc;
+                font-size: 16px;
+                font-weight: 800;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+
 }
