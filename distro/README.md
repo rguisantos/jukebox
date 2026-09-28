@@ -77,10 +77,15 @@ branca do código preservada). Prefira baixar a imagem oficial do Mercado Pago;
 se houver apenas PDF, extraia somente a área do QR em PNG sem alterar seu
 conteúdo. Copie primeiro para um arquivo temporário em `/dados/pix/` e renomeie
 para `qr.png` quando estiver completo. A jukebox verifica alterações a cada
-5 segundos, sem precisar reiniciar. Se faltar a imagem ou ela for inválida,
+5 segundos, sem precisar reiniciar. No PC de teste, o script
+`distro/tools/run-test-pixlogic.sh` inicia o programa dentro de
+`jukebox-app/`. Quando o log do banco indicar `./dados/jukebox.db`, copie
+o QR para `jukebox-app/dados/pix/qr.png` dentro do checkout; o caminho
+`/dados/pix/qr.png` é usado somente quando o banco está em
+`/dados/jukebox.db`. Se faltar a imagem ou ela for inválida,
 a tela informa o motivo e orienta usar o QR físico. A imagem continua visível
 quando não há conexão com o PixLogic; o estado de conexão aparece separado.
-Confira se o PixLogic está configurado e se a partição /dados está montada; a imagem não ativa pagamentos quando o serviço está desativado.
+Confira se o PixLogic está configurado. Na distro, a partição /dados precisa estar montada; a imagem não ativa pagamentos quando o serviço está desativado.
 Antes de colocar em operação, escaneie os códigos da tela e do impresso e
 confira no aplicativo de pagamento se ambos correspondem à máquina correta.
 
