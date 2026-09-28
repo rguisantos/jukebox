@@ -38,6 +38,7 @@
 //!   - `RUST_LOG`           — nível de log do app (padrão: info)
 
 use serde::Deserialize;
+use crate::{db::PendingPix, storage::service::DbHandle};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
@@ -116,7 +117,7 @@ pub struct PixService {
 impl PixService {
     /// Sobe o serviço PIX: cria a std::thread isolada com o runtime Tokio
     /// `current_thread` e retorna imediatamente o handle de controle.
-    pub fn start(config: PixConfig, event_tx: Sender<PixUiEvent>) -> Self {
+    pub fn start(config: PixConfig, event_tx: Sender<PixUiEvent>, storage: DbHandle) -> Self {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<PixCommand>(8);
 
         thread::Builder::new()
@@ -148,7 +149,7 @@ impl PixService {
                     }
                 };
 
-                rt.block_on(pix_main_loop(config, event_tx, cmd_rx));
+                rt.block_on(pix_main_loop(config, event_tx, cmd_rx, storage));
             })
             .expect("Falha crítica ao criar a thread do serviço PIX");
 
@@ -228,6 +229,7 @@ async fn pix_main_loop(
     config: PixConfig,
     event_tx: Sender<PixUiEvent>,
     mut cmd_rx: Receiver<PixCommand>,
+    storage: DbHandle,
 ) {
     // MODO DEMO (JUKEBOX_PIX_DEMO=1): fluxo completo sem backend —
     // QR simulado, pagamento confirmado após DEMO_PAY_DELAY.
@@ -251,6 +253,8 @@ async fn pix_main_loop(
         }
     };
 
+    reconcile_pending(&client, &config, &storage, &event_tx, None).await;
+
     loop {
         // -------------------------------------------------------------------
         // FASE 1 — Obter um QR Code dinâmico do backend (com retry infinito)
@@ -265,6 +269,7 @@ async fn pix_main_loop(
                     // (15s) OU um comando manual de refresh, o que vier 1º.
                     log::warn!("PIX: falha ao gerar QR Code: {}", reason);
                     let _ = event_tx.send(PixUiEvent::Offline { reason });
+                    reconcile_pending(&client, &config, &storage, &event_tx, None).await;
 
                     tokio::select! {
                         _ = tokio::time::sleep(QR_RETRY_DELAY) => continue,
@@ -277,6 +282,16 @@ async fn pix_main_loop(
                 }
             }
         };
+
+        // The QR must be durable before it can be displayed or paid.
+        let pending = PendingPix { machine_id: config.machine_id.clone(), txid: qr.txid.clone(),
+            api_base: config.api_base.clone(), status_path: qr.status_path.clone(), credits: CREDITOS_POR_PIX };
+        if let Err(e) = storage.remember_pix(pending) {
+            log::error!("PIX: falha ao persistir QR antes da exibição: {e}");
+            let _ = event_tx.send(PixUiEvent::Offline { reason: "falha ao registrar QR no armazenamento".into() });
+            tokio::time::sleep(QR_RETRY_DELAY).await;
+            continue;
+        }
 
         // Renderiza o payload EMV em buffer RGB e publica na UI
         match render_qr_to_rgb(&qr.payload) {
@@ -312,10 +327,15 @@ async fn pix_main_loop(
         // Após uma travada de rede, não dispara rajadas de requisições:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // consome o tick imediato do interval()
+        let mut last_reconciliation = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    if last_reconciliation.elapsed() >= Duration::from_secs(60) {
+                        reconcile_pending(&client, &config, &storage, &event_tx, Some(&qr.txid)).await;
+                        last_reconciliation = tokio::time::Instant::now();
+                    }
                     match check_status(&client, &config, &qr).await {
                         Ok(PixStatus::Paid) => {
                             log::info!("PIX: pagamento CONFIRMADO (txid={}).", qr.txid);
@@ -329,6 +349,7 @@ async fn pix_main_loop(
                         }
                         Ok(PixStatus::Expired) => {
                             log::info!("PIX: QR expirado sem pagamento. Renovando...");
+                            let _ = storage.forget_pix(config.machine_id.clone(), qr.txid.clone());
                             break;
                         }
                         Ok(PixStatus::Pending) => {
@@ -478,6 +499,30 @@ enum PixStatus {
     Pending,
     Paid,
     Expired,
+}
+
+/// Recheck QR codes displayed before a restart or replaced via manual refresh.
+/// The storage worker deletes a paid QR in the same transaction as its credit.
+async fn reconcile_pending(client: &reqwest::Client, config: &PixConfig, storage: &DbHandle,
+    events: &Sender<PixUiEvent>, active_txid: Option<&str>) {
+    let pending = match storage.pending_pix() {
+        Ok(pending) => pending,
+        Err(e) => { log::error!("PIX: não foi possível consultar recibos pendentes: {e}"); return; }
+    };
+    for item in pending {
+        if active_txid == Some(item.txid.as_str()) && item.machine_id == config.machine_id { continue; }
+        let old_config = PixConfig { api_base: item.api_base.clone(), machine_id: item.machine_id.clone(), demo: false };
+        let qr = QrInfo { payload: String::new(), txid: item.txid.clone(), status_path: item.status_path };
+        match check_status(client, &old_config, &qr).await {
+            Ok(PixStatus::Paid) => {
+                log::info!("PIX: pagamento pendente recuperado (txid={}).", item.txid);
+                let _ = events.send(PixUiEvent::Paid { machine_id: item.machine_id, txid: item.txid, credits: item.credits });
+            }
+            Ok(PixStatus::Expired) => { let _ = storage.forget_pix(item.machine_id, item.txid); }
+            Ok(PixStatus::Pending) => {}
+            Err(e) => log::warn!("PIX: consulta de pagamento pendente falhou: {e}"),
+        }
+    }
 }
 
 /// POST /api/pix/gerar — solicita um QR Code dinâmico para esta máquina.

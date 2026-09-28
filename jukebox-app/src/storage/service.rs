@@ -1,6 +1,6 @@
 //! Owns the SQLite connection and processes domain commands in order.
 //! Neither commands nor events depend on Slint; the UI bridge lives in main.rs.
-use crate::{db::Database, operator, settings::Settings};
+use crate::{db::{Database, PendingPix}, operator, settings::Settings};
 use crate::state::models::{AlbumInfo, GenreInfo, TrackInfo};
 use std::{sync::mpsc::{self, Receiver, Sender}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
@@ -11,6 +11,9 @@ enum DbCommand {
     RefreshCredits,
     CashPulse,
     AcceptPix { machine_id: String, txid: String, credits: u32 },
+    RememberPix(PendingPix, Sender<Result<(), String>>),
+    PendingPix(Sender<Result<Vec<PendingPix>, String>>),
+    ForgetPix(String, String),
     Authenticate(String),
     LockOperator,
     LoadSettings,
@@ -52,6 +55,19 @@ impl DbHandle {
     pub fn cash_pulse(&self) -> Result<(), String> { self.send(DbCommand::CashPulse) }
     pub fn accept_pix(&self, machine_id: String, txid: String, credits: u32) -> Result<(), String> {
         self.send(DbCommand::AcceptPix { machine_id, txid, credits })
+    }
+    pub fn remember_pix(&self, item: PendingPix) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(DbCommand::RememberPix(item, tx))?;
+        rx.recv_timeout(Duration::from_secs(8)).map_err(|e| e.to_string())?
+    }
+    pub fn pending_pix(&self) -> Result<Vec<PendingPix>, String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(DbCommand::PendingPix(tx))?;
+        rx.recv_timeout(Duration::from_secs(8)).map_err(|e| e.to_string())?
+    }
+    pub fn forget_pix(&self, machine_id: String, txid: String) -> Result<(), String> {
+        self.send(DbCommand::ForgetPix(machine_id, txid))
     }
     pub fn authenticate(&self, pin: String) -> Result<(), String> { self.send(DbCommand::Authenticate(pin)) }
     pub fn lock_operator(&self) -> Result<(), String> { self.send(DbCommand::LockOperator) }
@@ -100,6 +116,17 @@ pub fn spawn(mut db: Database) -> (DbHandle, Receiver<DbEvent>) {
                     Ok((balance, false)) => { log::info!("PIX repetido ignorado: máquina {machine_id}, txid {txid}"); let _ = events.send(DbEvent::Balance(balance)); }
                     Err(e) => toast(&events, format!("Falha ao registrar PIX: {e}"), 2),
                 },
+                DbCommand::RememberPix(item, reply) => {
+                    let _ = reply.send(db.remember_pix(&item).map_err(|e| e.to_string()));
+                }
+                DbCommand::PendingPix(reply) => {
+                    let _ = reply.send(db.pending_pix().map_err(|e| e.to_string()));
+                }
+                DbCommand::ForgetPix(machine_id, txid) => {
+                    if let Err(e) = db.forget_pix(&machine_id, &txid) {
+                        log::error!("Falha ao remover Pix expirado {txid}: {e}");
+                    }
+                }
                 DbCommand::Authenticate(pin) => {
                     if Instant::now() < blocked_until {
                         toast(&events, "Aguarde 30 segundos antes de tentar novamente", 2);
