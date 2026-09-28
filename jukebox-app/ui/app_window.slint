@@ -568,58 +568,6 @@ export component MainWindow inherits Window {
         padding: 0px;
         spacing: 0px;
 
-        // ---- Header enxuto: só o badge de créditos --------------------------
-        Rectangle {
-            height: 56px;
-            background: #0a0b10;
-
-            Text {
-                x:16px; y:8px; width:parent.width - 245px; height:20px;
-                text: "O · " + root.active-genre;
-                color:#cbd5e1; font-size:14px; overflow:elide;
-            }
-            Text {
-                x:16px; y:31px; width:parent.width - 245px; height:18px;
-                text: root.disk-low ? "ARMAZENAMENTO BAIXO · " + root.disk-status : root.disk-status;
-                color:root.disk-low ? #fb7185 : #64748b; font-size:12px; overflow:elide;
-            }
-            Rectangle {
-                x: parent.width - self.width - 24px;
-                y: (parent.height - self.height) / 2;
-                width: 190px;
-                height: 40px;
-                background: #12131c;
-                border-radius: 10px;
-                border-width: 2px;
-                border-color: #f59e0b;
-
-                HorizontalLayout {
-                    padding-left: 14px;
-                    padding-right: 14px;
-                    alignment: center;
-                    spacing: 10px;
-
-                    Text {
-                        text: root.free-play ? "FESTA:" : "CRÉDITOS:";
-                        color: #9ca3af;
-                        font-size: 15px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-
-                    Text {
-                        text: root.free-play ? "LIVRE" : "\{root.credits}";
-                        color: #fbbf24;
-                        font-size: 20px;
-                        font-weight: 800;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-        }
-
-        Rectangle { height: 2px; background: #1e1f2e; }
-
         // ---- Corpo ----------------------------------------------------------
         HorizontalLayout {
             padding: 0px;
@@ -1158,6 +1106,42 @@ export component MainWindow inherits Window {
                 }
             }
         }
+
+        // Saldo sempre visível na base da tela principal.
+        Rectangle {
+            height: 52px;
+            background: #0a0b10;
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 190px;
+                height: 40px;
+                background: #12131c;
+                border-radius: 10px;
+                border-width: 2px;
+                border-color: #f59e0b;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    alignment: center;
+                    spacing: 10px;
+                    Text {
+                        text: root.free-play ? "FESTA:" : "CRÉDITOS:";
+                        color: #9ca3af;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.free-play ? "LIVRE" : "\{root.credits}";
+                        color: #fbbf24;
+                        font-size: 20px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -1446,6 +1430,13 @@ export component MainWindow inherits Window {
                     overflow: elide;
                 }
 
+                Text {
+                    text: root.disk-low ? "ARMAZENAMENTO BAIXO · " + root.disk-status : "DISCO · " + root.disk-status;
+                    color: root.disk-low ? #fb7185 : #94a3b8;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+
                 Rectangle { height: 1px; background: #1e2438; }
 
                 HorizontalLayout {
@@ -1554,7 +1545,7 @@ export component MainWindow inherits Window {
                 spacing: 8px;
 
                 Text {
-                    text: "SELEÇÃO RÁPIDA DE DISCOS (E/R move, I confirma ou aguarde)";
+                    text: "SELEÇÃO RÁPIDA (E volta, R avança, I confirma ou aguarde)";
                     color: #818cf8;
                     font-size: 14px;
                     font-weight: 700;
@@ -2042,13 +2033,6 @@ export component MainWindow inherits Window {
                 Text { text:"Pacotes maiores devem ser múltiplos dos menores. O menu fica aberto até sair."; color:#94a3b8; font-size:12px; horizontal-alignment:center; }
             }
         }
-    }
-    if root.video-fullscreen && root.disk-low : Rectangle {
-        x: 20px; y: 20px; width: min(root.width - 40px, 520px); height: 36px;
-        background: #7f1d1dcc; border-radius: 8px;
-        Text { text: "ARMAZENAMENTO BAIXO · " + root.disk-status;
-            color: #ffffff; font-size: 14px; horizontal-alignment: center;
-            vertical-alignment: center; overflow: elide; }
     }
     // ---- Toast ----
     if root.toast-visible : Rectangle {

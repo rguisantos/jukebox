@@ -577,11 +577,11 @@ impl AppState {
                 _ => None,
             },
             FocusState::AlphabetPicker => match key {
-                'e' | 'w' => {
+                'r' | 'w' => {
                     self.letter_index = (self.letter_index + 1).min(ALPHABET_ITEMS.len() - 1);
                     Some(Action::LetterMoved(self.letter_index))
                 }
-                'r' | 'q' => {
+                'e' | 'q' => {
                     self.letter_index = self.letter_index.saturating_sub(1);
                     Some(Action::LetterMoved(self.letter_index))
                 }
@@ -848,6 +848,17 @@ mod tests {
         assert!(matches!(state.handle_key("o"), Some(Action::Noop)));
         assert_eq!(state.focus, FocusState::BrowsingAlbums);
         assert_eq!(state.active_genre, "Pop");
+    }
+
+    #[test]
+    fn alphabet_picker_uses_e_to_go_back_and_r_to_advance() {
+        let mut state = AppState::new(50, 1);
+        state.handle_key("r_long");
+        assert_eq!(state.focus, FocusState::AlphabetPicker);
+        assert!(matches!(state.handle_key("r"), Some(Action::LetterMoved(1))));
+        assert!(matches!(state.handle_key("e"), Some(Action::LetterMoved(0))));
+        assert!(matches!(state.handle_key("q"), Some(Action::LetterMoved(0))));
+        assert!(matches!(state.handle_key("w"), Some(Action::LetterMoved(1))));
     }
 
     #[test]
