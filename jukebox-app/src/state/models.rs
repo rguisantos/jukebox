@@ -212,7 +212,7 @@ impl FocusState {
 #[derive(Debug, Clone)]
 pub enum Action {
     OpenGenrePicker,
-    SelectGenre(String),
+    SelectGenre,
     OpenSettings,
     SaveSettings,
     SettingsAdjusted { index: usize, direction: i32 },
@@ -570,8 +570,8 @@ impl AppState {
                 'o' => {
                     self.focus = FocusState::BrowsingAlbums;
                     if let Some(genre) = self.available_genres.get(self.selected_genre).cloned() {
-                        self.active_genre = genre.clone();
-                        Some(Action::SelectGenre(genre))
+                        self.active_genre = genre;
+                        Some(Action::SelectGenre)
                     } else { Some(Action::Noop) }
                 }
                 _ => None,
@@ -839,7 +839,7 @@ mod tests {
         assert!(matches!(state.handle_key("o"), Some(Action::OpenGenrePicker)));
         assert_eq!(state.focus, FocusState::GenrePicker);
         state.handle_key("w");
-        assert!(matches!(state.handle_key("o"), Some(Action::SelectGenre(g)) if g == "Pop"));
+        assert!(matches!(state.handle_key("o"), Some(Action::SelectGenre)));
         assert_eq!(state.active_genre, "Pop");
         assert_eq!(state.focus, FocusState::BrowsingAlbums);
         state.handle_key("o");
