@@ -732,6 +732,34 @@ export component MainWindow inherits Window {
                                         font-size: 13px;
                                         vertical-alignment: center;
                                     }
+                                    Rectangle {
+                                        width: 190px;
+                                        height: 40px;
+                                        background: #12131c;
+                                        border-radius: 10px;
+                                        border-width: 2px;
+                                        border-color: #f59e0b;
+                                        HorizontalLayout {
+                                            padding-left: 14px;
+                                            padding-right: 14px;
+                                            alignment: center;
+                                            spacing: 10px;
+                                            Text {
+                                                text: root.free-play ? "FESTA:" : "CRÉDITOS:";
+                                                color: #9ca3af;
+                                                font-size: 15px;
+                                                font-weight: 700;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: root.free-play ? "LIVRE" : "\{root.credits}";
+                                                color: #fbbf24;
+                                                font-size: 20px;
+                                                font-weight: 800;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1107,8 +1135,8 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Saldo sempre visível na base da tela principal.
-        Rectangle {
+        // Nas faixas e durante a carga, o saldo permanece no rodapé.
+        if root.ui-focus != 0 || root.scanning || root.albums.length == 0 : Rectangle {
             height: 52px;
             background: #0a0b10;
             Rectangle {

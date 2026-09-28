@@ -424,16 +424,15 @@ impl AppState {
         let target_index = match letter {
             "*" => self.albums.iter().position(|a| a.is_recent),
             "#" => self.albums.iter().position(|a| {
-                let first = a.artist.chars().next().or_else(|| a.title.chars().next());
-                first.map(|c| !c.is_alphabetic()).unwrap_or(false)
+                let name = if a.artist.trim().is_empty() { &a.title } else { &a.artist };
+                catalog_sort_key(name).chars().next()
+                    .map(|c| !c.is_ascii_alphabetic()).unwrap_or(false)
             }),
             char_str => {
-                let target_char = char_str.chars().next().unwrap().to_ascii_lowercase();
+                let target_char = catalog_sort_key(char_str).chars().next().unwrap();
                 self.albums.iter().position(|a| {
-                    let first = a.artist.chars().next().or_else(|| a.title.chars().next());
-                    first
-                        .map(|c| c.to_ascii_lowercase() == target_char)
-                        .unwrap_or(false)
+                    let name = if a.artist.trim().is_empty() { &a.title } else { &a.artist };
+                    catalog_sort_key(name).chars().next() == Some(target_char)
                 })
             }
         };
@@ -585,7 +584,7 @@ impl AppState {
                     self.letter_index = self.letter_index.saturating_sub(1);
                     Some(Action::LetterMoved(self.letter_index))
                 }
-                'i' => {
+                'i' | 'o' => {
                     let idx = self.letter_index;
                     if let Some(&letter) = ALPHABET_ITEMS.get(idx) {
                         self.jump_to_letter(letter);
@@ -805,6 +804,23 @@ impl AppState {
     }
 }
 
+/// Chave de ordenação do catálogo: ignora acentos sem perder os nomes exibidos.
+pub fn catalog_sort_key(name: &str) -> String {
+    name.trim().chars().flat_map(|ch| {
+        let lower = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
+            'ñ' | 'Ñ' => 'n',
+            _ => ch,
+        };
+        lower.to_lowercase()
+    }).collect()
+}
+
 /// Hash FNV-1a 64-bit — determina a cor do placeholder da capa e o nome do
 /// arquivo de cache de capas (estável entre execuções: a capa nunca "muda
 /// de cor" nem é extraída duas vezes do mesmo disco).
@@ -859,6 +875,28 @@ mod tests {
         assert!(matches!(state.handle_key("e"), Some(Action::LetterMoved(0))));
         assert!(matches!(state.handle_key("q"), Some(Action::LetterMoved(0))));
         assert!(matches!(state.handle_key("w"), Some(Action::LetterMoved(1))));
+    }
+
+    #[test]
+    fn alphabet_picker_confirms_with_o_and_finds_accented_artists() {
+        let mut state = AppState::new(50, 1);
+        state.albums = ["Águia", "Ze Ramalho", "Zé Neto"].into_iter().enumerate()
+            .map(|(i, artist)| AlbumInfo {
+                key: i.to_string(), title: "CD".into(), artist: artist.into(),
+                genre: "Sertanejo".into(), initial: "C".into(), palette: 0,
+                is_recent: false, tracks: vec![],
+            }).collect();
+        state.handle_key("e_long");
+        state.letter_index = ALPHABET_ITEMS.iter().position(|&v| v == "Z").unwrap();
+        assert!(matches!(state.handle_key("o"), Some(Action::ConfirmLetter(_))));
+        assert_eq!(state.album_index, 1);
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+        state.handle_key("r_long");
+        state.letter_index = ALPHABET_ITEMS.iter().position(|&v| v == "A").unwrap();
+        assert!(matches!(state.handle_key("i"), Some(Action::ConfirmLetter(_))));
+        assert_eq!(state.album_index, 0);
+        assert_eq!(catalog_sort_key("Zé Neto"), "ze neto");
+        assert_eq!(catalog_sort_key("Ze Ramalho"), "ze ramalho");
     }
 
     #[test]
