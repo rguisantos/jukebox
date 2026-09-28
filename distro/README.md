@@ -80,6 +80,21 @@ grava o arquivo com permissão `0600`, sem mostrar o token. Desligue a ESP que
 usa esse mesmo UUID antes de iniciar a jukebox: dois clientes simultâneos
 podem disputar o mesmo crédito reservado. Reinicie a jukebox após instalar.
 
+No PC de desenvolvimento, sem partição `JUKEBOX_DATA`, execute **sem sudo**:
+
+```sh
+python3 distro/tools/install-test-pixlogic.py \
+  /home/bilhares/Downloads/sistemapix-b4450dba-3931-486c-b7ef-57709e724684.ino --local
+sh distro/tools/run-test-pixlogic.sh
+```
+
+O perfil fica em `~/.config/jukebox/jukebox.env`, fora do repositório. O script
+de execução carrega as variáveis no processo e inicia `cargo run --release` na
+pasta do aplicativo. Se `/dados` existir sem estar montado, verifique esse
+diretório antes de receber créditos: o app poderia escolhê-lo como local do
+banco de dados. Em qualquer modo, não rode a ESP e a jukebox com o mesmo UUID
+ao mesmo tempo.
+
 ## Instalar no disco
 
 Inicie pela ISO. Com teclado de manutenção, execute:
