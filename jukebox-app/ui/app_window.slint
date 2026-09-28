@@ -274,17 +274,18 @@ component OperatorMenuRow inherits Rectangle {
     }
 
     HorizontalLayout {
-        padding-left: 26px;
-        padding-right: 26px;
-        spacing: 16px;
+        padding-left: 18px;
+        padding-right: 18px;
+        spacing: 10px;
 
         Text {
             text: root.label;
             color: root.index == root.selected-index ? #f8fafc : #cbd5e1;
-            font-size: 15px;
+            font-size: 14px;
             font-weight: 700;
             vertical-alignment: center;
             horizontal-stretch: 1;
+            overflow: elide;
         }
 
         Text {
@@ -295,7 +296,7 @@ component OperatorMenuRow inherits Rectangle {
             font-weight: 800;
             vertical-alignment: center;
             overflow: elide;
-            width: 250px;
+            width: 180px;
             horizontal-alignment: right;
         }
     }
@@ -705,7 +706,7 @@ export component MainWindow inherits Window {
                                     alignment: start;
 
                                     Rectangle {
-                                        width: 320px;
+                                        width: 300px;
                                         height: 40px;
                                         background: cta-touch.has-hover ? #4f46e5 : #6366f1;
                                         border-radius: 10px;
@@ -717,7 +718,7 @@ export component MainWindow inherits Window {
                                         }
 
                                         Text {
-                                            text: "APERE O BOTÃO ESCOLHER PARA ABRIR O ÁLBUM";
+                                            text: "APERTE ESCOLHER PARA ABRIR O ÁLBUM";
                                             color: #ffffff;
                                             font-size: 12px;
                                             font-weight: 800;
@@ -731,34 +732,6 @@ export component MainWindow inherits Window {
                                         color: #64748b;
                                         font-size: 13px;
                                         vertical-alignment: center;
-                                    }
-                                    Rectangle {
-                                        width: 190px;
-                                        height: 40px;
-                                        background: #12131c;
-                                        border-radius: 10px;
-                                        border-width: 2px;
-                                        border-color: #f59e0b;
-                                        HorizontalLayout {
-                                            padding-left: 14px;
-                                            padding-right: 14px;
-                                            alignment: center;
-                                            spacing: 10px;
-                                            Text {
-                                                text: root.free-play ? "FESTA:" : "CRÉDITOS:";
-                                                color: #9ca3af;
-                                                font-size: 15px;
-                                                font-weight: 700;
-                                                vertical-alignment: center;
-                                            }
-                                            Text {
-                                                text: root.free-play ? "LIVRE" : "\{root.credits}";
-                                                color: #fbbf24;
-                                                font-size: 20px;
-                                                font-weight: 800;
-                                                vertical-alignment: center;
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -1172,6 +1145,39 @@ export component MainWindow inherits Window {
         }
     }
 
+    // A linha do botão pertence ao painel esquerdo; o crédito é ancorado
+    // no centro da janela inteira, na mesma altura do botão.
+    if !root.video-fullscreen && root.ui-focus == 0 && !root.scanning && root.albums.length > 0 : Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - 72px;
+        width: 190px;
+        height: 40px;
+        background: #12131c;
+        border-radius: 10px;
+        border-width: 2px;
+        border-color: #f59e0b;
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            alignment: center;
+            spacing: 10px;
+            Text {
+                text: root.free-play ? "FESTA:" : "CRÉDITOS:";
+                color: #9ca3af;
+                font-size: 15px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.free-play ? "LIVRE" : "\{root.credits}";
+                color: #fbbf24;
+                font-size: 20px;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+        }
+    }
+
     // =========================================================================
     // OVERLAYS
     // =========================================================================
@@ -1238,252 +1244,185 @@ export component MainWindow inherits Window {
 
     // ---- Menu do operador ----
     if root.ui-focus == 3 : Rectangle {
-        x: 0; y: 0;
         width: root.width;
         height: root.height;
         background: #000000e6;
-
         TouchArea { }
 
         Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: min(660px, root.width - 16px);
-            height: min(660px, root.height - 16px);
+            width: min(784px, root.width - 24px);
+            height: min(740px, root.height - 16px);
             background: #0d0e14;
-            border-radius: 16px;
+            border-radius: 18px;
             border-width: 2px;
             border-color: #f59e0b;
             drop-shadow-blur: 18px;
             drop-shadow-color: #000000a0;
+            clip: true;
 
             VerticalLayout {
-                padding: 16px;
-                spacing: 6px;
+                padding: 18px;
+                spacing: 5px;
 
                 Text {
                     text: "MENU DO OPERADOR";
-                    color: #f59e0b;
+                    color: #fbbf24;
                     font-size: 22px;
                     font-weight: 800;
                     horizontal-alignment: center;
                 }
-
-                Rectangle {
-                    height: 52px;
-                    background: #12131c;
-                    border-radius: 10px;
-                    border-width: 1px;
-                    border-color: #1e2438;
-
-                    HorizontalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 2px;
-
-                            HorizontalLayout {
-                                alignment: center;
-                                spacing: 8px;
-                                Text {
-                                    text: "ODÔMETRO:";
-                                    color: #64748b;
-                                    font-size: 12px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: "\{root.op-absolute-coins}";
-                                    color: #fbbf24;
-                                    font-size: 20px;
-                                    font-weight: 800;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            // Receita total acumulada em R$ — conferência
-                            // patrimonial junto ao odômetro de créditos.
-                            Text {
-                                text: "Moedeiro: " + root.op-total-revenue;
-                                color: #34d399;
-                                font-size: 13px;
-                                font-weight: 800;
-                                horizontal-alignment: center;
-                            }
-                        }
-
-                        Rectangle { width: 1px; background: #1e2438; }
-
-                        HorizontalLayout {
-                            alignment: center;
-                            spacing: 8px;
-                            Text {
-                                text: "CAIXA ATUAL:";
-                                color: #64748b;
-                                font-size: 12px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                text: "\{root.op-partial-coins}";
-                                color: #34d399;
-                                font-size: 20px;
-                                font-weight: 800;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle { width: 1px; background: #1e2438; }
-
-                        HorizontalLayout {
-                            alignment: center;
-                            spacing: 8px;
-                            Text {
-                                text: "PREÇO:";
-                                color: #64748b;
-                                font-size: 12px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                text: root.op-song-price == 1
-                                    ? "1 CRÉDITO"
-                                    : "\{root.op-song-price} CRÉDITOS";
-                                color: #38bdf8;
-                                font-size: 20px;
-                                font-weight: 800;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-
-                Rectangle { height: 1px; background: #1e2438; }
-
-                OperatorMenuRow {
-                    index: 0;
-                    selected-index: root.op-menu-index;
-                    label: "⇅  SINCRONIZAR PENDRIVE";
-                    value: "iniciar agora";
-                    actionable: true;
-                    danger: false;
-                }
-
-                OperatorMenuRow {
-                    index: 1;
-                    selected-index: root.op-menu-index;
-                    label: "PREÇO DA MÚSICA";
-                    value: root.op-song-price == 1
-                        ? "1 crédito"
-                        : "\{root.op-song-price} créditos";
-                    actionable: true;
-                    danger: false;
-                }
-
-                OperatorMenuRow {
-                    index: 2;
-                    selected-index: root.op-menu-index;
-                    label: "DIAS RECÉM-ADICIONADOS (*)";
-                    value: "\{root.op-recent-days} dias";
-                    actionable: true;
-                    danger: false;
-                }
-
-                OperatorMenuRow {
-                    index: 3;
-                    selected-index: root.op-menu-index;
-                    label: "BLOQUEAR GÊNEROS";
-                    value: "abrir lista";
-                    actionable: true;
-                    danger: false;
-                }
-
-                OperatorMenuRow {
-                    index: 4;
-                    selected-index: root.op-menu-index;
-                    label: "✕  ZERAR CAIXA PARCIAL";
-                    value: "\{root.op-partial-coins} créditos";
-                    actionable: true;
-                    danger: true;
-                }
-
-                OperatorMenuRow {
-                    index: 5;
-                    selected-index: root.op-menu-index;
-                    label: "✕  ZERAR CRÉDITOS ATUAIS";
-                    value: "\{root.credits} créditos";
-                    actionable: true;
-                    danger: true;
-                }
-
-                OperatorMenuRow {
-                    index: 6;
-                    selected-index: root.op-menu-index;
-                    label: "DESLIGAR MÁQUINA";
-                    value: "desligar";
-                    actionable: true;
-                    danger: true;
-                }
-
-                OperatorMenuRow {
-                    index: 7;
-                    selected-index: root.op-menu-index;
-                    label: "CONFIGURAR WI-FI";
-                    value: "redes e conexão";
-                    actionable: true;
-                    danger: false;
-                }
-                OperatorMenuRow {
-                    index: 8;
-                    selected-index: root.op-menu-index;
-                    label: "ATUALIZAR ACERVO ONLINE";
-                    value: "verificar agora";
-                    actionable: true;
-                    danger: false;
-                }
-                OperatorMenuRow {
-                    index:9; selected-index:root.op-menu-index;
-                    label:"PACOTES, FESTA E AUTOMAÇÃO"; value:"configurar"; actionable:true; danger:false;
-                }
-                OperatorMenuRow {
-                    index:10; selected-index:root.op-menu-index;
-                    label:"VOLTAR À JUKEBOX"; value:"O confirma"; actionable:true; danger:false;
-                }
                 Text {
-                    text: root.online-status;
-                    color: #38bdf8;
+                    text: "CONFIGURAÇÃO E MANUTENÇÃO";
+                    color: #94a3b8;
                     font-size: 12px;
-                    overflow: elide;
+                    font-weight: 700;
+                    horizontal-alignment: center;
                 }
-
-                Text {
-                    text: root.disk-low ? "ARMAZENAMENTO BAIXO · " + root.disk-status : "DISCO · " + root.disk-status;
-                    color: root.disk-low ? #fb7185 : #94a3b8;
-                    font-size: 12px;
-                    overflow: elide;
-                }
-
-                Rectangle { height: 1px; background: #1e2438; }
 
                 HorizontalLayout {
-                    spacing: 12px;
+                    height: 68px;
+                    spacing: 8px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: #161a27;
+                        border-radius: 10px;
+                        VerticalLayout {
+                            padding-left: 12px; padding-right: 12px;
+                            alignment: center; spacing: 2px;
+                            Text { text: "ODÔMETRO"; color: #94a3b8; font-size: 11px; font-weight: 700; }
+                            Text { text: "\{root.op-absolute-coins} créditos"; color: #fbbf24; font-size: 18px; font-weight: 800; overflow: elide; }
+                            Text { text: "Moedeiro: " + root.op-total-revenue; color: #34d399; font-size: 11px; overflow: elide; }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: #161a27;
+                        border-radius: 10px;
+                        VerticalLayout {
+                            padding-left: 12px; padding-right: 12px;
+                            alignment: center; spacing: 2px;
+                            Text { text: "CAIXA ATUAL"; color: #94a3b8; font-size: 11px; font-weight: 700; }
+                            Text { text: "\{root.op-partial-coins} créditos"; color: #34d399; font-size: 18px; font-weight: 800; overflow: elide; }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: #161a27;
+                        border-radius: 10px;
+                        VerticalLayout {
+                            padding-left: 12px; padding-right: 12px;
+                            alignment: center; spacing: 2px;
+                            Text { text: "PREÇO POR MÚSICA"; color: #94a3b8; font-size: 11px; font-weight: 700; }
+                            Text {
+                                text: root.op-song-price == 1 ? "1 crédito" : "\{root.op-song-price} créditos";
+                                color: #38bdf8; font-size: 18px; font-weight: 800; overflow: elide;
+                            }
+                        }
+                    }
+                }
 
+                Rectangle { height: 1px; background: #25293a; }
+
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 0; selected-index: root.op-menu-index;
+                    label: "⇅  SINCRONIZAR PENDRIVE"; value: "iniciar agora";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 1; selected-index: root.op-menu-index;
+                    label: "PREÇO DA MÚSICA"; value: root.op-song-price == 1 ? "1 crédito" : "\{root.op-song-price} créditos";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 2; selected-index: root.op-menu-index;
+                    label: "DIAS RECÉM-ADICIONADOS (*)"; value: "\{root.op-recent-days} dias";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 3; selected-index: root.op-menu-index;
+                    label: "BLOQUEAR GÊNEROS"; value: "abrir lista";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 4; selected-index: root.op-menu-index;
+                    label: "✕  ZERAR CAIXA PARCIAL"; value: "\{root.op-partial-coins} créditos";
+                    actionable: true; danger: true;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 5; selected-index: root.op-menu-index;
+                    label: "✕  ZERAR CRÉDITOS ATUAIS"; value: "\{root.credits} créditos";
+                    actionable: true; danger: true;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 6; selected-index: root.op-menu-index;
+                    label: "DESLIGAR MÁQUINA"; value: "desligar";
+                    actionable: true; danger: true;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 7; selected-index: root.op-menu-index;
+                    label: "CONFIGURAR WI-FI"; value: "redes e conexão";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 8; selected-index: root.op-menu-index;
+                    label: "ATUALIZAR ACERVO ONLINE"; value: "verificar agora";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 9; selected-index: root.op-menu-index;
+                    label: "PACOTES, FESTA E AUTOMAÇÃO"; value: "configurar";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 36px;
+                    index: 10; selected-index: root.op-menu-index;
+                    label: "VOLTAR À JUKEBOX"; value: "O confirma";
+                    actionable: true; danger: false;
+                }
+
+                Rectangle { height: 1px; background: #25293a; }
+                Rectangle {
+                    height: 54px;
+                    background: #121622;
+                    border-radius: 9px;
+                    VerticalLayout {
+                        padding-left: 12px; padding-right: 12px;
+                        padding-top: 7px; padding-bottom: 7px;
+                        spacing: 2px;
+                        Text {
+                            text: root.online-status;
+                            color: #38bdf8; font-size: 12px; overflow: elide;
+                        }
+                        Text {
+                            text: root.disk-low ? "ARMAZENAMENTO BAIXO · " + root.disk-status : "DISCO · " + root.disk-status;
+                            color: root.disk-low ? #fb7185 : #94a3b8;
+                            font-size: 12px; overflow: elide;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 12px;
                     Text {
                         text: root.op-ip != "" ? "IP: \{root.op-ip}" : "IP: consultando...";
-                        color: #64748b;
-                        font-size: 12px;
-                        vertical-alignment: center;
+                        color: #94a3b8; font-size: 12px; overflow: elide;
+                        vertical-alignment: center; horizontal-stretch: 1;
                     }
-
                     Text {
                         text: "Q/W/E/R navega   ·   O confirma";
-                        color: #64748b;
-                        font-size: 12px;
-                        horizontal-alignment: right;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
+                        color: #94a3b8; font-size: 12px;
+                        horizontal-alignment: right; vertical-alignment: center;
                     }
                 }
             }
