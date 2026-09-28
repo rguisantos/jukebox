@@ -39,7 +39,10 @@ Sem essa partição, a sessão live serve para demonstração e seus dados podem
 ser descartados no reboot. Não use esse modo para receber dinheiro.
 
 A configuração da máquina é `/dados/jukebox.env`. Não coloque comandos nesse
-arquivo: ele é carregado pelo launcher como configuração shell. O padrão do
+arquivo: ele é carregado pelo launcher como configuração shell.
+O launcher verifica se `/dados` está montado. Se não estiver, desativa Pix,
+PixLogic e pulsos de dinheiro e informa na tela que pagamentos estão
+indisponíveis. A reprodução de demonstração continua disponível.
 Para usar a entrega automática de créditos pelo PixLogic, configure os três
 valores `JUKEBOX_PIXLOGIC_API` (origem HTTPS, sem `/api`),
 `JUKEBOX_PIXLOGIC_UUID` e `JUKEBOX_PIXLOGIC_TOKEN` (credencial de 64 caracteres).
