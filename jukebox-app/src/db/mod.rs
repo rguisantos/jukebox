@@ -637,8 +637,9 @@ impl Database {
     // MÓDULO 7 — Catálogo agrupado por álbum (navegação por capas)
     // =========================================================================
 
-    /// Catálogo agrupado por (artista, álbum), ordenado para o carrossel:
-    /// gênero → artista → álbum → faixa.
+    /// Cada pasta de mídia é um CD, mesmo quando as tags das faixas divergem.
+    /// Na raiz de músicas, onde não há pasta de CD, preserva o agrupamento ID3.
+    /// O carrossel é ordenado por artista e depois pelo nome do disco.
     pub fn get_albums(&self) -> Result<Vec<AlbumInfo>> {
         let recent_days = self.get_recent_days().unwrap_or(30);
         let now_secs = std::time::SystemTime::now()
@@ -651,8 +652,7 @@ impl Database {
             "SELECT id, title, artist, album, file_path, file_type, genre, COALESCE(created_at, 0)
              FROM tracks
              WHERE genre NOT IN (SELECT genre FROM blocked_genres)
-             ORDER BY genre COLLATE NOCASE ASC,
-                      artist COLLATE NOCASE ASC,
+             ORDER BY artist COLLATE NOCASE ASC,
                       album COLLATE NOCASE ASC,
                       title COLLATE NOCASE ASC;",
         )?;
@@ -677,24 +677,38 @@ impl Database {
         let mut index: HashMap<String, usize> = HashMap::new();
 
         for (track, created_at) in rows {
-            let key = format!("{}|{}", track.artist, track.album);
+            let folder = std::path::Path::new(&track.file_path).parent();
+            let folder = folder.filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("musicas"));
+            let key = folder.map(|p| format!("dir:{}", p.display()))
+                .unwrap_or_else(|| format!("tag:{}|{}", track.artist, track.album));
+            let folder_title = folder.and_then(|p| p.file_name()).and_then(|n| n.to_str());
+            let folder_artist = folder.and_then(|p| p.parent())
+                .and_then(|p| p.file_name()).and_then(|n| n.to_str())
+                .filter(|name| !name.eq_ignore_ascii_case("musicas"));
             let is_recent = created_at >= cutoff_secs;
 
             match index.get(&key) {
                 Some(&position) => {
                     let alb = &mut albums[position];
+                    if folder_artist.is_none() && !alb.artist.eq_ignore_ascii_case(&track.artist) {
+                        alb.artist = "Vários Artistas".into();
+                    }
+                    if !alb.genre.eq_ignore_ascii_case(&track.genre) {
+                        alb.genre = "Vários gêneros".into();
+                    }
                     alb.tracks.push(track);
                     if is_recent {
                         alb.is_recent = true;
                     }
                 }
                 None => {
-                    let initial = album_initial(&track.album);
+                    let title = folder_title.unwrap_or(&track.album).to_string();
+                    let initial = album_initial(&title);
                     let palette = (fnv64(&key) % 6) as u32;
                     index.insert(key.clone(), albums.len());
                     albums.push(AlbumInfo {
-                        title: track.album.clone(),
-                        artist: track.artist.clone(),
+                        title,
+                        artist: folder_artist.unwrap_or(&track.artist).to_string(),
                         genre: track.genre.clone(),
                         key,
                         initial,
@@ -705,6 +719,15 @@ impl Database {
                 }
             }
         }
+
+        for album in &mut albums {
+            album.tracks.sort_by(|a, b| a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase()));
+        }
+        albums.sort_by(|a, b| {
+            a.artist.to_lowercase().cmp(&b.artist.to_lowercase())
+                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                .then_with(|| a.key.cmp(&b.key))
+        });
 
         Ok(albums)
     }
@@ -875,6 +898,28 @@ mod queue_tests {
         };
         db.create_tables().unwrap();
         db
+    }
+    #[test]
+    fn each_directory_is_one_cd_even_with_inconsistent_tags() {
+        let db = database();
+        for i in 0..20 {
+            db.conn.execute(
+                "INSERT INTO tracks(title,artist,album,file_path,file_type,genre) VALUES(?1,?2,?3,?4,'mp3',?5)",
+                params![format!("Faixa {i}"), if i == 0 { "Zeca" } else { "Outro" },
+                    format!("Disco {i}"), format!("/dados/musicas/Zeca/CD 01/{i:02}.mp3"),
+                    if i == 0 { "Rock" } else { "Pop" }],
+            ).unwrap();
+        }
+        db.conn.execute(
+            "INSERT INTO tracks(title,artist,album,file_path,file_type,genre) VALUES('A','Ana','Outro','/dados/musicas/Ana/CD 02/a.mp3','mp3','Pop')",
+            [],
+        ).unwrap();
+        let albums = db.get_albums().unwrap();
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].artist, "Ana");
+        assert_eq!(albums[1].artist, "Zeca");
+        assert_eq!(albums[1].title, "CD 01");
+        assert_eq!(albums[1].tracks.len(), 20);
     }
     #[test]
     fn reset_credit_clears_bonus_and_fraction_without_resetting_receipts() {

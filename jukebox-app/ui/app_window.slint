@@ -405,6 +405,8 @@ export component MainWindow inherits Window {
     in-out property <int> op-recent-days: 30;
     in-out property <int> op-recent-days-edit: 30;
     in-out property <int> selected-letter-index: 0;
+    in-out property <[string]> genre-options: [];
+    in-out property <int> selected-genre-index: 0;
     in-out property <[GenreData]> op-genres: [];
     in-out property <int> op-genre-index: 0;
 
@@ -480,7 +482,7 @@ export component MainWindow inherits Window {
         property <bool> is-long: false;
 
         key-timer := Timer {
-            interval: 600ms;
+            interval: 3000ms;
             running: false;
             triggered => {
                 keyboard-handler.is-long = true;
@@ -493,9 +495,9 @@ export component MainWindow inherits Window {
         }
 
         key-released(event) => {
-            if (root.ui-focus == 0 && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
+            if (keyboard-handler.last-key != "" && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
                 key-timer.running = false;
-                if (!keyboard-handler.is-long) {
+                if (!keyboard-handler.is-long && root.ui-focus == 0) {
                     root.arcade-key-pressed(event.text);
                 }
                 keyboard-handler.is-long = false;
@@ -687,29 +689,24 @@ export component MainWindow inherits Window {
                                 floor(root.selected-album / 4);
                             property <int> current-page:
                                 floor(self.selected-row / 2);
-                            property <length> off-y:
-                                self.current-page * 2 * self.pitch-v;
-
-                            // Teto de linhas — 32 linhas × 4 = 128 discos
-                            for row in 32 : Rectangle {
-                                visible: (row * 4) < root.albums.length;
+                            // Apenas as oito capas da página atual são instanciadas.
+                            for row in 2 : Rectangle {
+                                visible: (carousel.current-page * 2 + row) * 4 < root.albums.length;
                                 x: carousel.margin-x;
-                                y: carousel.margin-y
-                                   + row * carousel.pitch-v
-                                   - carousel.off-y;
+                                y: carousel.margin-y + row * carousel.pitch-v;
                                 width: carousel.grid-w;
                                 height: carousel.cap-size;
                                 background: transparent;
 
                                 for col in 4 : AlbumCard {
-                                    visible: (row * 4 + col) < root.albums.length;
+                                    visible: (carousel.current-page * 2 + row) * 4 + col < root.albums.length;
                                     x: col * carousel.pitch-h;
                                     y: 0;
                                     size: carousel.cap-size;
-                                    index: row * 4 + col;
-                                    album: root.albums[row * 4 + col];
+                                    index: (carousel.current-page * 2 + row) * 4 + col;
+                                    album: root.albums[(carousel.current-page * 2 + row) * 4 + col];
                                     is-selected:
-                                        (row * 4 + col) == root.selected-album;
+                                        (carousel.current-page * 2 + row) * 4 + col == root.selected-album;
                                     activated(i) => { root.album-activated(i); }
                                 }
                             }
@@ -1468,6 +1465,65 @@ export component MainWindow inherits Window {
                         horizontal-alignment: right;
                         horizontal-stretch: 1;
                         vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Escolha pública de gêneros ----
+    if root.ui-focus == 8 : Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #000000bf;
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 520px;
+            height: min(570px, root.height - 60px);
+            background: #0d0e14;
+            border-radius: 16px;
+            border-width: 2px;
+            border-color: #818cf8;
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 14px;
+                Text {
+                    text: "ESCOLHA UM GÊNERO";
+                    color: #818cf8;
+                    font-size: 22px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Q/W/E/R: navegar   •   O: confirmar";
+                    color: #94a3b8;
+                    font-size: 14px;
+                }
+                genre-picker-list := ListView {
+                    for genre[idx] in root.genre-options : Rectangle {
+                        height: 48px;
+                        background: idx == root.selected-genre-index ? #4338ca : #1e2438;
+                        border-radius: 6px;
+                        Text {
+                            text: genre;
+                            color: #ffffff;
+                            font-size: 18px;
+                            vertical-alignment: center;
+                            x: 16px;
+                            width: parent.width - 32px;
+                            height: parent.height;
+                        }
+                    }
+                    property <int> sel: root.selected-genre-index;
+                    changed sel => {
+                        if (self.sel * 48px < -self.viewport-y) {
+                            self.viewport-y = 0px - self.sel * 48px;
+                        } else if ((self.sel + 1) * 48px > -self.viewport-y + self.height) {
+                            self.viewport-y = self.height - (self.sel + 1) * 48px;
+                        }
                     }
                 }
             }

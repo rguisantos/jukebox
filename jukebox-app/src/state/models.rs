@@ -33,12 +33,12 @@ impl TrackInfo {
     }
 }
 
-/// Um disco do catálogo: agrupamento de faixas por (artista, álbum).
+/// Um disco do catálogo: uma pasta de mídia ou, na raiz, um álbum ID3.
 /// Base da navegação em duas camadas do Módulo 7 — primeiro escolhe-se o
 /// disco no carrossel de capas, depois a faixa dentro dele.
 #[derive(Debug, Clone)]
 pub struct AlbumInfo {
-    /// Chave de agrupamento estável ("artista|álbum") — também indexa as capas
+    /// Chave de agrupamento estável (caminho da pasta) — também indexa as capas
     pub key: String,
     /// Título do álbum
     pub title: String,
@@ -170,6 +170,7 @@ pub enum FocusState {
     OperatorGenreMenu,
     /// Régua de seleção rápida alfabética e recém-adicionados (*)
     AlphabetPicker,
+    GenrePicker,
     /// Submenu de dias recém-adicionados (W/Q alteram, O/U salvam)
     OperatorRecentDaysMenu,
 }
@@ -186,6 +187,7 @@ impl FocusState {
             FocusState::OperatorPriceMenu => 4,
             FocusState::OperatorGenreMenu => 5,
             FocusState::AlphabetPicker => 6,
+            FocusState::GenrePicker => 8,
             FocusState::OperatorRecentDaysMenu => 7,
         }
     }
@@ -209,7 +211,8 @@ impl FocusState {
 /// A máquina permanece pura: nenhum canal, banco ou UI é tocado aqui dentro.
 #[derive(Debug, Clone)]
 pub enum Action {
-    CycleGenre,
+    OpenGenrePicker,
+    SelectGenre(String),
     OpenSettings,
     SaveSettings,
     SettingsAdjusted { index: usize, direction: i32 },
@@ -303,6 +306,8 @@ pub struct AppState {
     pub settings_index: usize,
     pub submenu_action: usize,
     pub active_genre: String,
+    pub available_genres: Vec<String>,
+    pub selected_genre: usize,
     pub last_navigation: std::time::Instant,
     pub last_overlay_interaction: std::time::Instant,
     pub fullscreen: bool,
@@ -348,6 +353,8 @@ impl AppState {
             settings_index: 0,
             submenu_action: 0,
             active_genre: String::new(),
+            available_genres: vec![String::new()],
+            selected_genre: 0,
             last_navigation: std::time::Instant::now(),
             last_overlay_interaction: std::time::Instant::now(),
             fullscreen: false,
@@ -494,7 +501,12 @@ impl AppState {
                 _ => None,
             },
             FocusState::BrowsingAlbums => match key {
-                'o' => Some(Action::CycleGenre),
+                'o' => {
+                    self.focus = FocusState::GenrePicker;
+                    self.selected_genre = self.available_genres.iter()
+                        .position(|genre| genre == &self.active_genre).unwrap_or(0);
+                    Some(Action::OpenGenrePicker)
+                },
                 'e' => {
                     if !self.albums.is_empty() {
                         self.album_index = self.album_index.saturating_sub(1);
@@ -546,6 +558,24 @@ impl AppState {
                 _ => None,
             },
 
+            FocusState::GenrePicker => match key {
+                'w' | 'r' => {
+                    self.selected_genre = (self.selected_genre + 1).min(self.available_genres.len());
+                    Some(Action::Noop)
+                }
+                'q' | 'e' => {
+                    self.selected_genre = self.selected_genre.saturating_sub(1);
+                    Some(Action::Noop)
+                }
+                'o' => {
+                    self.focus = FocusState::BrowsingAlbums;
+                    if let Some(genre) = self.available_genres.get(self.selected_genre).cloned() {
+                        self.active_genre = genre.clone();
+                        Some(Action::SelectGenre(genre))
+                    } else { Some(Action::Noop) }
+                }
+                _ => None,
+            },
             FocusState::AlphabetPicker => match key {
                 'e' | 'w' => {
                     self.letter_index = (self.letter_index + 1).min(ALPHABET_ITEMS.len() - 1);
@@ -801,6 +831,39 @@ pub fn album_initial(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn genre_picker_selects_and_goes_back_with_o() {
+        let mut state = AppState::new(50, 1);
+        state.available_genres = vec![String::new(), "Pop".into(), "Rock".into()];
+        assert!(matches!(state.handle_key("o"), Some(Action::OpenGenrePicker)));
+        assert_eq!(state.focus, FocusState::GenrePicker);
+        state.handle_key("w");
+        assert!(matches!(state.handle_key("o"), Some(Action::SelectGenre(g)) if g == "Pop"));
+        assert_eq!(state.active_genre, "Pop");
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+        state.handle_key("o");
+        state.handle_key("w");
+        state.handle_key("w");
+        assert!(matches!(state.handle_key("o"), Some(Action::Noop)));
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+        assert_eq!(state.active_genre, "Pop");
+    }
+
+    #[test]
+    fn alphabet_picker_jumps_past_first_carousel_page() {
+        let mut state = AppState::new(50, 1);
+        state.albums = (0..5000).map(|i| AlbumInfo {
+            key: format!("cd-{i}"), title: format!("CD {i}"),
+            artist: if i < 4999 { "Ana" } else { "Zeca" }.into(),
+            genre: "Rock".into(), initial: "C".into(), palette: 0,
+            is_recent: false, tracks: vec![],
+        }).collect();
+        assert!(matches!(state.handle_key("e_long"), Some(Action::OpenAlphabetPicker)));
+        state.jump_to_letter("Z");
+        assert_eq!(state.album_index, 4999);
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+    }
 
     #[test]
     fn catalog_refresh_preserves_selection_in_large_library() {
