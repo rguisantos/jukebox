@@ -421,6 +421,7 @@ export component MainWindow inherits Window {
     in property <image> pix-qr-image;
     in property <bool> pixlogic-mode: false;
     in property <bool> pixlogic-has-qr: false;
+    in property <string> pix-qr-error: "";
     in property <bool> pix-loading: true;
     in property <bool> pix-offline: false;
     in property <string> pix-error-text: "";
@@ -1040,7 +1041,17 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         spacing: 12px;
-                                        Text { text: "USE O QR FÍSICO\nDA MÁQUINA"; color: #0f766e; font-size: 16px; font-weight: 800; horizontal-alignment: center; }
+                                        Text {
+                                            text: root.pix-qr-error == ""
+                                                ? "USE O QR FÍSICO\nDA MÁQUINA"
+                                                : "QR NA TELA INDISPONÍVEL\n" + root.pix-qr-error;
+                                            color: root.pix-qr-error == "" ? #0f766e : #b45309;
+                                            font-size: root.pix-qr-error == "" ? 16px : 13px;
+                                            font-weight: 800;
+                                            width: parent.width - 20px;
+                                            horizontal-alignment: center;
+                                            wrap: word-wrap;
+                                        }
                                     }
                                 }
 
