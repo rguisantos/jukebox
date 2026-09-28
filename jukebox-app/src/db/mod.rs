@@ -49,7 +49,7 @@ impl Database {
     }
 
     /// Determina o caminho ideal para o banco de dados
-    fn resolve_db_path() -> PathBuf {
+    pub(crate) fn resolve_db_path() -> PathBuf {
         let prod_dir = Path::new("/dados");
         if prod_dir.exists() && prod_dir.is_dir() {
             prod_dir.join("jukebox.db")
