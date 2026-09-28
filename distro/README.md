@@ -26,6 +26,21 @@ Os pacotes Debian acompanham as atualizações do repositório: o build ainda n�
 A ISO deve ser validada em BIOS e UEFI sem Secure Boot e nas placas reais antes
 de distribuição. A verificação estática não comprova boot, áudio, GPU ou Wi-Fi.
 
+## Clipes aleatórios para músicas sem vídeo
+
+A distro cria `/dados/fundos/` na partição `JUKEBOX_DATA`. Coloque ali clipes
+`.mp4`, `.mpeg` ou `.wmv` (inclusive em subpastas). O player escolhe um vídeo
+aleatório, sem som, enquanto toca uma música só de áudio. Ao terminar um clipe,
+escolhe outro; músicas que já têm vídeo mostram o próprio vídeo. Sem clipes,
+a música continua normalmente, sem imagem de fundo.
+
+Para instalar pelo pendrive, crie uma pasta **`fundos` na raiz do pendrive**,
+com os vídeos dentro. Exemplo: `fundos/festa.mp4`. Ao inserir o pendrive ou
+forçar a sincronização no menu do operador, esses arquivos vão para
+`/dados/fundos/`, fora de `/dados/musicas/` e do carrossel. O player
+recarrega a lista após a importação, inclusive quando uma música já estiver
+tocando. Vídeos nas demais pastas do pendrive entram no catálogo como faixas.
+
 ## Inicialização e armazenamento
 
 `systemd → jukebox-data → sessão Xorg/Openbox → aplicativo`.
