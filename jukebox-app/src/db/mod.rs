@@ -476,7 +476,9 @@ impl Database {
     }
     pub fn random_track(&self, exclude: Option<&str>) -> Result<Option<TrackInfo>> {
         self.conn.query_row("SELECT id,title,artist,album,file_path,file_type,genre FROM tracks
-            WHERE genre NOT IN (SELECT genre FROM blocked_genres) AND (?1 IS NULL OR file_path != ?1)
+            WHERE genre NOT IN (SELECT genre FROM blocked_genres)
+              AND file_path NOT LIKE '%/musicas/fundos/%'
+              AND (?1 IS NULL OR file_path != ?1)
             ORDER BY RANDOM() LIMIT 1", [exclude], |r|Ok(TrackInfo{id:r.get(0)?,title:r.get(1)?,artist:r.get(2)?,album:r.get(3)?,file_path:r.get(4)?,file_type:r.get(5)?,genre:r.get(6)?})).optional()
     }
 
@@ -612,6 +614,7 @@ impl Database {
             "SELECT id, title, artist, album, file_path, file_type, genre
              FROM tracks
              WHERE genre NOT IN (SELECT genre FROM blocked_genres)
+               AND file_path NOT LIKE '%/musicas/fundos/%'
              ORDER BY artist ASC, title ASC;",
         )?;
 
@@ -652,6 +655,7 @@ impl Database {
             "SELECT id, title, artist, album, file_path, file_type, genre, COALESCE(created_at, 0)
              FROM tracks
              WHERE genre NOT IN (SELECT genre FROM blocked_genres)
+               AND file_path NOT LIKE '%/musicas/fundos/%'
              ORDER BY artist COLLATE NOCASE ASC,
                       album COLLATE NOCASE ASC,
                       title COLLATE NOCASE ASC;",
@@ -899,6 +903,19 @@ mod queue_tests {
         db.create_tables().unwrap();
         db
     }
+    #[test]
+    fn old_usb_background_folder_is_not_a_music_album() {
+        let db = database();
+        db.conn.execute(
+            "INSERT INTO tracks(title,artist,album,file_path,file_type,genre)
+             VALUES('Loop','Fundos','Fundos','/dados/musicas/fundos/loop.mp4','mp4','Vídeo')",
+            [],
+        ).unwrap();
+        assert!(db.get_albums().unwrap().is_empty());
+        assert!(db.get_all_tracks().unwrap().is_empty());
+        assert!(db.random_track(None).unwrap().is_none());
+    }
+
     #[test]
     fn albums_sort_accented_names_with_their_base_letter() {
         let db = database();
