@@ -4,7 +4,7 @@
 // Teclas verticais: Q = cima, W = baixo (remapeadas conforme solicitado).
 // =============================================================================
 
-import { ListView, Spinner, LineEdit, Button, CheckBox, ScrollView } from "std-widgets.slint";
+import { ListView, Spinner } from "std-widgets.slint";
 
 // -----------------------------------------------------------------------------
 // Estruturas compartilhadas com Rust
@@ -14,7 +14,7 @@ export struct ConfigData {
     pack-cents: string, pack-credits: string,
     large-cents: string, large-credits: string,
     coin-cents: string, attract-minutes: string, low-disk-mib: string,
-    free-play: bool, new-pin: string,
+    free-play: bool,
 }
 
 export struct TrackData {
@@ -391,6 +391,8 @@ export component MainWindow inherits Window {
     in-out property <int> volume-value: 70;
 
     in-out property <int> op-menu-index: 0;
+    in-out property <int> op-submenu-action: 0;
+    in-out property <int> op-settings-index: 0;
     in property <string> online-status: "Aguardando verificação";
     in-out property <string> op-ip: "";
     in-out property <int> op-absolute-coins: 0;
@@ -441,8 +443,6 @@ export component MainWindow inherits Window {
     in property <string> active-genre: "Todos os gêneros";
     in property <bool> disk-low: false;
     in property <string> disk-status: "Consultando disco...";
-    in property <bool> auth-setup: false;
-    in property <string> pin-mask: "";
     in-out property <ConfigData> config-data;
     in-out property <string> cfg-base-cents;
     in-out property <string> cfg-base-credits;
@@ -454,7 +454,6 @@ export component MainWindow inherits Window {
     in-out property <string> cfg-attract-minutes;
     in-out property <string> cfg-low-disk-mib;
     in-out property <bool> cfg-free-play;
-    in-out property <string> cfg-new-pin;
     changed config-data => {
         root.cfg-base-cents = root.config-data.base-cents;
         root.cfg-base-credits = root.config-data.base-credits;
@@ -466,10 +465,7 @@ export component MainWindow inherits Window {
         root.cfg-attract-minutes = root.config-data.attract-minutes;
         root.cfg-low-disk-mib = root.config-data.low-disk-mib;
         root.cfg-free-play = root.config-data.free-play;
-        root.cfg-new-pin = root.config-data.new-pin;
     }
-    callback save-config(ConfigData);
-    callback close-config();
 
     // ---- Callbacks ----
     callback arcade-key-pressed(string) -> bool;
@@ -497,7 +493,7 @@ export component MainWindow inherits Window {
         }
 
         key-released(event) => {
-            if (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R") {
+            if (root.ui-focus == 0 && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
                 key-timer.running = false;
                 if (!keyboard-handler.is-long) {
                     root.arcade-key-pressed(event.text);
@@ -510,14 +506,6 @@ export component MainWindow inherits Window {
         }
 
         key-pressed(event) => {
-            if root.ui-focus == 8 {
-                if event.text == Key.Return { root.arcade-key-pressed("auth-submit"); }
-                else if event.text == Key.Escape { root.arcade-key-pressed("auth-cancel"); }
-                else if event.text == Key.Backspace { root.arcade-key-pressed("auth-backspace"); }
-                else { root.arcade-key-pressed(event.text); }
-                return accept;
-            }
-
             if (root.ui-focus == 0 && (event.text == "e" || event.text == "E" || event.text == "r" || event.text == "R")) {
                 if (keyboard-handler.last-key != event.text) {
                     keyboard-handler.last-key = event.text;
@@ -1450,6 +1438,10 @@ export component MainWindow inherits Window {
                     index:9; selected-index:root.op-menu-index;
                     label:"PACOTES, FESTA E AUTOMAÇÃO"; value:"configurar"; actionable:true; danger:false;
                 }
+                OperatorMenuRow {
+                    index:10; selected-index:root.op-menu-index;
+                    label:"VOLTAR À JUKEBOX"; value:"O confirma"; actionable:true; danger:false;
+                }
                 Text {
                     text: root.online-status;
                     color: #38bdf8;
@@ -1470,7 +1462,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: "Q/W seleciona   ·   O confirma   ·   U fecha";
+                        text: "Q/W/E/R navega   ·   O confirma";
                         color: #64748b;
                         font-size: 12px;
                         horizontal-alignment: right;
@@ -1598,18 +1590,18 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
-                    text: "Q/R aumenta (+5)   ·   W/E diminui (-5)";
+                    text: "Q aumenta (+5)   ·   W diminui (-5)";
                     color: #94a3b8;
                     font-size: 14px;
                     horizontal-alignment: center;
                 }
 
-                Text {
-                    text: "O ou U salva e volta";
-                    color: #64748b;
-                    font-size: 13px;
-                    horizontal-alignment: center;
+                HorizontalLayout {
+                    spacing: 12px;
+                    OperatorMenuRow { index: 0; selected-index: root.op-submenu-action; label: "SALVAR"; value: "O"; actionable: true; danger: false; }
+                    OperatorMenuRow { index: 1; selected-index: root.op-submenu-action; label: "VOLTAR"; value: "O"; actionable: true; danger: false; }
                 }
+                Text { text: "Q/W altera dias · E/R escolhe Salvar ou Voltar"; color: #64748b; font-size: 13px; horizontal-alignment: center; }
             }
         }
     }
@@ -1677,7 +1669,7 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
-                    text: "= R$ \{root.op-price-edit * 2},00 por música";
+                    text: "\{root.op-price-edit} crédito(s) por música";
                     color: #34d399;
                     font-size: 16px;
                     font-weight: 700;
@@ -1693,12 +1685,12 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                 }
 
-                Text {
-                    text: "O ou U salva e volta";
-                    color: #64748b;
-                    font-size: 14px;
-                    horizontal-alignment: center;
+                HorizontalLayout {
+                    spacing: 12px;
+                    OperatorMenuRow { index: 0; selected-index: root.op-submenu-action; label: "SALVAR"; value: "O"; actionable: true; danger: false; }
+                    OperatorMenuRow { index: 1; selected-index: root.op-submenu-action; label: "VOLTAR"; value: "O"; actionable: true; danger: false; }
                 }
+                Text { text: "Q/W altera preço · E/R escolhe Salvar ou Voltar"; color: #64748b; font-size: 13px; horizontal-alignment: center; }
             }
         }
     }
@@ -1791,12 +1783,11 @@ export component MainWindow inherits Window {
 
                 Rectangle { height: 1px; background: #1e2438; }
 
-                Text {
-                    text: "O alterna o bloqueio   ·   U volta";
-                    color: #64748b;
-                    font-size: 13px;
-                    horizontal-alignment: center;
+                OperatorMenuRow {
+                    index: root.op-genres.length; selected-index: root.op-genre-index;
+                    label: "VOLTAR AO MENU"; value: "O confirma"; actionable: true; danger: false;
                 }
+                Text { text: "Q/W/E/R navega · O alterna ou volta"; color: #64748b; font-size: 13px; horizontal-alignment: center; }
             }
         }
     }
@@ -1969,82 +1960,30 @@ export component MainWindow inherits Window {
             }
         }
     }
-    if root.ui-focus == 8 : Rectangle {
-        width:root.width; height:root.height; background:#08080cf5;
-        Rectangle {
-            width:min(520px,root.width - 32px); height:300px;
-            x:(parent.width - self.width)/2; y:(parent.height - self.height)/2;
-            background:#111827; border-radius:14px;
-            VerticalLayout {
-                padding:28px; spacing:18px;
-                Text { text:root.auth-setup ? "CRIAR SENHA DO OPERADOR" : "ACESSO DO OPERADOR"; color:#fbbf24; font-size:20px; font-weight:700; }
-                Text { text:"Digite 4 a 16 letras/números no teclado de manutenção."; color:#94a3b8; font-size:13px; wrap:word-wrap; }
-                Text { text:root.pin-mask + "_"; color:#fff; font-size:28px; }
-                HorizontalLayout {
-                    Button { text:root.auth-setup ? "Criar senha" : "Entrar"; clicked=>{root.arcade-key-pressed("auth-submit");} }
-                    Button { text:"Cancelar"; clicked=>{root.arcade-key-pressed("auth-cancel");} }
-                }
-                Text { text:"Enter confirma · Backspace apaga · Esc cancela"; color:#64748b; font-size:12px; }
-            }
-        }
-    }
     if root.ui-focus == 9 : Rectangle {
-        width:root.width; height:root.height; background:#0a0b10;
-        VerticalLayout {
-            padding:20px; spacing:10px;
-            Text { text:"CONFIGURAÇÕES DO OPERADOR"; color:#fbbf24; font-size:22px; font-weight:700; }
-            Text { text:"Valores em centavos (100 = R$ 1). Pacotes maiores devem ser múltiplos dos menores."; color:#94a3b8; font-size:13px; wrap:word-wrap; }
-            ScrollView {
-                vertical-stretch:1;
-                VerticalLayout {
-                    spacing:10px;
-                    HorizontalLayout {
-                        Text { text:"Pacote base"; color:#e2e8f0; width:190px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-base-cents; placeholder-text:"Centavos"; }
-                        Text { text:"→ créditos"; color:#94a3b8; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-base-credits; placeholder-text:"Créditos"; }
-                    }
-                    HorizontalLayout {
-                        Text { text:"Pacote intermediário"; color:#e2e8f0; width:190px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-pack-cents; placeholder-text:"Centavos"; }
-                        Text { text:"→ créditos"; color:#94a3b8; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-pack-credits; placeholder-text:"Créditos"; }
-                    }
-                    HorizontalLayout {
-                        Text { text:"Pacote maior"; color:#e2e8f0; width:190px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-large-cents; placeholder-text:"Centavos"; }
-                        Text { text:"→ créditos"; color:#94a3b8; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-large-credits; placeholder-text:"Créditos"; }
-                    }
-                    HorizontalLayout {
-                        Text { text:"Valor do pulso Z (centavos)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-coin-cents; }
-                    }
-                    HorizontalLayout {
-                        Text { text:"Attract: intervalo em minutos (0 desliga)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-attract-minutes; }
-                    }
-                    HorizontalLayout {
-                        Text { text:"Alerta de disco: mínimo livre (MiB)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-low-disk-mib; }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Rectangle { width: 40px; height: 32px; background: #e2e8f0; border-radius: 4px;
-                            CheckBox { text: ""; checked <=> root.cfg-free-play; }
-                        }
-                        Text { text: "Modo Festa — reprodução contínua sem consumir créditos"; color: #e2e8f0; vertical-alignment: center; }
-                    }
-                    HorizontalLayout {
-                        Text { text:"Nova senha (vazio mantém a atual)"; color:#e2e8f0; width:360px; vertical-alignment:center; }
-                        LineEdit { text <=> root.cfg-new-pin; input-type:password; }
-                    }
-                    Text { text:"Fundos de vídeo: /dados/fundos · Este menu permanece aberto até você sair."; color:#94a3b8; font-size:12px; wrap:word-wrap; }
-                }
-            }
-            HorizontalLayout {
-                Button { text:"Salvar configurações"; clicked=>{root.save-config({base-cents: root.cfg-base-cents, base-credits: root.cfg-base-credits, pack-cents: root.cfg-pack-cents, pack-credits: root.cfg-pack-credits, large-cents: root.cfg-large-cents, large-credits: root.cfg-large-credits, coin-cents: root.cfg-coin-cents, attract-minutes: root.cfg-attract-minutes, low-disk-mib: root.cfg-low-disk-mib, free-play: root.cfg-free-play, new-pin: root.cfg-new-pin});} }
-                Button { text:"Voltar ao menu"; clicked=>{root.close-config();} }
+        width:root.width; height:root.height; background:#000000e6;
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: min(660px, root.width - 16px); height: min(690px, root.height - 16px);
+            background:#0d0e14; border-radius:16px; border-width:2px; border-color:#f59e0b;
+            VerticalLayout {
+                padding:20px; spacing:8px;
+                Text { text:"PACOTES, FESTA E AUTOMAÇÃO"; color:#fbbf24; font-size:21px; font-weight:800; horizontal-alignment:center; }
+                Text { text:"Q/W navega · E/R ajusta · O confirma · valores monetários em centavos"; color:#94a3b8; font-size:12px; horizontal-alignment:center; }
+                OperatorMenuRow { index:0; selected-index:root.op-settings-index; label:"Base: valor (R$)"; value:root.cfg-base-cents + " centavos"; actionable:true; danger:false; }
+                OperatorMenuRow { index:1; selected-index:root.op-settings-index; label:"Base: créditos"; value:root.cfg-base-credits; actionable:true; danger:false; }
+                OperatorMenuRow { index:2; selected-index:root.op-settings-index; label:"Intermediário: valor (R$)"; value:root.cfg-pack-cents + " centavos"; actionable:true; danger:false; }
+                OperatorMenuRow { index:3; selected-index:root.op-settings-index; label:"Intermediário: créditos"; value:root.cfg-pack-credits; actionable:true; danger:false; }
+                OperatorMenuRow { index:4; selected-index:root.op-settings-index; label:"Maior: valor (R$)"; value:root.cfg-large-cents + " centavos"; actionable:true; danger:false; }
+                OperatorMenuRow { index:5; selected-index:root.op-settings-index; label:"Maior: créditos"; value:root.cfg-large-credits; actionable:true; danger:false; }
+                OperatorMenuRow { index:6; selected-index:root.op-settings-index; label:"Valor do pulso"; value:root.cfg-coin-cents + " centavos"; actionable:true; danger:false; }
+                OperatorMenuRow { index:7; selected-index:root.op-settings-index; label:"Attract"; value:root.cfg-attract-minutes + " minutos"; actionable:true; danger:false; }
+                OperatorMenuRow { index:8; selected-index:root.op-settings-index; label:"Disco: mínimo livre"; value:root.cfg-low-disk-mib + " MiB"; actionable:true; danger:false; }
+                OperatorMenuRow { index:9; selected-index:root.op-settings-index; label:"MODO FESTA"; value:root.cfg-free-play ? "LIGADO" : "DESLIGADO"; actionable:true; danger:false; }
+                Rectangle { height:1px; background:#1e2438; }
+                OperatorMenuRow { index:10; selected-index:root.op-settings-index; label:"SALVAR CONFIGURAÇÕES"; value:"O confirma"; actionable:true; danger:false; }
+                OperatorMenuRow { index:11; selected-index:root.op-settings-index; label:"VOLTAR SEM SALVAR"; value:"O confirma"; actionable:true; danger:false; }
+                Text { text:"Pacotes maiores devem ser múltiplos dos menores. O menu fica aberto até sair."; color:#94a3b8; font-size:12px; horizontal-alignment:center; }
             }
         }
     }

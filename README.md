@@ -13,8 +13,12 @@ atômico, importação USB por pastas e sincronização incremental HTTPS. O ace
 Wi-Fi do operador usa nmtui em uma janela de manutenção. Pix permanece na
 implementação anterior até a integração com o serviço de saldo existente.
 
-Controles preservados: W/Q navegam, E/R capas, I álbum, O filtra gênero/seleciona faixa, U volta/pula,
-P volume, Z crédito, X operador, A zera saldo, L sai do aplicativo.
+Controles: W/Q/E/R navegam, I abre/fecha o álbum, O filtra gênero ou confirma,
+U cancela a faixa atual, P abre/fecha o volume, Z recebe pulso, X abre o menu
+interno do operador, A zera saldo e L encerra o aplicativo. Volume e faixas do
+álbum fecham após 5 segundos sem interação; o menu do operador permanece aberto
+até selecionar Voltar com O. O menu não exige senha: a tecla X deve ficar
+dentro do gabinete trancado, inacessível ao público.
 
 Validações de boot BIOS/UEFI, Wi-Fi, áudio sob carga e desempenho com 5.000 álbuns
 em hardware real são necessárias antes de instalar em produção.

@@ -126,7 +126,9 @@ pub const ALPHABET_ITEMS: &[&str] = &[
 // =============================================================================
 
 /// Total de linhas do menu principal do operador
-pub const OPERATOR_MENU_ITEMS: usize = 10;
+pub const OPERATOR_MENU_ITEMS: usize = 11;
+pub const OPERATOR_MENU_BACK: usize = 10;
+pub const SETTINGS_ITEMS: usize = 12;
 
 /// Índice da linha "Sincronizar Pendrive" no menu principal
 pub const OPERATOR_MENU_SYNC: usize = 0;
@@ -153,7 +155,6 @@ pub const OPERATOR_MENU_POWEROFF: usize = 6;
 /// para a propriedade `ui-focus` do Slint (que decide qual camada desenhar).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FocusState {
-    OperatorAuth,
     OperatorSettings,
     /// Camada 1 — carrossel de capas (E/R/W/Q navegam, I abre o disco)
     BrowsingAlbums,
@@ -161,11 +162,11 @@ pub enum FocusState {
     BrowsingTracks,
     /// Overlay de volume (P abre/fecha, W/Q/E/R ajustam)
     VolumeControl,
-    /// MÓDULO 8 — Menu principal do operador (X abre, W/Q navegam, O entra, U fecha)
+    /// Menu principal do operador (X abre, Q/W/E/R navegam, O confirma)
     OperatorMainMenu,
-    /// MÓDULO 8 — Submenu de preço (W/Q alteram, O/U salvam e voltam)
+    /// Submenu de preço (W/Q alteram, E/R escolhem Salvar/Voltar)
     OperatorPriceMenu,
-    /// MÓDULO 8 — Submenu de gêneros (W/Q navegam, O alterna bloqueio, U volta)
+    /// Submenu de gêneros (direções navegam, O alterna ou volta)
     OperatorGenreMenu,
     /// Régua de seleção rápida alfabética e recém-adicionados (*)
     AlphabetPicker,
@@ -177,7 +178,6 @@ impl FocusState {
     /// Espelha o estado para a propriedade `ui-focus` do Slint (0..=7)
     pub fn as_i32(self) -> i32 {
         match self {
-            FocusState::OperatorAuth => 8,
             FocusState::OperatorSettings => 9,
             FocusState::BrowsingAlbums => 0,
             FocusState::BrowsingTracks => 1,
@@ -196,8 +196,7 @@ impl FocusState {
     pub fn is_operator(self) -> bool {
         matches!(
             self,
-            FocusState::OperatorAuth
-                | FocusState::OperatorSettings
+            FocusState::OperatorSettings
                 | FocusState::OperatorMainMenu
                 | FocusState::OperatorPriceMenu
                 | FocusState::OperatorGenreMenu
@@ -212,6 +211,8 @@ impl FocusState {
 pub enum Action {
     CycleGenre,
     OpenSettings,
+    SaveSettings,
+    SettingsAdjusted { index: usize, direction: i32 },
     OpenWifi,
     SyncOnline,
     /// Tecla reconhecida, porém sem efeito adicional (ex.: E já na 1ª capa)
@@ -223,7 +224,7 @@ pub enum Action {
     PlayTrack(TrackInfo),
     /// W/Q no overlay de volume: aplicar o novo valor no playbin
     VolumeChanged(u32),
-    /// U no overlay de volume: aplicar e persistir o volume no banco
+    /// P ou timeout no overlay de volume: aplicar e persistir o volume no banco
     VolumeClosed(u32),
     /// X: abrir o menu do operador (stats + gêneros do banco + sync USB)
     OpenOperatorMenu,
@@ -270,7 +271,7 @@ pub enum Action {
 pub struct AppState {
     /// Estado de foco atual (decide qual camada da UI está ativa)
     pub focus: FocusState,
-    /// Estado anterior à abertura de um overlay (U volta para ele)
+    /// Estado anterior à abertura de um overlay
     pub previous: FocusState,
     /// Catálogo agrupado por álbum (substituído a cada sincronização)
     pub albums: Vec<AlbumInfo>,
@@ -284,7 +285,7 @@ pub struct AppState {
     pub volume: u32,
     /// MÓDULO 8 — Preço vigente da música (créditos), sincronizado com o banco
     pub song_price: u32,
-    /// MÓDULO 8 — Valor em edição no submenu de preço (W/Q alteram, O/U salvam)
+    /// Valor em edição no submenu de preço (W/Q alteram)
     pub price_value: u32,
     /// Dias para considerar um disco como recém-adicionado (*)
     pub recent_days: u32,
@@ -299,14 +300,34 @@ pub struct AppState {
     pub genre_index: usize,
     /// Indica se há uma música sendo reproduzida no momento
     pub is_playing: bool,
-    pub operator_unlocked: bool,
+    pub settings_index: usize,
+    pub submenu_action: usize,
     pub active_genre: String,
-    pub pin_entry: String,
     pub last_navigation: std::time::Instant,
+    pub last_overlay_interaction: std::time::Instant,
     pub fullscreen: bool,
 }
 
 impl AppState {
+    /// Os overlays públicos expiram após cinco segundos. O menu do operador
+    /// nunca expira; sua saída depende da opção Voltar.
+    pub fn expire_idle_overlay(&mut self, now: std::time::Instant) -> Option<Action> {
+        if now.saturating_duration_since(self.last_overlay_interaction) < std::time::Duration::from_secs(5) {
+            return None;
+        }
+        match self.focus {
+            FocusState::VolumeControl => {
+                self.focus = self.previous;
+                Some(Action::VolumeClosed(self.volume))
+            }
+            FocusState::BrowsingTracks => {
+                self.focus = FocusState::BrowsingAlbums;
+                Some(Action::Noop)
+            }
+            _ => None,
+        }
+    }
+
     pub fn new(volume: u32, song_price: u32) -> Self {
         Self {
             focus: FocusState::BrowsingAlbums,
@@ -324,10 +345,11 @@ impl AppState {
             genres: Vec::new(),
             genre_index: 0,
             is_playing: false,
-            operator_unlocked: false,
+            settings_index: 0,
+            submenu_action: 0,
             active_genre: String::new(),
-            pin_entry: String::new(),
             last_navigation: std::time::Instant::now(),
+            last_overlay_interaction: std::time::Instant::now(),
             fullscreen: false,
         }
     }
@@ -457,7 +479,20 @@ impl AppState {
         }
 
         match self.focus {
-            FocusState::OperatorAuth | FocusState::OperatorSettings => None,
+            FocusState::OperatorSettings => match key {
+                'w' => { self.settings_index = (self.settings_index + 1).min(SETTINGS_ITEMS - 1); Some(Action::Noop) }
+                'q' => { self.settings_index = self.settings_index.saturating_sub(1); Some(Action::Noop) }
+                'e' | 'r' if self.settings_index < SETTINGS_ITEMS - 2 => Some(Action::SettingsAdjusted {
+                    index: self.settings_index, direction: if key == 'r' { 1 } else { -1 },
+                }),
+                'o' => match self.settings_index {
+                    9 => Some(Action::SettingsAdjusted { index: 9, direction: 1 }),
+                    10 => Some(Action::SaveSettings),
+                    11 => { self.focus = FocusState::OperatorMainMenu; Some(Action::Noop) }
+                    _ => Some(Action::Noop),
+                },
+                _ => None,
+            },
             FocusState::BrowsingAlbums => match key {
                 'o' => Some(Action::CycleGenre),
                 'e' => {
@@ -486,11 +521,13 @@ impl AppState {
                 }
                 'i' => {
                     self.open_current_album();
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::Noop)
                 }
                 'p' => {
                     self.previous = FocusState::BrowsingAlbums;
                     self.focus = FocusState::VolumeControl;
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::Noop)
                 }
                 'u' => {
@@ -502,9 +539,7 @@ impl AppState {
                 }
                 'x' => {
                     self.previous = FocusState::BrowsingAlbums;
-                    self.focus = FocusState::OperatorAuth;
-                    self.operator_unlocked = false;
-                    self.pin_entry.clear();
+                    self.focus = FocusState::OperatorMainMenu;
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
                 }
@@ -538,14 +573,16 @@ impl AppState {
             },
 
             FocusState::BrowsingTracks => match key {
-                'w' => {
+                'w' | 'r' => {
                     if self.track_count() > 0 {
                         self.track_index = (self.track_index + 1).min(self.track_count() - 1);
                     }
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::Noop)
                 }
-                'q' => {
+                'q' | 'e' => {
                     self.track_index = self.track_index.saturating_sub(1);
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::Noop)
                 }
                 'i' => {
@@ -572,13 +609,12 @@ impl AppState {
                 'p' => {
                     self.previous = FocusState::BrowsingTracks;
                     self.focus = FocusState::VolumeControl;
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::Noop)
                 }
                 'x' => {
                     self.previous = FocusState::BrowsingTracks;
-                    self.focus = FocusState::OperatorAuth;
-                    self.operator_unlocked = false;
-                    self.pin_entry.clear();
+                    self.focus = FocusState::OperatorMainMenu;
                     self.menu_index = 0;
                     Some(Action::OpenOperatorMenu)
                 }
@@ -588,10 +624,12 @@ impl AppState {
             FocusState::VolumeControl => match key {
                 'w' | 'r' => {
                     self.volume = (self.volume + VOLUME_STEP).min(VOLUME_MAX);
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::VolumeChanged(self.volume))
                 }
                 'q' | 'e' => {
                     self.volume = self.volume.saturating_sub(VOLUME_STEP);
+                    self.last_overlay_interaction = std::time::Instant::now();
                     Some(Action::VolumeChanged(self.volume))
                 }
                 'p' => {
@@ -609,14 +647,13 @@ impl AppState {
                 _ => None,
             },
 
-            // MÓDULO 8 — Menu principal do operador (7 opções + 3 submenus).
-            // W/Q navegam, O entra/confirma, U fecha e volta à tela anterior.
+            // Menu principal do operador: quatro direções navegam, O confirma.
             FocusState::OperatorMainMenu => match key {
-                'w' => {
+                'w' | 'r' => {
                     self.menu_index = (self.menu_index + 1).min(OPERATOR_MENU_ITEMS - 1);
                     Some(Action::Noop)
                 }
-                'q' => {
+                'q' | 'e' => {
                     self.menu_index = self.menu_index.saturating_sub(1);
                     Some(Action::Noop)
                 }
@@ -624,11 +661,13 @@ impl AppState {
                     OPERATOR_MENU_SYNC => Some(Action::ForceSync),
                     OPERATOR_MENU_PRICE => {
                         self.price_value = self.song_price;
+                        self.submenu_action = 0;
                         self.focus = FocusState::OperatorPriceMenu;
                         Some(Action::OpenPriceMenu)
                     }
                     OPERATOR_MENU_RECENT_DAYS => {
                         self.recent_days_value = self.recent_days;
+                        self.submenu_action = 0;
                         self.focus = FocusState::OperatorRecentDaysMenu;
                         Some(Action::OpenRecentDaysMenu)
                     }
@@ -643,22 +682,23 @@ impl AppState {
                     7 => Some(Action::OpenWifi),
                     8 => Some(Action::SyncOnline),
                     9 => {
+                        self.settings_index = 0;
                         self.focus = FocusState::OperatorSettings;
                         Some(Action::OpenSettings)
                     }
+                    OPERATOR_MENU_BACK => {
+                        self.focus = self.previous;
+                        Some(Action::CloseOperatorMenu)
+                    }
                     _ => Some(Action::Noop),
                 },
-                'u' => {
-                    self.operator_unlocked = false;
-                    self.focus = self.previous;
-                    Some(Action::CloseOperatorMenu)
-                }
                 _ => None,
             },
 
-            // MÓDULO 8 — Submenu de preço: W/Q alteram o valor em edição,
-            // O ou U salvam e voltam ao menu principal.
+            // Preço: W/Q alteram o valor, E/R escolhem Salvar ou Voltar.
             FocusState::OperatorPriceMenu => match key {
+                'e' => { self.submenu_action = 0; Some(Action::Noop) }
+                'r' => { self.submenu_action = 1; Some(Action::Noop) }
                 'w' => {
                     self.price_value = self.price_value.saturating_sub(1).max(SONG_PRICE_MIN);
                     Some(Action::Noop)
@@ -667,7 +707,11 @@ impl AppState {
                     self.price_value = (self.price_value + 1).min(SONG_PRICE_MAX);
                     Some(Action::Noop)
                 }
-                'o' | 'u' => {
+                'o' => {
+                    if self.submenu_action == 1 {
+                        self.focus = FocusState::OperatorMainMenu;
+                        return Some(Action::Noop);
+                    }
                     let price = self.price_value;
                     self.song_price = price;
                     self.focus = FocusState::OperatorMainMenu;
@@ -678,15 +722,21 @@ impl AppState {
 
             // Submenu de dias para recém-adicionados (*)
             FocusState::OperatorRecentDaysMenu => match key {
-                'w' | 'r' => {
+                'e' => { self.submenu_action = 0; Some(Action::Noop) }
+                'r' => { self.submenu_action = 1; Some(Action::Noop) }
+                'w' => {
                     self.recent_days_value = self.recent_days_value.saturating_sub(5).max(1);
                     Some(Action::Noop)
                 }
-                'q' | 'e' => {
+                'q' => {
                     self.recent_days_value = (self.recent_days_value + 5).min(365);
                     Some(Action::Noop)
                 }
-                'o' | 'u' => {
+                'o' => {
+                    if self.submenu_action == 1 {
+                        self.focus = FocusState::OperatorMainMenu;
+                        return Some(Action::Noop);
+                    }
                     let days = self.recent_days_value;
                     self.recent_days = days;
                     self.focus = FocusState::OperatorMainMenu;
@@ -695,21 +745,21 @@ impl AppState {
                 _ => None,
             },
 
-            // MÓDULO 8 — Submenu de gêneros: W/Q navegam na lista, O alterna
-            // o bloqueio (feedback local instantâneo + gravação no banco),
-            // U volta ao menu principal.
+            // Gêneros: quatro direções navegam; O alterna ou seleciona Voltar.
             FocusState::OperatorGenreMenu => match key {
-                'w' => {
-                    if !self.genres.is_empty() {
-                        self.genre_index = (self.genre_index + 1).min(self.genres.len() - 1);
-                    }
+                'w' | 'r' => {
+                    self.genre_index = (self.genre_index + 1).min(self.genres.len());
                     Some(Action::Noop)
                 }
-                'q' => {
+                'q' | 'e' => {
                     if !self.genres.is_empty() {
                         self.genre_index = self.genre_index.saturating_sub(1);
                     }
                     Some(Action::Noop)
+                }
+                'o' if self.genre_index == self.genres.len() => {
+                    self.focus = FocusState::OperatorMainMenu;
+                    Some(Action::CloseGenreMenu)
                 }
                 'o' => match self.genres.get_mut(self.genre_index) {
                     Some(genre) => {
@@ -719,10 +769,6 @@ impl AppState {
                     }
                     None => Some(Action::Noop),
                 },
-                'u' => {
-                    self.focus = FocusState::OperatorMainMenu;
-                    Some(Action::CloseGenreMenu)
-                }
                 _ => None,
             },
         }
@@ -872,5 +918,48 @@ mod tests {
         // Quando não está tocando, 'u' não tem efeito
         let action_not_playing = state.handle_key("u");
         assert!(action_not_playing.is_none());
+    }
+
+    #[test]
+    fn public_overlays_expire_and_direction_resets_album_clock() {
+        use std::time::{Duration, Instant};
+        let mut state = AppState::new(50, 1);
+        state.albums = vec![AlbumInfo {
+            title: "Disco".into(), artist: "Artista".into(), genre: "Rock".into(),
+            key: "disco".into(), initial: "D".into(), palette: 0, is_recent: false,
+            tracks: vec![TrackInfo { id: 1, title: "Faixa".into(), artist: "Artista".into(),
+                album: "Disco".into(), genre: "Rock".into(), file_path: "/f.mp3".into(), file_type: "mp3".into() }],
+        }];
+        state.handle_key("i");
+        state.last_overlay_interaction = Instant::now() - Duration::from_secs(6);
+        state.handle_key("w");
+        assert!(state.expire_idle_overlay(Instant::now()).is_none());
+        assert!(matches!(state.expire_idle_overlay(Instant::now() + Duration::from_secs(6)), Some(Action::Noop)));
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+
+        state.handle_key("p");
+        state.last_overlay_interaction = Instant::now() - Duration::from_secs(6);
+        assert!(matches!(state.expire_idle_overlay(Instant::now()), Some(Action::VolumeClosed(50))));
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
+    }
+
+    #[test]
+    fn operator_exits_with_selected_back_and_never_times_out() {
+        use std::time::{Duration, Instant};
+        let mut state = AppState::new(50, 1);
+        assert!(matches!(state.handle_key("x"), Some(Action::OpenOperatorMenu)));
+        state.last_overlay_interaction = Instant::now() - Duration::from_secs(60);
+        assert!(state.expire_idle_overlay(Instant::now()).is_none());
+        assert!(state.handle_key("u").is_none());
+        state.menu_index = OPERATOR_MENU_PRICE;
+        assert!(matches!(state.handle_key("o"), Some(Action::OpenPriceMenu)));
+        state.handle_key("w");
+        state.handle_key("r");
+        state.handle_key("o");
+        assert_eq!(state.focus, FocusState::OperatorMainMenu);
+        assert_eq!(state.song_price, 1); // Voltar descarta a edição.
+        state.menu_index = OPERATOR_MENU_BACK;
+        assert!(matches!(state.handle_key("o"), Some(Action::CloseOperatorMenu)));
+        assert_eq!(state.focus, FocusState::BrowsingAlbums);
     }
 }

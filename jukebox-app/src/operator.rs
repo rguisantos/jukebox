@@ -16,7 +16,6 @@ pub struct SettingsInput {
     pub attract_minutes: String,
     pub low_disk_mib: String,
     pub free_play: bool,
-    pub new_pin: String,
 }
 impl From<ConfigData> for SettingsInput {
     fn from(form: ConfigData) -> Self {
@@ -31,7 +30,6 @@ impl From<ConfigData> for SettingsInput {
             attract_minutes: form.attract_minutes.to_string(),
             low_disk_mib: form.low_disk_mib.to_string(),
             free_play: form.free_play,
-            new_pin: form.new_pin.to_string(),
         }
     }
 }
@@ -47,7 +45,6 @@ pub fn form(s: &Settings) -> ConfigData {
         attract_minutes: s.attract_minutes.to_string().into(),
         low_disk_mib: s.low_disk_mib.to_string().into(),
         free_play: s.free_play,
-        new_pin: "".into(),
     }
 }
 pub fn parse(f: SettingsInput, mut current: Settings) -> Result<Settings, String> {
@@ -75,8 +72,5 @@ pub fn parse(f: SettingsInput, mut current: Settings) -> Result<Settings, String
     current.low_disk_mib = number(&f.low_disk_mib)?;
     current.free_play = f.free_play;
     current.validate()?;
-    if !f.new_pin.is_empty() {
-        current.set_pin(&f.new_pin)?;
-    }
     Ok(current)
 }
