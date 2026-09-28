@@ -82,6 +82,7 @@ impl Database {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS operator_settings (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cash_receipts (receipt TEXT PRIMARY KEY, cents INTEGER NOT NULL, credits INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS pix_receipts (machine_id TEXT NOT NULL, txid TEXT NOT NULL, credits INTEGER NOT NULL CHECK(credits > 0), created_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(machine_id, txid));
+            CREATE TABLE IF NOT EXISTS pixlogic_deliveries (machine_id TEXT NOT NULL, operation_id TEXT NOT NULL, credits INTEGER NOT NULL CHECK(credits BETWEEN 1 AND 100), confirmed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(machine_id,operation_id));
             CREATE TABLE IF NOT EXISTS pending_pix (machine_id TEXT NOT NULL, txid TEXT NOT NULL, api_base TEXT NOT NULL, status_path TEXT NOT NULL, credits INTEGER NOT NULL CHECK(credits > 0), PRIMARY KEY(machine_id, txid));
             CREATE TABLE IF NOT EXISTS conversion_session (id INTEGER PRIMARY KEY CHECK(id=1), cents INTEGER NOT NULL, awarded INTEGER NOT NULL);
             INSERT OR IGNORE INTO conversion_session VALUES(1,0,0);")?;
@@ -328,6 +329,38 @@ impl Database {
         let balance = if inserted { current + credits } else { current };
         tx.commit()?;
         Ok((balance, inserted))
+    }
+    /// Apply one reserved PixLogic operation and record its pending ACK atomically.
+    pub fn accept_pixlogic(&mut self, machine: &str, operation: &str, credits: u32) -> Result<(u32, bool)> {
+        if machine.len() != 36 || operation.len() != 36 || !(1..=100).contains(&credits) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: Option<u32> = tx.query_row(
+            "SELECT credits FROM pixlogic_deliveries WHERE machine_id=?1 AND operation_id=?2",
+            params![machine, operation], |r| r.get(0)).optional()?;
+        if previous.is_some_and(|old| old != credits) { return Err(rusqlite::Error::InvalidQuery); }
+        let balance: u32 = tx.query_row("SELECT value FROM system_state WHERE key='credits'", [], |r| r.get(0))?;
+        if previous.is_none() {
+            balance.checked_add(credits).filter(|n| *n <= i32::MAX as u32)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            tx.execute("INSERT INTO pixlogic_deliveries(machine_id,operation_id,credits) VALUES(?1,?2,?3)", params![machine,operation,credits])?;
+            tx.execute("UPDATE system_state SET value=value+?1 WHERE key IN ('credits','partial_coins','absolute_coins')", [credits])?;
+            tx.execute("INSERT INTO credits_audit(amount) VALUES(?1)", [credits])?;
+        }
+        tx.commit()?;
+        Ok((balance + if previous.is_none() { credits } else { 0 }, previous.is_none()))
+    }
+
+    pub fn pending_pixlogic(&self, machine: &str) -> Result<Vec<(String,u32)>> {
+        let mut stmt = self.conn.prepare("SELECT operation_id,credits FROM pixlogic_deliveries WHERE machine_id=?1 AND confirmed=0 ORDER BY rowid")?;
+        let rows = stmt.query_map([machine], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn confirm_pixlogic(&self, machine: &str, operation: &str) -> Result<()> {
+        self.conn.execute("UPDATE pixlogic_deliveries SET confirmed=1 WHERE machine_id=?1 AND operation_id=?2", params![machine,operation])?;
+        Ok(())
     }
     pub fn remember_pix(&self, item: &PendingPix) -> Result<()> {
         if item.machine_id.trim().is_empty() || item.txid.trim().is_empty()
@@ -1117,6 +1150,33 @@ mod queue_tests {
             assert_eq!(db.accept_pix("m1", "payment-1", 1).unwrap(), (1, true));
             assert!(db.pending_pix().unwrap().is_empty());
             assert_eq!(db.accept_pix("m1", "payment-1", 1).unwrap(), (1, false));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pixlogic_operation_survives_restart_and_cannot_credit_twice() {
+        let path = std::env::temp_dir().join(format!("jukebox-pixlogic-{}-{}.db",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let machine = "11111111-2222-3333-4444-555555555555";
+        let operation = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        {
+            let mut db = Database { conn: Connection::open(&path).unwrap() };
+            db.create_tables().unwrap();
+            assert_eq!(db.accept_pixlogic(machine, operation, 20).unwrap(), (20,true));
+            assert_eq!(db.pending_pixlogic(machine).unwrap(), vec![(operation.into(),20)]);
+        }
+        {
+            let mut db = Database { conn: Connection::open(&path).unwrap() };
+            db.create_tables().unwrap();
+            assert_eq!(db.accept_pixlogic(machine, operation, 20).unwrap(), (20,false));
+            assert!(db.accept_pixlogic(machine, operation, 21).is_err());
+            assert_eq!(db.get_credits().unwrap(), 20);
+            assert_eq!(db.pending_pixlogic(machine).unwrap().len(), 1);
+            db.confirm_pixlogic(machine, operation).unwrap();
+            assert!(db.pending_pixlogic(machine).unwrap().is_empty());
+            assert_eq!(db.accept_pixlogic(machine, operation, 20).unwrap(), (20,false));
         }
         std::fs::remove_file(path).unwrap();
     }

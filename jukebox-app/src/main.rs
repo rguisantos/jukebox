@@ -36,6 +36,7 @@ mod state;
 
 use db::Database;
 use finance::pix::{PixConfig, PixService, PixUiEvent};
+use finance::pixlogic;
 use media::covers::{self, CoverCommand, CoverEvent};
 use catalog_ui::{publish_albums, track_info_to_data};
 use media::player::{self, PlayerCommand, PlayerEvent};
@@ -487,7 +488,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let pix_service = PixService::start(PixConfig::from_env(), pix_event_tx, db_tx.clone());
+    let _legacy_pix = match pixlogic::Config::from_env() {
+        Some(Ok(config)) => {
+            main_window.set_pixlogic_mode(true);
+            main_window.set_pix_loading(false);
+            match load_pixlogic_qr(std::path::Path::new("/dados/pix/qr.png")) {
+                Ok(image) => {
+                    main_window.set_pix_qr_image(image);
+                    main_window.set_pixlogic_has_qr(true);
+                }
+                Err(reason) => log::warn!("QR PixLogic local: {reason}"),
+            }
+            pixlogic::spawn(config, db_tx.clone(), pix_event_tx);
+            None
+        }
+        Some(Err(reason)) => {
+            main_window.set_pixlogic_mode(true);
+            main_window.set_pix_loading(false);
+            main_window.set_pix_offline(true);
+            main_window.set_pix_error_text(reason.into());
+            None
+        }
+        None => Some(PixService::start(PixConfig::from_env(), pix_event_tx, db_tx.clone())),
+    };
 
     {
         let ui_handle = main_window.as_weak();
@@ -496,6 +519,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::spawn(move || {
             while let Ok(event) = pix_event_rx.recv() {
                 match event {
+                    PixUiEvent::PixLogicStatus { connected, message } => {
+                        let weak = ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_pix_offline(!connected);
+                                ui.set_pix_error_text(message.into());
+                            }
+                        });
+                    }
                     PixUiEvent::Loading => {
                         let ui_handle = ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -688,15 +720,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             handle_ui_action(&ui, &state_arc, action, &db_tx, &player_tx, &usb_tx);
-        });
-    }
-
-    // Botão "Tentar novamente" do painel PIX
-    {
-        let service = pix_service.clone();
-        main_window.on_pix_retry(move || {
-            log::info!("UI: retry manual do QR Code PIX.");
-            service.request_refresh();
         });
     }
 
@@ -1210,6 +1233,32 @@ fn show_toast(ui_handle: &slint::Weak<MainWindow>, message: &str, kind: i32) {
     });
 }
 
+/// Carrega o QR público da máquina uma vez no boot. Falha de arquivo mantém o
+/// fluxo PixLogic ativo e a tela orienta a usar o QR físico.
+fn load_pixlogic_qr(path: &std::path::Path) -> Result<slint::Image, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() < 24 || bytes.len() > 4 * 1024 * 1024
+        || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return Err("esperado arquivo PNG de até 4 MiB".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    if !(128..=2048).contains(&width) || !(128..=2048).contains(&height) {
+        return Err("QR PNG deve ter entre 128 e 2048 pixels por dimensão".into());
+    }
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .map_err(|e| format!("PNG inválido: {e}"))?;
+    let rgba = decoded.to_rgba8();
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for pixel in rgba.pixels() {
+        let alpha = u16::from(pixel[3]);
+        for color in &pixel.0[..3] {
+            rgb.push(((u16::from(*color) * alpha + 255 * (255 - alpha)) / 255) as u8);
+        }
+    }
+    Ok(rgb_buffer_to_image(rgb, width, height))
+}
+
 /// Converte um buffer RGB (QR do PIX, capas de álbum) em textura do Slint
 pub(crate) fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slint::Image {
     let mut buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(width, height);
@@ -1226,7 +1275,20 @@ pub(crate) fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slin
 
 #[cfg(test)]
 mod brl_tests {
-    use super::{format_brl, revenue_label};
+    use super::{format_brl, load_pixlogic_qr, revenue_label};
+
+    #[test]
+    fn local_pix_qr_requires_a_readable_png() {
+        let path = std::env::temp_dir().join(format!("jukebox-qr-{}-{}.png",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let pixels = image::RgbaImage::from_pixel(128,128,image::Rgba([0,0,0,255]));
+        image::DynamicImage::ImageRgba8(pixels).save(&path).unwrap();
+        assert!(load_pixlogic_qr(&path).is_ok());
+        std::fs::write(&path,b"PDF, not PNG").unwrap();
+        assert!(load_pixlogic_qr(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn failed_receipts_query_is_not_a_zero_balance() {

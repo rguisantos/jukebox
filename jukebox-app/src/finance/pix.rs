@@ -85,6 +85,7 @@ const DEFAULT_MACHINE_ID: &str = "JUKEBOX-001";
 /// Eventos enviados do serviço PIX para a thread principal (que os aplica
 /// na UI via `slint::invoke_from_event_loop` e credita no banco quando pago).
 pub enum PixUiEvent {
+    PixLogicStatus { connected: bool, message: String },
     /// Buscando QR Code no backend (estado de carregamento na UI)
     Loading,
     /// QR Code pronto — buffer RGB + dimensões + string Copia e Cola
