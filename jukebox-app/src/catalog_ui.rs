@@ -171,7 +171,7 @@ pub(crate) fn publish_albums(
             let mut st = lock_state(&state_arc);
             let mut albums = albums;
             if !st.active_genre.is_empty() {
-                albums.retain(|a| a.genre == st.active_genre);
+                albums.retain(|a| a.tracks.iter().any(|track| track.genre == st.active_genre));
             }
             if keep_focus || st.focus.is_operator() {
                 st.replace_catalog_keep_focus(albums);

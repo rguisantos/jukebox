@@ -179,19 +179,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ui.set_free_play(settings.free_play);
                             ui.set_config_data(operator::form(&settings));
                         }
-                        DbEvent::CycleGenre(albums) => {
-                            let genres: Vec<_> = albums.iter().map(|a| a.genre.clone())
-                                .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-                            {
-                                let mut st = lock_state(&state);
-                                st.active_genre = if st.active_genre.is_empty() {
-                                    genres.first().cloned().unwrap_or_default()
-                                } else {
-                                    genres.iter().position(|g| g == &st.active_genre)
-                                        .and_then(|i| genres.get(i + 1)).cloned().unwrap_or_default()
-                                };
-                            }
-                            publish_albums(&weak, &state, &covers, albums, true);
+                        DbEvent::GenreOptions(genres) => {
+                            let mut st = lock_state(&state);
+                            st.available_genres = genres;
+                            st.selected_genre = st.available_genres.iter()
+                                .position(|g| g == &st.active_genre).unwrap_or(0);
+                            mirror_nav(&ui, &st);
                         }
                         DbEvent::Catalog(albums) => publish_albums(&weak, &state, &covers, albums, true),
                         DbEvent::OperatorStats { partial, absolute, revenue, price, recent_days, genres } => {
@@ -724,6 +717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if !st.focus.is_operator()
                     && st.focus != FocusState::VolumeControl
+                    && st.focus != FocusState::GenrePicker
                     && !ui.get_usb_overlay_visible()
                 {
                     if st.last_navigation.elapsed() >= Duration::from_secs(10)
@@ -736,6 +730,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     st.fullscreen
                         && ui.get_video_available()
                         && !st.focus.is_operator()
+                        && st.focus != FocusState::GenrePicker
                         && !ui.get_usb_overlay_visible(),
                 );
             },
@@ -817,6 +812,10 @@ pub(crate) fn mirror_nav(ui: &MainWindow, st: &AppState) {
     ui.set_op_price_edit(st.price_value as i32);
     ui.set_op_recent_days_edit(st.recent_days_value as i32);
     ui.set_selected_letter_index(st.letter_index as i32);
+    ui.set_selected_genre_index(st.selected_genre as i32);
+    ui.set_genre_options(ModelRc::new(VecModel::from(st.available_genres.iter()
+        .map(|g| if g.is_empty() { "Todos os gêneros".into() } else { g.clone().into() })
+        .chain(std::iter::once("Voltar".into())).collect::<Vec<slint::SharedString>>() )));
     ui.set_op_genre_index(st.genre_index as i32);
     if st.focus == FocusState::OperatorGenreMenu {
         let rows: Vec<GenreData> = st
@@ -895,9 +894,8 @@ fn handle_ui_action(
             show_toast(&ui.as_weak(), "Verificação do acervo solicitada", 2);
         }
 
-        Action::CycleGenre => {
-            let _ = db_tx.cycle_genre();
-        }
+        Action::OpenGenrePicker => { let _ = db_tx.load_genres(); }
+        Action::SelectGenre(_) => { let _ = db_tx.refresh_catalog(); }
         Action::OpenSettings => {
             let _ = db_tx.load_settings();
         }

@@ -21,7 +21,8 @@ enum DbCommand {
     LockOperator,
     LoadSettings,
     SaveSettings(operator::SettingsInput),
-    CycleGenre,
+    LoadGenres,
+    RefreshCatalog,
     RequestPlay(TrackInfo),
     SetVolume(u32),
     QueryOperatorStats,
@@ -38,7 +39,7 @@ pub enum DbEvent {
     Toast { message: String, kind: i32 },
     SettingsLoaded(Settings),
     SettingsSaved(Settings),
-    CycleGenre(Vec<AlbumInfo>),
+    GenreOptions(Vec<String>),
     Catalog(Vec<AlbumInfo>),
     Enqueue(TrackInfo),
     OperatorStats { partial: i64, absolute: i64, revenue: Result<i64, String>, price: u32,
@@ -90,7 +91,8 @@ impl DbHandle {
     pub fn lock_operator(&self) -> Result<(), String> { self.send(DbCommand::LockOperator) }
     pub fn load_settings(&self) -> Result<(), String> { self.send(DbCommand::LoadSettings) }
     pub fn save_settings(&self, input: operator::SettingsInput) -> Result<(), String> { self.send(DbCommand::SaveSettings(input)) }
-    pub fn cycle_genre(&self) -> Result<(), String> { self.send(DbCommand::CycleGenre) }
+    pub fn load_genres(&self) -> Result<(), String> { self.send(DbCommand::LoadGenres) }
+    pub fn refresh_catalog(&self) -> Result<(), String> { self.send(DbCommand::RefreshCatalog) }
     pub fn request_play(&self, track: TrackInfo) -> Result<(), String> { self.send(DbCommand::RequestPlay(track)) }
     pub fn set_volume(&self, volume: u32) -> Result<(), String> { self.send(DbCommand::SetVolume(volume)) }
     pub fn operator_stats(&self) -> Result<(), String> { self.send(DbCommand::QueryOperatorStats) }
@@ -191,8 +193,16 @@ fn spawn_with_persistence(mut db: Database, persistent: bool) -> (DbHandle, Rece
                         Err(e) => toast(&events, e, 2),
                     }
                 }
-                DbCommand::CycleGenre => match db.get_albums() {
-                    Ok(albums) => { let _ = events.send(DbEvent::CycleGenre(albums)); }
+                DbCommand::LoadGenres => match db.get_genres() {
+                    Ok(genres) => {
+                        let mut names = vec![String::new()];
+                        names.extend(genres.into_iter().filter(|g| !g.blocked).map(|g| g.name));
+                        let _ = events.send(DbEvent::GenreOptions(names));
+                    }
+                    Err(e) => toast(&events, format!("Falha ao listar gêneros: {e}"), 2),
+                },
+                DbCommand::RefreshCatalog => match db.get_albums() {
+                    Ok(albums) => { let _ = events.send(DbEvent::Catalog(albums)); }
                     Err(e) => toast(&events, format!("Falha ao filtrar gêneros: {e}"), 2),
                 },
                 DbCommand::RequestPlay(track) => { let _ = events.send(DbEvent::Enqueue(track)); }
