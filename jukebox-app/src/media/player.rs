@@ -320,6 +320,14 @@ impl Player {
             .unwrap()
             .join("fundos");
         self.backgrounds = background_files(&dir);
+        // Compatibilidade: versões anteriores do importador USB colocavam
+        // fundos dentro de musicas/fundos. Novos clipes vão para /dados/fundos.
+        let legacy_dir = super::scanner::resolve_media_dir().join("fundos");
+        self.backgrounds.extend(background_files(&legacy_dir).into_iter().filter(|path| {
+            path.strip_prefix(&legacy_dir).ok()
+                .map(|relative| !dir.join(relative).is_file())
+                .unwrap_or(false)
+        }));
         self.failed_backgrounds.clear();
         log::info!("Vídeos de fundo disponíveis: {}", self.backgrounds.len());
     }
