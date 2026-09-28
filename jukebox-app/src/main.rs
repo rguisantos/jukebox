@@ -113,7 +113,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main_window = MainWindow::new()?;
     main_window.set_credits(initial_credits as i32);
     main_window.set_free_play(initial_settings.free_play);
-    main_window.set_auth_setup(!initial_settings.has_pin());
     main_window.set_config_data(operator::form(&initial_settings));
     main_window.set_volume_value(initial_volume as i32);
     main_window.set_op_song_price(initial_price as i32);
@@ -174,19 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             credit_feedback(&weak, &player, added);
                         }
                         DbEvent::Toast { message, kind } => show_toast(&weak, &message, kind),
-                        DbEvent::Authenticated => {
-                            let mut st = lock_state(&state);
-                            if st.focus == FocusState::OperatorAuth {
-                                st.operator_unlocked = true;
-                                st.focus = FocusState::OperatorMainMenu;
-                                ui.set_auth_setup(false);
-                                mirror_nav(&ui, &st);
-                            } else {
-                                let _ = storage.lock_operator();
-                            }
-                        }
                         DbEvent::SettingsLoaded(settings) => {
-                            ui.set_auth_setup(!settings.has_pin());
                             ui.set_config_data(operator::form(&settings));
                         }
                         DbEvent::SettingsSaved(settings) => {
@@ -612,41 +599,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = player_tx.send(PlayerCommand::Activity);
             {
                 let mut st = lock_state(&state_arc);
-                if st.focus == FocusState::OperatorAuth {
-                    match key.as_str() {
-                        "auth-submit" => {
-                            let pin = std::mem::take(&mut st.pin_entry);
-                            let _ = db_tx.authenticate(pin);
-                        }
-                        "auth-cancel" => {
-                            let _ = db_tx.lock_operator();
-                            st.pin_entry.clear();
-                            st.operator_unlocked = false;
-                            st.focus = st.previous;
-                            let _ = player_tx.send(PlayerCommand::Operator(false));
-                        }
-                        "auth-backspace" => {
-                            st.pin_entry.pop();
-                        }
-                        text => {
-                            if text.len() == 1
-                                && text.as_bytes()[0].is_ascii_alphanumeric()
-                                && st.pin_entry.len() < 16
-                            {
-                                st.pin_entry.push_str(text);
-                            }
-                        }
-                    }
-                    mirror_nav(&ui, &st);
-                    return true;
-                }
-                if st.focus == FocusState::OperatorSettings {
-                    return false;
+                if st.focus == FocusState::VolumeControl && !key.is_empty() {
+                    st.last_overlay_interaction = std::time::Instant::now();
                 }
                 if st.focus != FocusState::VolumeControl
                     && matches!(
                         key.to_ascii_lowercase().as_str(),
-                        "q" | "w" | "e" | "r" | "i" | "o"
+                        "q" | "w" | "e" | "r" | "i" | "o" | "p"
                     )
                 {
                     st.last_navigation = std::time::Instant::now();
@@ -687,6 +646,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if st.focus == FocusState::BrowsingAlbums && !st.albums.is_empty() {
                     st.album_index = (index.max(0) as usize).min(st.albums.len() - 1);
                     st.open_current_album();
+                    st.last_overlay_interaction = std::time::Instant::now();
                 }
                 Some(Action::Noop)
             };
@@ -718,6 +678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut st = lock_state(&state_arc);
                 if st.focus == FocusState::BrowsingTracks && st.track_count() > 0 {
                     st.track_index = (index.max(0) as usize).min(st.track_count() - 1);
+                    st.last_overlay_interaction = std::time::Instant::now();
                     st.current_album()
                         .and_then(|album| album.tracks.get(st.track_index))
                         .cloned()
@@ -747,6 +708,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = main_window.as_weak();
         let state = state_arc.clone();
+        let db = db_tx.clone();
         media_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(50),
@@ -756,6 +718,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_video_frame(rgb_buffer_to_image(frame.rgb, frame.width, frame.height));
                 }
                 let mut st = lock_state(&state);
+                if let Some(action) = st.expire_idle_overlay(std::time::Instant::now()) {
+                    mirror_nav(&ui, &st);
+                    if let Action::VolumeClosed(volume) = action {
+                        let _ = db.set_volume(volume);
+                    }
+                }
                 if !st.focus.is_operator()
                     && st.focus != FocusState::VolumeControl
                     && !ui.get_usb_overlay_visible()
@@ -810,21 +778,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             thread::sleep(Duration::from_secs(30));
         });
     }
-    {
-        let tx = db_tx.clone();
-        main_window.on_save_config(move |form| {
-            let _ = tx.save_settings(form.into());
-        });
-        let weak = main_window.as_weak();
-        let state = state_arc.clone();
-        main_window.on_close_config(move || {
-            if let Some(ui) = weak.upgrade() {
-                let mut st = lock_state(&state);
-                st.focus = FocusState::OperatorMainMenu;
-                mirror_nav(&ui, &st);
-            }
-        });
-    }
     main_window.show()?;
     main_window.run()?;
 
@@ -857,7 +810,8 @@ pub(crate) fn mirror_nav(ui: &MainWindow, st: &AppState) {
     } else {
         st.active_genre.clone().into()
     });
-    ui.set_pin_mask("•".repeat(st.pin_entry.len()).into());
+    ui.set_op_settings_index(st.settings_index as i32);
+    ui.set_op_submenu_action(st.submenu_action as i32);
     ui.set_volume_value(st.volume as i32);
     ui.set_op_menu_index(st.menu_index as i32);
 
@@ -949,6 +903,23 @@ fn handle_ui_action(
         Action::OpenSettings => {
             let _ = db_tx.load_settings();
         }
+        Action::SaveSettings => {
+            let _ = db_tx.save_settings(operator::SettingsInput {
+                base_cents: ui.get_cfg_base_cents().to_string(),
+                base_credits: ui.get_cfg_base_credits().to_string(),
+                pack_cents: ui.get_cfg_pack_cents().to_string(),
+                pack_credits: ui.get_cfg_pack_credits().to_string(),
+                large_cents: ui.get_cfg_large_cents().to_string(),
+                large_credits: ui.get_cfg_large_credits().to_string(),
+                coin_cents: ui.get_cfg_coin_cents().to_string(),
+                attract_minutes: ui.get_cfg_attract_minutes().to_string(),
+                low_disk_mib: ui.get_cfg_low_disk_mib().to_string(),
+                free_play: ui.get_cfg_free_play(),
+            });
+        }
+        Action::SettingsAdjusted { index, direction } => {
+            adjust_settings(ui, index, direction);
+        }
         Action::Noop => {}
         Action::AddCredit => {
             log::debug!("Evento de moeda/tecla 'Z' detectado pela interface.");
@@ -977,6 +948,7 @@ fn handle_ui_action(
             std::process::exit(0);
         }
         Action::OpenOperatorMenu => {
+            let _ = db_tx.unlock_operator();
             let _ = player_tx.send(PlayerCommand::Operator(true));
             let _ = db_tx.load_settings();
             // IP calculado na hora (dhcp pode mudar entre aberturas do menu)
@@ -1017,7 +989,7 @@ fn handle_ui_action(
         }
         Action::CloseGenreMenu => {
             // Continua dentro das telas do operador: o vídeo permanece
-            // oculto até o U final do menu principal
+            // oculto até selecionar Voltar no menu principal
         }
         Action::ToggleGenreBlock(genre) => {
             // Grava o bloqueio e recarrega o catálogo público (a thread do
@@ -1075,6 +1047,39 @@ fn handle_ui_action(
     }
 
     true
+}
+
+fn adjust_settings(ui: &MainWindow, index: usize, direction: i32) {
+    if index == 9 {
+        ui.set_cfg_free_play(!ui.get_cfg_free_play());
+        return;
+    }
+    let (current, step, lower, upper) = match index {
+        0 => (ui.get_cfg_base_cents(), 100, 1, 100_000),
+        1 => (ui.get_cfg_base_credits(), 1, 1, 10_000),
+        2 => (ui.get_cfg_pack_cents(), 100, 1, 100_000),
+        3 => (ui.get_cfg_pack_credits(), 1, 1, 10_000),
+        4 => (ui.get_cfg_large_cents(), 100, 1, 100_000),
+        5 => (ui.get_cfg_large_credits(), 1, 1, 10_000),
+        6 => (ui.get_cfg_coin_cents(), 100, 1, 100_000),
+        7 => (ui.get_cfg_attract_minutes(), 1, 0, 1440),
+        8 => (ui.get_cfg_low_disk_mib(), 100, 1, 100_000),
+        _ => return,
+    };
+    let value = current.as_str().parse::<i32>().unwrap_or(lower);
+    let value = (value + step * direction).clamp(lower, upper).to_string().into();
+    match index {
+        0 => ui.set_cfg_base_cents(value),
+        1 => ui.set_cfg_base_credits(value),
+        2 => ui.set_cfg_pack_cents(value),
+        3 => ui.set_cfg_pack_credits(value),
+        4 => ui.set_cfg_large_cents(value),
+        5 => ui.set_cfg_large_credits(value),
+        6 => ui.set_cfg_coin_cents(value),
+        7 => ui.set_cfg_attract_minutes(value),
+        8 => ui.set_cfg_low_disk_mib(value),
+        _ => {}
+    }
 }
 
 // =============================================================================

@@ -17,7 +17,7 @@ enum DbCommand {
     RememberPix(PendingPix, Sender<Result<(), String>>),
     PendingPix(Sender<Result<Vec<PendingPix>, String>>),
     ForgetPix(String, String),
-    Authenticate(String),
+    UnlockOperator,
     LockOperator,
     LoadSettings,
     SaveSettings(operator::SettingsInput),
@@ -36,7 +36,6 @@ pub enum DbEvent {
     Balance(u32),
     CreditAccepted { balance: u32, added: u32 },
     Toast { message: String, kind: i32 },
-    Authenticated,
     SettingsLoaded(Settings),
     SettingsSaved(Settings),
     CycleGenre(Vec<AlbumInfo>),
@@ -87,7 +86,7 @@ impl DbHandle {
     pub fn forget_pix(&self, machine_id: String, txid: String) -> Result<(), String> {
         self.send(DbCommand::ForgetPix(machine_id, txid))
     }
-    pub fn authenticate(&self, pin: String) -> Result<(), String> { self.send(DbCommand::Authenticate(pin)) }
+    pub fn unlock_operator(&self) -> Result<(), String> { self.send(DbCommand::UnlockOperator) }
     pub fn lock_operator(&self) -> Result<(), String> { self.send(DbCommand::LockOperator) }
     pub fn load_settings(&self) -> Result<(), String> { self.send(DbCommand::LoadSettings) }
     pub fn save_settings(&self, input: operator::SettingsInput) -> Result<(), String> { self.send(DbCommand::SaveSettings(input)) }
@@ -116,8 +115,6 @@ fn spawn_with_persistence(mut db: Database, persistent: bool) -> (DbHandle, Rece
     let (tx, rx) = mpsc::channel();
     let (events, responses) = mpsc::channel();
     thread::Builder::new().name("storage-service".into()).spawn(move || {
-        let mut failures = 0u32;
-        let mut blocked_until = Instant::now();
         let mut unlocked = false;
         while let Ok(cmd) = rx.recv() {
             match cmd {
@@ -178,39 +175,14 @@ fn spawn_with_persistence(mut db: Database, persistent: bool) -> (DbHandle, Rece
                         log::error!("Falha ao remover Pix expirado {txid}: {e}");
                     }
                 }
-                DbCommand::Authenticate(pin) => {
-                    if Instant::now() < blocked_until {
-                        toast(&events, "Aguarde 30 segundos antes de tentar novamente", 2);
-                        continue;
-                    }
-                    let result = (|| -> Result<bool, String> {
-                        let mut settings = db.settings().map_err(|e| e.to_string())?;
-                        if !settings.has_pin() {
-                            settings.set_pin(&pin)?;
-                            db.save_settings(&settings).map_err(|e| e.to_string())?;
-                            Ok(true)
-                        } else { Ok(settings.verify_pin(&pin)) }
-                    })();
-                    match result {
-                        Ok(true) => {
-                            unlocked = true;
-                            failures = 0;
-                            let _ = events.send(DbEvent::Authenticated);
-                        }
-                        other => {
-                            failures += 1;
-                            if failures >= 5 { blocked_until = Instant::now() + Duration::from_secs(30); failures = 0; }
-                            toast(&events, other.err().unwrap_or("Senha incorreta".into()), 2);
-                        }
-                    }
-                }
+                DbCommand::UnlockOperator => unlocked = true,
                 DbCommand::LockOperator => unlocked = false,
                 DbCommand::LoadSettings => match db.settings() {
                     Ok(settings) => { let _ = events.send(DbEvent::SettingsLoaded(settings)); }
                     Err(e) => toast(&events, format!("Falha ao carregar configurações: {e}"), 2),
                 },
                 DbCommand::SaveSettings(input) => {
-                    if !unlocked { toast(&events, "Faça login para alterar configurações", 2); continue; }
+                    if !unlocked { toast(&events, "Abra o menu do operador para alterar configurações", 2); continue; }
                     let result = db.settings().map_err(|e| e.to_string())
                         .and_then(|old| operator::parse(input, old))
                         .and_then(|settings| { db.save_settings(&settings).map_err(|e| e.to_string())?; Ok(settings) });
@@ -313,14 +285,13 @@ mod tests {
             pack_cents: "500".into(), pack_credits: "6".into(),
             large_cents: "1000".into(), large_credits: "15".into(),
             coin_cents: "100".into(), attract_minutes: "5".into(),
-            low_disk_mib: "500".into(), free_play: true, new_pin: String::new(),
+            low_disk_mib: "500".into(), free_play: true,
         };
         handle.save_settings(input()).unwrap();
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Toast { kind: 2, .. }));
         handle.load_settings().unwrap();
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::SettingsLoaded(s) if !s.free_play));
-        handle.authenticate("1234".into()).unwrap();
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Authenticated));
+        handle.unlock_operator().unwrap();
         handle.save_settings(input()).unwrap();
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::SettingsSaved(s) if s.free_play));
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Toast { kind: 1, .. }));
