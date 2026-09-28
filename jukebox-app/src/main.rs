@@ -1231,20 +1231,25 @@ fn show_toast(ui_handle: &slint::Weak<MainWindow>, message: &str, kind: i32) {
     });
 }
 
+fn pixlogic_qr_path() -> std::path::PathBuf {
+    Database::resolve_db_path().parent().unwrap().join("pix/qr.png")
+}
+
 /// Observa o QR público sem bloquear o event loop. Um arquivo criado ou
 /// substituído durante a execução aparece automaticamente na tela.
 fn watch_pixlogic_qr(ui: slint::Weak<MainWindow>) {
     thread::Builder::new().name("pixlogic-qr".into()).spawn(move || {
-        let path = std::path::Path::new("/dados/pix/qr.png");
+        let path = pixlogic_qr_path();
+        log::info!("QR PixLogic: lendo {}", path.display());
         let mut observed = None;
         let mut retry = true;
         let mut last_error = String::new();
         loop {
-            let signature = std::fs::metadata(path).ok()
+            let signature = std::fs::metadata(&path).ok()
                 .map(|meta| (meta.len(), meta.modified().ok()));
             if retry || observed.as_ref() != Some(&signature) {
                 observed = Some(signature);
-                let result = load_pixlogic_qr(path);
+                let result = load_pixlogic_qr(&path);
                 retry = result.is_err();
                 match result {
                     Ok((rgb, width, height)) => {
@@ -1283,7 +1288,7 @@ fn watch_pixlogic_qr(ui: slint::Weak<MainWindow>) {
 /// Valida e redimensiona a imagem antes de enviá-la para a UI. O caminho é
 /// público e não contém credenciais PixLogic.
 fn load_pixlogic_qr(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Não foi possível ler qr.png: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() < 24 || bytes.len() > 8 * 1024 * 1024
         || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
         return Err("Esperado PNG válido de até 8 MiB (PDF precisa ser convertido)".into());
@@ -1330,7 +1335,18 @@ pub(crate) fn rgb_buffer_to_image(rgb: Vec<u8>, width: u32, height: u32) -> slin
 
 #[cfg(test)]
 mod brl_tests {
-    use super::{format_brl, load_pixlogic_qr, revenue_label};
+    use super::{format_brl, load_pixlogic_qr, pixlogic_qr_path, revenue_label};
+
+    #[test]
+    fn pixlogic_qr_uses_the_same_data_directory_as_the_database() {
+        let db = crate::db::Database::resolve_db_path();
+        let qr = pixlogic_qr_path();
+        assert_eq!(qr, db.parent().unwrap().join("pix/qr.png"));
+        assert!(qr.ends_with("pix/qr.png"));
+        if db.starts_with("./dados") {
+            assert_eq!(qr, std::path::PathBuf::from("./dados/pix/qr.png"));
+        }
+    }
 
     #[test]
     fn local_pix_qr_requires_a_readable_png() {
