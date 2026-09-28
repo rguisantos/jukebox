@@ -2,7 +2,7 @@
 //! Neither commands nor events depend on Slint; the UI bridge lives in main.rs.
 use crate::{db::{Database, PendingPix}, operator, settings::Settings};
 use crate::state::models::{AlbumInfo, GenreInfo, TrackInfo};
-use std::{sync::mpsc::{self, Receiver, Sender}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{sync::mpsc::{self, Receiver, Sender}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 const VOLUME_CONFIG_KEY: &str = "volume";
 

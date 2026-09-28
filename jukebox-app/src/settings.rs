@@ -1,9 +1,11 @@
 //! Persisted operator policy. Monetary arithmetic uses integer centavos only.
+#[cfg(test)]
 use ring::{
     pbkdf2,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::num::NonZeroU32;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -86,9 +88,11 @@ impl Settings {
         }
         (credits, cents)
     }
+    #[cfg(test)]
     pub fn has_pin(&self) -> bool {
         !self.pin_hash.is_empty()
     }
+    #[cfg(test)]
     pub fn set_pin(&mut self, pin: &str) -> Result<(), String> {
         if !(4..=16).contains(&pin.len()) || !pin.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err("Use 4 a 16 letras/números para a senha ou combinação".into());
@@ -109,6 +113,7 @@ impl Settings {
         self.pin_hash = hash.to_vec();
         Ok(())
     }
+    #[cfg(test)]
     pub fn verify_pin(&self, pin: &str) -> bool {
         self.has_pin()
             && pbkdf2::verify(

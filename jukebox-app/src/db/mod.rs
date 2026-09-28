@@ -275,6 +275,7 @@ impl Database {
     /// MÓDULO 8: toda entrada (moeda ou PIX) alimenta também os contadores
     /// antifraude — o caixa parcial (zerado pelo operador no recolhimento)
     /// e o odômetro absoluto (nunca zerado, para conferência patrimonial).
+    #[cfg(test)]
     pub fn increment_credits(&mut self, amount: u32) -> Result<u32> {
         let tx = self.conn.transaction()?;
 
@@ -582,54 +583,6 @@ impl Database {
     // Catálogo de Faixas de Mídia
     // =========================================================================
 
-    /// Insere ou atualiza uma faixa no banco. Usa file_path como chave de unicidade.
-    /// Em caso de conflito (arquivo já indexado), atualiza os metadados.
-    pub fn upsert_track(&mut self, track: &TrackInfo) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO tracks (title, artist, album, file_path, file_type, genre)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(file_path) DO UPDATE SET
-                title     = excluded.title,
-                artist    = excluded.artist,
-                album     = excluded.album,
-                file_type = excluded.file_type,
-                genre     = excluded.genre;",
-            params![
-                track.title,
-                track.artist,
-                track.album,
-                track.file_path,
-                track.file_type,
-                track.genre,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Batch catalog writes so FULL durability does not require one disk sync per track.
-    pub fn upsert_tracks(&mut self, tracks: &[TrackInfo]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO tracks (title,artist,album,file_path,file_type,genre)
-                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(file_path) DO UPDATE SET
-                title=excluded.title, artist=excluded.artist, album=excluded.album,
-                file_type=excluded.file_type, genre=excluded.genre",
-            )?;
-            for track in tracks {
-                insert.execute(params![
-                    track.title,
-                    track.artist,
-                    track.album,
-                    track.file_path,
-                    track.file_type,
-                    track.genre
-                ])?;
-            }
-        }
-        tx.commit()
-    }
-
     pub fn media_fingerprints(&self) -> Result<HashMap<String, String>> {
         let mut stmt = self.conn.prepare("SELECT f.file_path,f.signature FROM media_fingerprints f JOIN tracks t ON t.file_path=f.file_path")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -650,16 +603,6 @@ impl Database {
                 params![t.file_path,signature])?;
         }
         tx.commit()
-    }
-
-    /// Retorna todos os file_paths já cadastrados no banco (para o scanner incremental)
-    pub fn get_all_track_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT file_path FROM tracks;")?;
-        let paths = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(paths)
     }
 
     /// Retorna todas as faixas do catálogo público, ordenadas por artista e
