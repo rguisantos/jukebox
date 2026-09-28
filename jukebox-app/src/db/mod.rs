@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use crate::state::models::{
-    album_initial, fnv64, AlbumInfo, GenreInfo, TrackInfo, SONG_PRICE_MAX, SONG_PRICE_MIN,
+    album_initial, catalog_sort_key, fnv64, AlbumInfo, GenreInfo, TrackInfo, SONG_PRICE_MAX, SONG_PRICE_MIN,
 };
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::collections::HashMap;
@@ -724,8 +724,8 @@ impl Database {
             album.tracks.sort_by(|a, b| a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase()));
         }
         albums.sort_by(|a, b| {
-            a.artist.to_lowercase().cmp(&b.artist.to_lowercase())
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            catalog_sort_key(&a.artist).cmp(&catalog_sort_key(&b.artist))
+                .then_with(|| catalog_sort_key(&a.title).cmp(&catalog_sort_key(&b.title)))
                 .then_with(|| a.key.cmp(&b.key))
         });
 
@@ -899,6 +899,21 @@ mod queue_tests {
         db.create_tables().unwrap();
         db
     }
+    #[test]
+    fn albums_sort_accented_names_with_their_base_letter() {
+        let db = database();
+        for artist in ["Zé Neto", "Ze Ramalho", "Águia", "Ana"] {
+            db.conn.execute(
+                "INSERT INTO tracks(title,artist,album,file_path,file_type,genre)
+                 VALUES('Música',?1,'CD',?2,'mp3','Sertanejo')",
+                params![artist, format!("/dados/musicas/{artist}/CD/01.mp3")],
+            ).unwrap();
+        }
+        let names: Vec<_> = db.get_albums().unwrap().iter()
+            .map(|album| album.artist.clone()).collect();
+        assert_eq!(names, ["Águia", "Ana", "Zé Neto", "Ze Ramalho"]);
+    }
+
     #[test]
     fn each_directory_is_one_cd_even_with_inconsistent_tags() {
         let db = database();
