@@ -49,6 +49,17 @@ concluídas são retomadas depois de reiniciar. Mantenha o token restrito ao
 operador. O protocolo não fornece QR: use o QR associado à máquina no PixLogic.
 Sem os três valores, a jukebox mantém o serviço de QR dinâmico anterior.
 
+Para mostrar na tela o mesmo QR estático impresso, instale a imagem pública em
+`/dados/pix/qr.png` (PNG de 128 a 2048 px por lado, até 4 MiB, com a borda
+branca do código preservada). Prefira baixar a imagem oficial do Mercado Pago;
+se houver apenas PDF, extraia somente a área do QR em PNG sem alterar seu
+conteúdo. Copie primeiro para um arquivo temporário em `/dados/pix/`, renomeie
+para `qr.png` quando estiver completo e reinicie a jukebox. Sem a imagem, a
+tela indica que o cliente deve usar o QR físico. A imagem continua visível
+quando não há conexão com o PixLogic; o estado de conexão aparece separado.
+Antes de colocar em operação, escaneie os códigos da tela e do impresso e
+confira no aplicativo de pagamento se ambos correspondem à máquina correta.
+
 ## Instalar no disco
 
 Inicie pela ISO. Com teclado de manutenção, execute:

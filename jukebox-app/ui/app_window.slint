@@ -415,6 +415,7 @@ export component MainWindow inherits Window {
 
     in property <image> pix-qr-image;
     in property <bool> pixlogic-mode: false;
+    in property <bool> pixlogic-has-qr: false;
     in property <bool> pix-loading: true;
     in property <bool> pix-offline: false;
     in property <string> pix-error-text: "";
@@ -1088,7 +1089,16 @@ export component MainWindow inherits Window {
                                     }
                                 }
 
-                                if root.pixlogic-mode : Rectangle {
+                                if root.pixlogic-mode && root.pixlogic-has-qr : Image {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 232px;
+                                    height: 232px;
+                                    source: root.pix-qr-image;
+                                    image-fit: ImageFit.contain;
+                                }
+
+                                if root.pixlogic-mode && !root.pixlogic-has-qr : Rectangle {
                                     x: 0; y: 0;
                                     width: parent.width;
                                     height: parent.height;
@@ -1096,8 +1106,7 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         spacing: 12px;
-                                        Text { text: root.pix-offline ? "PIX SEM CONEXÃO" : "PIX ATIVO"; color: root.pix-offline ? #b91c1c : #0f766e; font-size: 16px; font-weight: 800; horizontal-alignment: center; }
-                                        Text { text: root.pix-error-text == "" ? "Aguardando pagamento" : root.pix-error-text; color: #64748b; font-size: 12px; horizontal-alignment: center; overflow: elide; width: 220px; }
+                                        Text { text: "USE O QR FÍSICO\nDA MÁQUINA"; color: #0f766e; font-size: 16px; font-weight: 800; horizontal-alignment: center; }
                                     }
                                 }
 
@@ -1153,8 +1162,8 @@ export component MainWindow inherits Window {
                                 horizontal-alignment: center;
                             }
                             if root.pixlogic-mode : Text {
-                                text: "Use o QR PixLogic associado a esta máquina";
-                                color: #64748b;
+                                text: root.pix-offline ? "PIX SEM CONEXÃO" : "PIX ATIVO · AGUARDANDO PAGAMENTO";
+                                color: root.pix-offline ? #f87171 : #2dd4bf;
                                 font-size: 11px;
                                 horizontal-alignment: center;
                                 width: 224px;
