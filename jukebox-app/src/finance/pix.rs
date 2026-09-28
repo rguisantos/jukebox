@@ -21,7 +21,7 @@
 //!   - Falha de DNS/roteador nunca derruba o serviço: o QR atual continua
 //!     na tela e o polling simplesmente tenta de novo no próximo tick;
 //!   - Falha ao gerar QR (backend fora do ar): estado "sem conexão" com
-//!     retry automático a cada 15s + botão manual de tentar novamente;
+//!     retry automático a cada 15s;
 //!   - Todo o serviço roda em um runtime Tokio `current_thread` isolado
 //!     em uma std::thread própria — o runtime de single-core do Sempron
 //!     não paga o preço de um pool multi-thread.
@@ -42,7 +42,6 @@ use crate::{db::PendingPix, storage::service::DbHandle};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender as AsyncSender};
 
 // =============================================================================
 // Parâmetros comerciais e de rede (ajustáveis para o operador)
@@ -103,24 +102,13 @@ pub enum PixUiEvent {
     Paid { machine_id: String, txid: String, credits: u32 },
 }
 
-/// Comandos aceitos pelo serviço (oriundos da interface)
-pub enum PixCommand {
-    /// Força a geração de um novo QR Code (botão "Tentar novamente")
-    RefreshQr,
-}
-
-/// Handle do serviço PIX — barato de clonar, seguro para mover para callbacks
-#[derive(Clone)]
-pub struct PixService {
-    cmd_tx: AsyncSender<PixCommand>,
-}
+/// Serviço PIX legado, que renova o QR automaticamente após expiração ou pagamento.
+pub struct PixService;
 
 impl PixService {
     /// Sobe o serviço PIX: cria a std::thread isolada com o runtime Tokio
-    /// `current_thread` e retorna imediatamente o handle de controle.
+    /// `current_thread` e retorna imediatamente.
     pub fn start(config: PixConfig, event_tx: Sender<PixUiEvent>, storage: DbHandle) -> Self {
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<PixCommand>(8);
-
         thread::Builder::new()
             .name("pix-service".to_string())
             .spawn(move || {
@@ -150,17 +138,11 @@ impl PixService {
                     }
                 };
 
-                rt.block_on(pix_main_loop(config, event_tx, cmd_rx, storage));
+                rt.block_on(pix_main_loop(config, event_tx, storage));
             })
             .expect("Falha crítica ao criar a thread do serviço PIX");
 
-        Self { cmd_tx }
-    }
-
-    /// Pede um novo QR Code imediatamente (chamado pela UI).
-    /// `blocking_send` é seguro aqui: a UI não roda em contexto async.
-    pub fn request_refresh(&self) {
-        let _ = self.cmd_tx.blocking_send(PixCommand::RefreshQr);
+        Self
     }
 }
 
@@ -229,13 +211,12 @@ fn pix_endpoint(base: &str, path: &str) -> String {
 async fn pix_main_loop(
     config: PixConfig,
     event_tx: Sender<PixUiEvent>,
-    mut cmd_rx: Receiver<PixCommand>,
     storage: DbHandle,
 ) {
     // MODO DEMO (JUKEBOX_PIX_DEMO=1): fluxo completo sem backend —
     // QR simulado, pagamento confirmado após DEMO_PAY_DELAY.
     if config.demo {
-        demo_main_loop(&config, event_tx, cmd_rx).await;
+        demo_main_loop(&config, event_tx).await;
         return;
     }
 
@@ -267,19 +248,13 @@ async fn pix_main_loop(
                 Ok(qr) => break qr,
                 Err(reason) => {
                     // Rede caiu / backend fora: sinaliza a UI e espera
-                    // (15s) OU um comando manual de refresh, o que vier 1º.
+                    // 15s antes de tentar novamente.
                     log::warn!("PIX: falha ao gerar QR Code: {}", reason);
                     let _ = event_tx.send(PixUiEvent::Offline { reason });
                     reconcile_pending(&client, &config, &storage, &event_tx, None).await;
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(QR_RETRY_DELAY) => continue,
-                        cmd = cmd_rx.recv() => match cmd {
-                            Some(PixCommand::RefreshQr) => continue,
-                            // Canal fechado = aplicativo encerrando
-                            None => return,
-                        },
-                    }
+                    tokio::time::sleep(QR_RETRY_DELAY).await;
+                    continue;
                 }
             }
         };
@@ -331,44 +306,31 @@ async fn pix_main_loop(
         let mut last_reconciliation = tokio::time::Instant::now();
 
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if last_reconciliation.elapsed() >= Duration::from_secs(60) {
-                        reconcile_pending(&client, &config, &storage, &event_tx, Some(&qr.txid)).await;
-                        last_reconciliation = tokio::time::Instant::now();
-                    }
-                    match check_status(&client, &config, &qr).await {
-                        Ok(PixStatus::Paid) => {
-                            log::info!("PIX: pagamento CONFIRMADO (txid={}).", qr.txid);
-                            let _ = event_tx.send(PixUiEvent::Paid {
-                                machine_id: config.machine_id.clone(),
-                                txid: qr.txid.clone(),
-                                credits: CREDITOS_POR_PIX,
-                            });
-                            // Sai para a FASE 1: novo QR para a próxima venda
-                            break;
-                        }
-                        Ok(PixStatus::Expired) => {
-                            log::info!("PIX: QR expirado sem pagamento. Renovando...");
-                            let _ = storage.forget_pix(config.machine_id.clone(), qr.txid.clone());
-                            break;
-                        }
-                        Ok(PixStatus::Pending) => {
-                            // Ainda aguardando pagamento — segue o baile
-                        }
-                        Err(reason) => {
-                            // Rede oscilou (DNS, 3G): NÃO derruba o QR atual.
-                            // A UI continua exibindo o QR; próximo tick tenta de novo.
-                            log::debug!("PIX: poll de status falhou (rede): {}", reason);
-                        }
-                    }
+            ticker.tick().await;
+            if last_reconciliation.elapsed() >= Duration::from_secs(60) {
+                reconcile_pending(&client, &config, &storage, &event_tx, Some(&qr.txid)).await;
+                last_reconciliation = tokio::time::Instant::now();
+            }
+            match check_status(&client, &config, &qr).await {
+                Ok(PixStatus::Paid) => {
+                    log::info!("PIX: pagamento CONFIRMADO (txid={}).", qr.txid);
+                    let _ = event_tx.send(PixUiEvent::Paid {
+                        machine_id: config.machine_id.clone(),
+                        txid: qr.txid.clone(),
+                        credits: CREDITOS_POR_PIX,
+                    });
+                    // Sai para a FASE 1: novo QR para a próxima venda
+                    break;
                 }
-                cmd = cmd_rx.recv() => match cmd {
-                    Some(PixCommand::RefreshQr) => {
-                        log::info!("PIX: refresh manual solicitado pela UI.");
-                        break;
-                    }
-                    None => return,
+                Ok(PixStatus::Expired) => {
+                    log::info!("PIX: QR expirado sem pagamento. Renovando...");
+                    let _ = storage.forget_pix(config.machine_id.clone(), qr.txid.clone());
+                    break;
+                }
+                Ok(PixStatus::Pending) => {}
+                Err(reason) => {
+                    // Mantém o QR atual e consulta novamente após o próximo intervalo.
+                    log::debug!("PIX: poll de status falhou (rede): {}", reason);
                 }
             }
         }
@@ -386,7 +348,6 @@ async fn pix_main_loop(
 async fn demo_main_loop(
     config: &PixConfig,
     event_tx: Sender<PixUiEvent>,
-    mut cmd_rx: Receiver<PixCommand>,
 ) {
     log::warn!("PIX: MODO DEMO ativo — pagamentos são SIMULADOS (nenhuma cobrança real!)");
 
@@ -421,25 +382,18 @@ async fn demo_main_loop(
             }
         }
 
-        // Espera o "pagamento" — ou um refresh manual da UI, o que vier 1º
-        tokio::select! {
-            _ = tokio::time::sleep(DEMO_PAY_DELAY) => {
-                log::warn!(
-                    "PIX [DEMO]: pagamento SIMULADO confirmado (txid={}) — creditando {} crédito(s).",
-                    txid,
-                    CREDITOS_POR_PIX
-                );
-                let _ = event_tx.send(PixUiEvent::Paid {
-                    machine_id: config.machine_id.clone(),
-                    txid,
-                    credits: CREDITOS_POR_PIX,
-                });
-            }
-            cmd = cmd_rx.recv() => match cmd {
-                Some(PixCommand::RefreshQr) => continue,
-                None => return,
-            }
-        }
+        // Simula um pagamento após o intervalo de demonstração.
+        tokio::time::sleep(DEMO_PAY_DELAY).await;
+        log::warn!(
+            "PIX [DEMO]: pagamento SIMULADO confirmado (txid={}) — creditando {} crédito(s).",
+            txid,
+            CREDITOS_POR_PIX
+        );
+        let _ = event_tx.send(PixUiEvent::Paid {
+            machine_id: config.machine_id.clone(),
+            txid,
+            credits: CREDITOS_POR_PIX,
+        });
     }
 }
 

@@ -149,7 +149,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state_arc.clone();
         let covers = cover_cmd_tx.clone();
         let player = player_cmd_tx.clone();
-        let storage = db_tx.clone();
         thread::spawn(move || {
             while let Ok(event) = db_events.recv() {
                 if let DbEvent::Enqueue(track) = event {
@@ -163,7 +162,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let state = state.clone();
                 let covers = covers.clone();
                 let player = player.clone();
-                let storage = storage.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = weak.upgrade() else { return };
                     match event {
@@ -1196,16 +1194,6 @@ fn credit_feedback(
         },
         1,
     );
-}
-
-/// Atualiza o badge de créditos (thread-safe: sempre dentro do event loop)
-fn update_credits_ui(ui_handle: &slint::Weak<MainWindow>, new_total: u32) {
-    let ui_handle = ui_handle.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = ui_handle.upgrade() {
-            ui.set_credits(new_total as i32);
-        }
-    });
 }
 
 /// Exibe um toast por 3,5s. kind: 0=info 1=sucesso 2=erro.
