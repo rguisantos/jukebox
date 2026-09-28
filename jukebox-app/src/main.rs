@@ -476,18 +476,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             main_window.set_pix_loading(false);
             main_window.set_pix_offline(true);
             main_window.set_pix_error_text("Armazenamento temporário: pagamentos desativados".into());
+            main_window.set_pix_qr_error("Monte /dados para ativar pagamentos".into());
             None
         }
         Some(Ok(config)) => {
             main_window.set_pixlogic_mode(true);
             main_window.set_pix_loading(false);
-            match load_pixlogic_qr(std::path::Path::new("/dados/pix/qr.png")) {
-                Ok(image) => {
-                    main_window.set_pix_qr_image(image);
-                    main_window.set_pixlogic_has_qr(true);
-                }
-                Err(reason) => log::warn!("QR PixLogic local: {reason}"),
-            }
+            watch_pixlogic_qr(main_window.as_weak());
             pixlogic::spawn(config, db_tx.clone(), pix_event_tx);
             None
         }
@@ -495,6 +490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             main_window.set_pixlogic_mode(true);
             main_window.set_pix_loading(false);
             main_window.set_pix_offline(true);
+            main_window.set_pix_qr_error(reason.clone().into());
             main_window.set_pix_error_text(reason.into());
             None
         }
@@ -1235,30 +1231,87 @@ fn show_toast(ui_handle: &slint::Weak<MainWindow>, message: &str, kind: i32) {
     });
 }
 
-/// Carrega o QR público da máquina uma vez no boot. Falha de arquivo mantém o
-/// fluxo PixLogic ativo e a tela orienta a usar o QR físico.
-fn load_pixlogic_qr(path: &std::path::Path) -> Result<slint::Image, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if bytes.len() < 24 || bytes.len() > 4 * 1024 * 1024
+/// Observa o QR público sem bloquear o event loop. Um arquivo criado ou
+/// substituído durante a execução aparece automaticamente na tela.
+fn watch_pixlogic_qr(ui: slint::Weak<MainWindow>) {
+    thread::Builder::new().name("pixlogic-qr".into()).spawn(move || {
+        let path = std::path::Path::new("/dados/pix/qr.png");
+        let mut observed = None;
+        let mut retry = true;
+        let mut last_error = String::new();
+        loop {
+            let signature = std::fs::metadata(path).ok()
+                .map(|meta| (meta.len(), meta.modified().ok()));
+            if retry || observed.as_ref() != Some(&signature) {
+                observed = Some(signature);
+                let result = load_pixlogic_qr(path);
+                retry = result.is_err();
+                match result {
+                    Ok((rgb, width, height)) => {
+                        last_error.clear();
+                        log::info!("QR PixLogic local carregado: {}x{}", width, height);
+                        let weak = ui.clone();
+                        if slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_pix_qr_image(rgb_buffer_to_image(rgb, width, height));
+                                ui.set_pixlogic_has_qr(true);
+                                ui.set_pix_qr_error("".into());
+                            }
+                        }).is_err() { return; }
+                    }
+                    Err(reason) => {
+                        if reason != last_error {
+                            log::warn!("QR PixLogic local: {reason}");
+                            last_error = reason.clone();
+                            let weak = ui.clone();
+                            if slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.set_pixlogic_has_qr(false);
+                                    ui.set_pix_qr_image(slint::Image::default());
+                                    ui.set_pix_qr_error(reason.into());
+                                }
+                            }).is_err() { return; }
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    }).expect("thread do QR PixLogic");
+}
+
+/// Valida e redimensiona a imagem antes de enviá-la para a UI. O caminho é
+/// público e não contém credenciais PixLogic.
+fn load_pixlogic_qr(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("Não foi possível ler qr.png: {e}"))?;
+    if bytes.len() < 24 || bytes.len() > 8 * 1024 * 1024
         || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
-        return Err("esperado arquivo PNG de até 4 MiB".into());
+        return Err("Esperado PNG válido de até 8 MiB (PDF precisa ser convertido)".into());
     }
     let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
     let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-    if !(128..=2048).contains(&width) || !(128..=2048).contains(&height) {
-        return Err("QR PNG deve ter entre 128 e 2048 pixels por dimensão".into());
+    if !(128..=4096).contains(&width) || !(128..=4096).contains(&height) {
+        return Err("QR PNG deve ter entre 128 e 4096 pixels por dimensão".into());
     }
     let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
         .map_err(|e| format!("PNG inválido: {e}"))?;
     let rgba = decoded.to_rgba8();
-    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    for pixel in rgba.pixels() {
+    let (display_w, display_h, pixels) = if width.max(height) > 768 {
+        let scale = 768f64 / f64::from(width.max(height));
+        let w = (f64::from(width) * scale).round().max(1.0) as u32;
+        let h = (f64::from(height) * scale).round().max(1.0) as u32;
+        (w, h, image::imageops::resize(&rgba, w, h, image::imageops::FilterType::Nearest))
+    } else {
+        (width, height, rgba)
+    };
+    let mut rgb = Vec::with_capacity((display_w as usize) * (display_h as usize) * 3);
+    for pixel in pixels.pixels() {
         let alpha = u16::from(pixel[3]);
         for color in &pixel.0[..3] {
             rgb.push(((u16::from(*color) * alpha + 255 * (255 - alpha)) / 255) as u8);
         }
     }
-    Ok(rgb_buffer_to_image(rgb, width, height))
+    Ok((rgb, display_w, display_h))
 }
 
 /// Converte um buffer RGB (QR do PIX, capas de álbum) em textura do Slint
@@ -1286,7 +1339,14 @@ mod brl_tests {
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let pixels = image::RgbaImage::from_pixel(128,128,image::Rgba([0,0,0,255]));
         image::DynamicImage::ImageRgba8(pixels).save(&path).unwrap();
-        assert!(load_pixlogic_qr(&path).is_ok());
+        let (_, width, height) = load_pixlogic_qr(&path).unwrap();
+        assert_eq!((width, height), (128, 128));
+        image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(1024,1024,image::Rgba([255,255,255,255]))
+        ).save(&path).unwrap();
+        let (rgb, width, height) = load_pixlogic_qr(&path).unwrap();
+        assert_eq!((width, height), (768, 768));
+        assert_eq!(rgb.len(), 768 * 768 * 3);
         std::fs::write(&path,b"PDF, not PNG").unwrap();
         assert!(load_pixlogic_qr(&path).is_err());
         std::fs::remove_file(path).unwrap();
