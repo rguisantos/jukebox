@@ -63,6 +63,23 @@ quando não há conexão com o PixLogic; o estado de conexão aparece separado.
 Antes de colocar em operação, escaneie os códigos da tela e do impresso e
 confira no aplicativo de pagamento se ambos correspondem à máquina correta.
 
+### Máquina PixLogic de teste
+
+O perfil público `test-machines/pixlogic-b4450dba.env` contém a origem e o UUID
+da máquina de teste. O repositório é público: não adicione nele o token do
+firmware. Com o `.ino` dessa máquina disponível **localmente**, instale o perfil
+e a credencial direto em `/dados/jukebox.env`:
+
+```sh
+sudo python3 distro/tools/install-test-pixlogic.py /caminho/para/maquina.ino
+```
+
+Execute a partir da raiz do repositório, com `JUKEBOX_DATA` montada. O script
+confere a identidade da máquina, preserva as outras opções de `jukebox.env` e
+grava o arquivo com permissão `0600`, sem mostrar o token. Desligue a ESP que
+usa esse mesmo UUID antes de iniciar a jukebox: dois clientes simultâneos
+podem disputar o mesmo crédito reservado. Reinicie a jukebox após instalar.
+
 ## Instalar no disco
 
 Inicie pela ISO. Com teclado de manutenção, execute:
