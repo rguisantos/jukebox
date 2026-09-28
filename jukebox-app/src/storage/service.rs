@@ -11,6 +11,9 @@ enum DbCommand {
     RefreshCredits,
     CashPulse,
     AcceptPix { machine_id: String, txid: String, credits: u32 },
+    AcceptPixLogic { machine: String, operation: String, credits: u32, reply: Sender<Result<(),String>> },
+    PendingPixLogic { machine: String, reply: Sender<Result<Vec<(String,u32)>,String>> },
+    ConfirmPixLogic { machine: String, operation: String, reply: Sender<Result<(),String>> },
     RememberPix(PendingPix, Sender<Result<(), String>>),
     PendingPix(Sender<Result<Vec<PendingPix>, String>>),
     ForgetPix(String, String),
@@ -55,6 +58,21 @@ impl DbHandle {
     pub fn cash_pulse(&self) -> Result<(), String> { self.send(DbCommand::CashPulse) }
     pub fn accept_pix(&self, machine_id: String, txid: String, credits: u32) -> Result<(), String> {
         self.send(DbCommand::AcceptPix { machine_id, txid, credits })
+    }
+    pub fn accept_pixlogic(&self, machine: String, operation: String, credits: u32) -> Result<(), String> {
+        let (reply, rx) = mpsc::channel();
+        self.send(DbCommand::AcceptPixLogic { machine, operation, credits, reply })?;
+        rx.recv_timeout(Duration::from_secs(8)).map_err(|e| e.to_string())?
+    }
+    pub fn pending_pixlogic(&self, machine: String) -> Result<Vec<(String,u32)>,String> {
+        let (reply, rx) = mpsc::channel();
+        self.send(DbCommand::PendingPixLogic { machine, reply })?;
+        rx.recv_timeout(Duration::from_secs(8)).map_err(|e| e.to_string())?
+    }
+    pub fn confirm_pixlogic(&self, machine: String, operation: String) -> Result<(),String> {
+        let (reply, rx) = mpsc::channel();
+        self.send(DbCommand::ConfirmPixLogic { machine, operation, reply })?;
+        rx.recv_timeout(Duration::from_secs(8)).map_err(|e| e.to_string())?
     }
     pub fn remember_pix(&self, item: PendingPix) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
@@ -116,6 +134,20 @@ pub fn spawn(mut db: Database) -> (DbHandle, Receiver<DbEvent>) {
                     Ok((balance, false)) => { log::info!("PIX repetido ignorado: máquina {machine_id}, txid {txid}"); let _ = events.send(DbEvent::Balance(balance)); }
                     Err(e) => toast(&events, format!("Falha ao registrar PIX: {e}"), 2),
                 },
+                DbCommand::AcceptPixLogic { machine, operation, credits, reply } => {
+                    let result = db.accept_pixlogic(&machine, &operation, credits).map_err(|e| e.to_string());
+                    if let Ok((balance, inserted)) = &result {
+                        if *inserted { let _ = events.send(DbEvent::CreditAccepted { balance: *balance, added: credits }); }
+                        else { let _ = events.send(DbEvent::Balance(*balance)); }
+                    }
+                    let _ = reply.send(result.map(|_| ()));
+                }
+                DbCommand::PendingPixLogic { machine, reply } => {
+                    let _ = reply.send(db.pending_pixlogic(&machine).map_err(|e| e.to_string()));
+                }
+                DbCommand::ConfirmPixLogic { machine, operation, reply } => {
+                    let _ = reply.send(db.confirm_pixlogic(&machine, &operation).map_err(|e| e.to_string()));
+                }
                 DbCommand::RememberPix(item, reply) => {
                     let _ = reply.send(db.remember_pix(&item).map_err(|e| e.to_string()));
                 }

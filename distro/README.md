@@ -40,7 +40,14 @@ ser descartados no reboot. Não use esse modo para receber dinheiro.
 
 A configuração da máquina é `/dados/jukebox.env`. Não coloque comandos nesse
 arquivo: ele é carregado pelo launcher como configuração shell. O padrão do
-Pix foi preservado; a integração com o serviço de saldo será tratada depois.
+Para usar a entrega automática de créditos pelo PixLogic, configure os três
+valores `JUKEBOX_PIXLOGIC_API` (origem HTTPS, sem `/api`),
+`JUKEBOX_PIXLOGIC_UUID` e `JUKEBOX_PIXLOGIC_TOKEN` (credencial de 64 caracteres).
+A jukebox consulta `/api/machine/{uuid}/credit` a cada 3 segundos, grava a
+operação no SQLite e confirma pelo endpoint `/confirm`. Confirmações não
+concluídas são retomadas depois de reiniciar. Mantenha o token restrito ao
+operador. O protocolo não fornece QR: use o QR associado à máquina no PixLogic.
+Sem os três valores, a jukebox mantém o serviço de QR dinâmico anterior.
 
 ## Instalar no disco
 

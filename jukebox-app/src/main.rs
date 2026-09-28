@@ -36,6 +36,7 @@ mod state;
 
 use db::Database;
 use finance::pix::{PixConfig, PixService, PixUiEvent};
+use finance::pixlogic;
 use media::covers::{self, CoverCommand, CoverEvent};
 use catalog_ui::{publish_albums, track_info_to_data};
 use media::player::{self, PlayerCommand, PlayerEvent};
@@ -487,7 +488,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let pix_service = PixService::start(PixConfig::from_env(), pix_event_tx, db_tx.clone());
+    let _legacy_pix = match pixlogic::Config::from_env() {
+        Some(Ok(config)) => {
+            main_window.set_pixlogic_mode(true);
+            main_window.set_pix_loading(false);
+            pixlogic::spawn(config, db_tx.clone(), pix_event_tx);
+            None
+        }
+        Some(Err(reason)) => {
+            main_window.set_pixlogic_mode(true);
+            main_window.set_pix_loading(false);
+            main_window.set_pix_offline(true);
+            main_window.set_pix_error_text(reason.into());
+            None
+        }
+        None => Some(PixService::start(PixConfig::from_env(), pix_event_tx, db_tx.clone())),
+    };
 
     {
         let ui_handle = main_window.as_weak();
@@ -496,6 +512,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::spawn(move || {
             while let Ok(event) = pix_event_rx.recv() {
                 match event {
+                    PixUiEvent::PixLogicStatus { connected, message } => {
+                        let weak = ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_pix_offline(!connected);
+                                ui.set_pix_error_text(message.into());
+                            }
+                        });
+                    }
                     PixUiEvent::Loading => {
                         let ui_handle = ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -688,15 +713,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             handle_ui_action(&ui, &state_arc, action, &db_tx, &player_tx, &usb_tx);
-        });
-    }
-
-    // Botão "Tentar novamente" do painel PIX
-    {
-        let service = pix_service.clone();
-        main_window.on_pix_retry(move || {
-            log::info!("UI: retry manual do QR Code PIX.");
-            service.request_refresh();
         });
     }
 

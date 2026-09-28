@@ -414,6 +414,7 @@ export component MainWindow inherits Window {
     in property <[TrackData]> queue-tracks: [];
 
     in property <image> pix-qr-image;
+    in property <bool> pixlogic-mode: false;
     in property <bool> pix-loading: true;
     in property <bool> pix-offline: false;
     in property <string> pix-error-text: "";
@@ -473,7 +474,6 @@ export component MainWindow inherits Window {
     callback arcade-key-pressed(string) -> bool;
     callback album-activated(int);
     callback track-activated(int);
-    callback pix-retry();
     callback usb-close();
 
     forward-focus: keyboard-handler;
@@ -1055,7 +1055,7 @@ export component MainWindow inherits Window {
                                 background: #ffffff;
                                 border-radius: 8px;
 
-                                if !root.pix-loading && !root.pix-offline : Image {
+                                if !root.pixlogic-mode && !root.pix-loading && !root.pix-offline : Image {
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
                                     width: 232px;
@@ -1064,7 +1064,7 @@ export component MainWindow inherits Window {
                                     image-fit: ImageFit.contain;
                                 }
 
-                                if root.pix-loading : Rectangle {
+                                if !root.pixlogic-mode && root.pix-loading : Rectangle {
                                     x: 0; y: 0;
                                     width: parent.width;
                                     height: parent.height;
@@ -1088,7 +1088,20 @@ export component MainWindow inherits Window {
                                     }
                                 }
 
-                                if root.pix-offline && !root.pix-loading : Rectangle {
+                                if root.pixlogic-mode : Rectangle {
+                                    x: 0; y: 0;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    background: #f8fafc;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 12px;
+                                        Text { text: root.pix-offline ? "PIX SEM CONEXÃO" : "PIX ATIVO"; color: root.pix-offline ? #b91c1c : #0f766e; font-size: 16px; font-weight: 800; horizontal-alignment: center; }
+                                        Text { text: root.pix-error-text == "" ? "Aguardando pagamento" : root.pix-error-text; color: #64748b; font-size: 12px; horizontal-alignment: center; overflow: elide; width: 220px; }
+                                    }
+                                }
+
+                                if !root.pixlogic-mode && root.pix-offline && !root.pix-loading : Rectangle {
                                     x: 0; y: 0;
                                     width: parent.width;
                                     height: parent.height;
@@ -1117,30 +1130,11 @@ export component MainWindow inherits Window {
                                             width: 220px;
                                         }
 
-                                        retry-button := Rectangle {
-                                            width: 150px;
-                                            height: 34px;
-                                            background: retry-mouse.has-hover ? #0d9488 : #14b8a6;
-                                            border-radius: 8px;
-
-                                            retry-mouse := TouchArea {
-                                                clicked => { root.pix-retry(); }
-                                            }
-
-                                            Text {
-                                                text: "TENTAR NOVAMENTE";
-                                                color: #ffffff;
-                                                font-size: 11px;
-                                                font-weight: 800;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
-                                            }
-                                        }
                                     }
                                 }
                             }
 
-                            Text {
+                            if !root.pixlogic-mode : Text {
                                 text: root.op-song-price == 1
                                     ? "R$ 2,00 = 1 CRÉDITO"
                                     : "MÚSICA = \{root.op-song-price} CRÉDITOS (R$ \{root.op-song-price * 2},00)";
@@ -1152,11 +1146,18 @@ export component MainWindow inherits Window {
                                 width: 224px;
                             }
 
-                            Text {
+                            if !root.pixlogic-mode : Text {
                                 text: "Aponte a câmera do app\ndo seu banco para o código";
                                 color: #64748b;
                                 font-size: 11px;
                                 horizontal-alignment: center;
+                            }
+                            if root.pixlogic-mode : Text {
+                                text: "Use o QR PixLogic associado a esta máquina";
+                                color: #64748b;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                width: 224px;
                             }
                         }
                     }
