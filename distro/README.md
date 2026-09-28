@@ -40,6 +40,10 @@ forçar a sincronização no menu do operador, esses arquivos vão para
 `/dados/fundos/`, fora de `/dados/musicas/` e do carrossel. O player
 recarrega a lista após a importação, inclusive quando uma música já estiver
 tocando. Vídeos nas demais pastas do pendrive entram no catálogo como faixas.
+Se uma versão anterior importou clipes para `/dados/musicas/fundos/`, eles
+também poderão servir de fundo, mas serão ocultados do carrossel e do modo
+aleatório de músicas. Após copiar os clipes para `/dados/fundos/`, o operador
+pode retirar a cópia antiga para recuperar espaço em disco.
 
 ## Inicialização e armazenamento
 
