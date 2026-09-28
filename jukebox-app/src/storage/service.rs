@@ -107,7 +107,12 @@ fn toast(events: &Sender<DbEvent>, message: impl Into<String>, kind: i32) {
 }
 
 /// The initial DB connection is moved to its only command consumer after boot.
-pub fn spawn(mut db: Database) -> (DbHandle, Receiver<DbEvent>) {
+pub fn spawn(db: Database) -> (DbHandle, Receiver<DbEvent>) {
+    let persistent = std::env::var("JUKEBOX_DATA_PERSISTENT").as_deref() != Ok("0");
+    spawn_with_persistence(db, persistent)
+}
+
+fn spawn_with_persistence(mut db: Database, persistent: bool) -> (DbHandle, Receiver<DbEvent>) {
     let (tx, rx) = mpsc::channel();
     let (events, responses) = mpsc::channel();
     thread::Builder::new().name("storage-service".into()).spawn(move || {
@@ -120,6 +125,10 @@ pub fn spawn(mut db: Database) -> (DbHandle, Receiver<DbEvent>) {
                     if let Ok(balance) = db.get_credits() { let _ = events.send(DbEvent::Balance(balance)); }
                 }
                 DbCommand::CashPulse => {
+                    if !persistent {
+                        toast(&events, "Armazenamento temporário: crédito em dinheiro desativado", 2);
+                        continue;
+                    }
                     let result = db.settings().and_then(|s| {
                         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
                         db.accept_money(s.coin_cents, &format!("coin-{}-{stamp}", std::process::id()))
@@ -129,12 +138,22 @@ pub fn spawn(mut db: Database) -> (DbHandle, Receiver<DbEvent>) {
                         Err(e) => toast(&events, format!("Falha ao registrar saldo: {e}"), 2),
                     }
                 }
-                DbCommand::AcceptPix { machine_id, txid, credits } => match db.accept_pix(&machine_id, &txid, credits) {
-                    Ok((balance, true)) => { let _ = events.send(DbEvent::CreditAccepted { balance, added: credits }); }
-                    Ok((balance, false)) => { log::info!("PIX repetido ignorado: máquina {machine_id}, txid {txid}"); let _ = events.send(DbEvent::Balance(balance)); }
-                    Err(e) => toast(&events, format!("Falha ao registrar PIX: {e}"), 2),
-                },
+                DbCommand::AcceptPix { machine_id, txid, credits } => {
+                    if !persistent {
+                        toast(&events, "Armazenamento temporário: Pix desativado", 2);
+                        continue;
+                    }
+                    match db.accept_pix(&machine_id, &txid, credits) {
+                        Ok((balance, true)) => { let _ = events.send(DbEvent::CreditAccepted { balance, added: credits }); }
+                        Ok((balance, false)) => { log::info!("PIX repetido ignorado: máquina {machine_id}, txid {txid}"); let _ = events.send(DbEvent::Balance(balance)); }
+                        Err(e) => toast(&events, format!("Falha ao registrar PIX: {e}"), 2),
+                    }
+                }
                 DbCommand::AcceptPixLogic { machine, operation, credits, reply } => {
+                    if !persistent {
+                        let _ = reply.send(Err("Armazenamento temporário: PixLogic desativado".into()));
+                        continue;
+                    }
                     let result = db.accept_pixlogic(&machine, &operation, credits).map_err(|e| e.to_string());
                     if let Ok((balance, inserted)) = &result {
                         if *inserted { let _ = events.send(DbEvent::CreditAccepted { balance: *balance, added: credits }); }
@@ -271,6 +290,18 @@ mod tests {
         handle.request_play(track).unwrap();
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::CreditAccepted { balance: 1, added: 1 }));
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Enqueue(t) if t.genre == "Rock"));
+    }
+
+    #[test]
+    fn temporary_storage_rejects_every_paid_credit_source() {
+        let (handle, events) = spawn_with_persistence(Database::in_memory(), false);
+        handle.cash_pulse().unwrap();
+        assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Toast { kind: 2, .. }));
+        handle.accept_pix("machine".into(), "payment".into(), 2).unwrap();
+        assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Toast { kind: 2, .. }));
+        assert!(handle.accept_pixlogic("machine".into(), "operation".into(), 2).is_err());
+        handle.refresh_credits().unwrap();
+        assert!(matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(), DbEvent::Balance(0)));
     }
 
     #[test]

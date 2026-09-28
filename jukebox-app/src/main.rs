@@ -489,6 +489,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let _legacy_pix = match pixlogic::Config::from_env() {
+        _ if std::env::var("JUKEBOX_DATA_PERSISTENT").as_deref() == Ok("0") => {
+            log::error!("Pix desativado: /dados não está montado como partição persistente");
+            main_window.set_pixlogic_mode(true);
+            main_window.set_pix_loading(false);
+            main_window.set_pix_offline(true);
+            main_window.set_pix_error_text("Armazenamento temporário: pagamentos desativados".into());
+            None
+        }
         Some(Ok(config)) => {
             main_window.set_pixlogic_mode(true);
             main_window.set_pix_loading(false);
