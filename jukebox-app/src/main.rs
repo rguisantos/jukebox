@@ -895,7 +895,7 @@ fn handle_ui_action(
         }
 
         Action::OpenGenrePicker => { let _ = db_tx.load_genres(); }
-        Action::SelectGenre(_) => { let _ = db_tx.refresh_catalog(); }
+        Action::SelectGenre => { let _ = db_tx.refresh_catalog(); }
         Action::OpenSettings => {
             let _ = db_tx.load_settings();
         }
