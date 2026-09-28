@@ -12,8 +12,9 @@
 //!      (o popup é desenhado pelo Slint, mas o vídeo XVideo é composto
 //!      DIRETAMENTE na janela X11, acima de qualquer desenho do Slint).
 //!   2. Copia recursivamente os arquivos `.mp3/.mp4/.wav/.wmv/.mpeg`
-//!      para `/dados/musicas/` (pulando arquivos já existentes — sincronização
-//!      idempotente: reinserir o mesmo pendrive não duplica nada).
+//!      para `/dados/musicas/`. Uma pasta `fundos/` na raiz do pendrive
+//!      vai para `/dados/fundos/`, fora do catálogo de músicas. Arquivos
+//!      idênticos são pulados ao reinserir o mesmo pendrive.
 //!   3. Roda o `scanner::scan_media_directory()` para indexar as novidades.
 //!   4. Emite `UsbSyncEvent::Finished` com o catálogo agrupado por álbum
 //!      (Módulo 7 — pronto para o carrossel de capas).
@@ -177,7 +178,7 @@ fn run_loop(cmd_rx: &Receiver<UsbSyncCommand>, event_tx: &Sender<UsbSyncEvent>) 
             // The first path component is the mounted device, not part of the album.
             let relative = src.strip_prefix(USB_MOUNT_POINT).unwrap();
             let relative: PathBuf = relative.components().skip(1).collect();
-            let dest = dest_dir.join(relative);
+            let dest = usb_destination(&dest_dir, &relative);
             if dest.is_file() && same_content(src, &dest).unwrap_or(false) {
                 skipped += 1;
                 continue;
@@ -316,6 +317,21 @@ fn is_syncable_media(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A pasta "fundos" no nível superior do pendrive alimenta o player visual,
+/// sem virar disco no carrossel. Demais pastas seguem sendo CDs.
+fn usb_destination(music_dir: &Path, relative: &Path) -> PathBuf {
+    let mut parts = relative.components();
+    let background = parts.next()
+        .and_then(|component| component.as_os_str().to_str())
+        .map(|name| name.eq_ignore_ascii_case("fundos"))
+        .unwrap_or(false);
+    if background {
+        music_dir.parent().unwrap_or(music_dir).join("fundos").join(parts.as_path())
+    } else {
+        music_dir.join(relative)
+    }
+}
+
 /// Equal byte length does not imply equal media; hash by chunks without
 /// loading an entire video into RAM. A read error triggers an atomic re-copy.
 fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
@@ -362,6 +378,17 @@ fn copy_atomic(src: &Path, dest: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usb_backgrounds_are_kept_out_of_music_catalog() {
+        let music = Path::new("/dados/musicas");
+        assert_eq!(usb_destination(music, Path::new("fundos/festa.mp4")),
+            Path::new("/dados/fundos/festa.mp4"));
+        assert_eq!(usb_destination(music, Path::new("FUNDOS/noite/loop.MP4")),
+            Path::new("/dados/fundos/noite/loop.MP4"));
+        assert_eq!(usb_destination(music, Path::new("Sertanejo/Zé Neto/CD/01.mp3")),
+            Path::new("/dados/musicas/Sertanejo/Zé Neto/CD/01.mp3"));
+    }
+
     #[test]
     fn equal_size_different_content_is_replaced() {
         let dir = std::env::temp_dir().join(format!("jukebox-usb-digest-{}", std::process::id()));

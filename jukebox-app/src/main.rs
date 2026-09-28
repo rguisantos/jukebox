@@ -382,6 +382,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
 
                         let track_count = albums.iter().map(|a| a.tracks.len()).sum::<usize>();
+                        // Clipes importados para /dados/fundos entram em cena sem
+                        // reiniciar a música nem esperar o próximo boot.
+                        let _ = player_tx.send(PlayerCommand::RefreshBackgrounds);
 
                         // Catálogo agrupado atualizado + reset da navegação
                         publish_albums(&ui_handle, &state_arc, &cover_tx, albums, false);
