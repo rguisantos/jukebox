@@ -78,6 +78,25 @@ def digest(path):
     return h.hexdigest()
 
 
+def album_complete(marker_path, aid, version):
+    """Fast stat check for unchanged albums; hash only files whose metadata changed."""
+    try:
+        marker = json.loads(marker_path.read_text())
+        files = marker.get('files')
+        if marker.get('id') != aid or marker.get('version') != version or not isinstance(files, list) or not files:
+            return False  # Older markers are upgraded on the next sync.
+        for item in files:
+            path = marker_path.parent / component(item['path'])
+            stat = path.stat()
+            if not path.is_file() or stat.st_size != item['size']:
+                return False
+            if stat.st_mtime_ns != item['mtime_ns'] and digest(path) != item['sha256']:
+                return False
+        return True
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def download(item, target, kib):
     size, checksum = item['size'], item['sha256']
     if type(size) is not int or size <= 0 or not re.fullmatch('[0-9a-f]{64}', checksum):
@@ -172,7 +191,7 @@ def sync(root, url, kib=512):
             raise ValueError('ID de álbum duplicado')
         seen.add(aid)
         old = state['albums'].get(aid, {})
-        if old.get('version') == version and (root / old.get('path', '') / '.jukebox-album.json').is_file():
+        if old.get('version') == version and album_complete(root / old.get('path', '') / '.jukebox-album.json', aid, version):
             continue
         album = fetch_json(entry['manifest_url'])
         if album.get('schema') != 1 or album.get('id') != aid or album.get('version') != version:
@@ -186,13 +205,6 @@ def sync(root, url, kib=512):
             marker = destination / '.jukebox-album.json'
             if not marker.is_file() or json.loads(marker.read_text()).get('id') != aid:
                 raise ValueError('Destino pertence a outro álbum ou ao acervo USB')
-        # Hash the complete manifest so changed URLs/contents cannot reuse unrelated partials.
-        token = hashlib.sha256(json.dumps(album, sort_keys=True).encode()).hexdigest()
-        stage = root / '.downloads' / token
-        stage.mkdir(parents=True, exist_ok=True)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if stage.stat().st_dev != destination.parent.stat().st_dev:
-            raise ValueError('Downloads e acervo precisam estar na mesma partição')
         files = album['files']
         if not files or not isinstance(files, list):
             raise ValueError('Álbum vazio')
@@ -201,7 +213,31 @@ def sync(root, url, kib=512):
             name = component(item['path'])
             if Path(name).suffix.lower() not in EXTENSIONS or name in names:
                 raise ValueError('Arquivo inválido ou repetido')
+            if type(item.get('size')) is not int or item['size'] <= 0 or not isinstance(item.get('sha256'), str) or not re.fullmatch('[0-9a-f]{64}', item['sha256']):
+                raise ValueError('Tamanho ou SHA-256 inválido')
             names.add(name)
+        if not any(Path(name).suffix.lower() in {'.mp3', '.mp4', '.wav', '.wmv', '.mpeg'} for name in names):
+            raise ValueError('Álbum deve conter ao menos uma faixa')
+        # Upgrade markers from older installs without swapping thousands of intact albums.
+        marker = destination / '.jukebox-album.json'
+        if old.get('version') == version and marker.is_file():
+            metadata = json.loads(marker.read_text())
+            if metadata.get('id') == aid and metadata.get('version') == version and 'files' not in metadata:
+                if all((destination / item['path']).is_file()
+                       and (destination / item['path']).stat().st_size == item['size'] for item in files):
+                    metadata['files'] = [dict(path=item['path'], size=item['size'], sha256=item['sha256'],
+                                              mtime_ns=(destination / item['path']).stat().st_mtime_ns) for item in files]
+                    atomic_json(marker, metadata)
+                    continue
+        # Hash the complete manifest so changed URLs/contents cannot reuse unrelated partials.
+        token = hashlib.sha256(json.dumps(album, sort_keys=True).encode()).hexdigest()
+        stage = root / '.downloads' / token
+        stage.mkdir(parents=True, exist_ok=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if stage.stat().st_dev != destination.parent.stat().st_dev:
+            raise ValueError('Downloads e acervo precisam estar na mesma partição')
+        for item in files:
+            name = item['path']
             target = stage / name
             if target.is_file() and target.stat().st_size == item['size'] and digest(target) == item['sha256']:
                 continue
@@ -220,9 +256,9 @@ def sync(root, url, kib=512):
                     target = stage / source.name
                     if not target.exists():
                         os.link(source, target)
-        if not any(Path(name).suffix.lower() in {'.mp3', '.mp4', '.wav', '.wmv', '.mpeg'} for name in names):
-            raise ValueError('Álbum deve conter ao menos uma faixa')
-        atomic_json(stage / '.jukebox-album.json', {'id': aid, 'version': version})
+        verified_files = [dict(path=item['path'], size=item['size'], sha256=item['sha256'],
+                               mtime_ns=(stage / item['path']).stat().st_mtime_ns) for item in files]
+        atomic_json(stage / '.jukebox-album.json', {'id': aid, 'version': version, 'files': verified_files})
         publish(stage, destination)
         state['albums'][aid] = {'version': version, 'path': str(relative)}
         atomic_json(state_path, state)
