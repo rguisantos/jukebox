@@ -408,6 +408,13 @@ export component MainWindow inherits Window {
     in-out property <int> selected-letter-index: 0;
     in-out property <[string]> genre-options: [];
     in-out property <int> selected-genre-index: 0;
+    in-out property <[string]> storage-options: [];
+    in-out property <int> storage-index: 0;
+    in-out property <bool> storage-busy: false;
+    in-out property <string> storage-message: "";
+    in-out property <string> storage-confirm-title: "";
+    in-out property <string> storage-confirm-action: "";
+    in-out property <int> storage-confirm-index: 0;
     in-out property <[GenreData]> op-genres: [];
     in-out property <int> op-genre-index: 0;
 
@@ -1337,68 +1344,74 @@ export component MainWindow inherits Window {
                 Rectangle { height: 1px; background: #25293a; }
 
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 0; selected-index: root.op-menu-index;
                     label: "⇅  SINCRONIZAR PENDRIVE"; value: "iniciar agora";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 1; selected-index: root.op-menu-index;
                     label: "PREÇO DA MÚSICA"; value: root.op-song-price == 1 ? "1 crédito" : "\{root.op-song-price} créditos";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 2; selected-index: root.op-menu-index;
                     label: "DIAS RECÉM-ADICIONADOS (*)"; value: "\{root.op-recent-days} dias";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 3; selected-index: root.op-menu-index;
                     label: "BLOQUEAR GÊNEROS"; value: "abrir lista";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 4; selected-index: root.op-menu-index;
                     label: "✕  ZERAR CAIXA PARCIAL"; value: "\{root.op-partial-coins} créditos";
                     actionable: true; danger: true;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 5; selected-index: root.op-menu-index;
                     label: "✕  ZERAR CRÉDITOS ATUAIS"; value: "\{root.credits} créditos";
                     actionable: true; danger: true;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 6; selected-index: root.op-menu-index;
                     label: "DESLIGAR MÁQUINA"; value: "desligar";
                     actionable: true; danger: true;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 7; selected-index: root.op-menu-index;
                     label: "CONFIGURAR WI-FI"; value: "redes e conexão";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 8; selected-index: root.op-menu-index;
                     label: "ATUALIZAR ACERVO ONLINE"; value: "verificar agora";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 9; selected-index: root.op-menu-index;
                     label: "PACOTES, FESTA E AUTOMAÇÃO"; value: "configurar";
                     actionable: true; danger: false;
                 }
                 OperatorMenuRow {
-                    height: 36px;
+                    height: 33px;
                     index: 10; selected-index: root.op-menu-index;
+                    label: "GERENCIAR ARMAZENAMENTO"; value: "remover / restaurar álbuns";
+                    actionable: true; danger: false;
+                }
+                OperatorMenuRow {
+                    height: 33px;
+                    index: 11; selected-index: root.op-menu-index;
                     label: "VOLTAR À JUKEBOX"; value: "O confirma";
                     actionable: true; danger: false;
                 }
@@ -1492,6 +1505,78 @@ export component MainWindow inherits Window {
                             self.viewport-y = 0px - self.sel * 48px;
                         } else if ((self.sel + 1) * 48px > -self.viewport-y + self.height) {
                             self.viewport-y = self.height - (self.sel + 1) * 48px;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Armazenamento local (operador; sem fechamento automático) ----
+    if root.ui-focus == 10 || root.ui-focus == 11 : Rectangle {
+        width: root.width; height: root.height;
+        background: #000000e6;
+        TouchArea { }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(880px, root.width - 24px);
+            height: min(660px, root.height - 24px);
+            background: #0d0e14; border-radius: 16px;
+            border-width: 2px; border-color: #f59e0b;
+            VerticalLayout {
+                padding: 20px; spacing: 12px;
+                Text { text: "ARMAZENAMENTO DESTA MÁQUINA"; color: #fbbf24; font-size: 22px; font-weight: 700; overflow: elide; }
+                Text { text: "Q/E: anterior · W/R: próximo · O: confirmar"; color: #94a3b8; font-size: 14px; }
+                Text { text: "Os álbuns removidos online ficam disponíveis para restauração."; color: #94a3b8; font-size: 13px; overflow: elide; }
+                storage-list := ListView {
+                    for label[idx] in root.storage-options : Rectangle {
+                        height: 60px;
+                        background: idx == root.storage-index ? #4338ca : #1e2438;
+                        border-radius: 6px;
+                        Text {
+                            x: 12px; width: parent.width - 24px; height: parent.height;
+                            text: label; color: #ffffff; font-size: 15px;
+                            vertical-alignment: center; overflow: elide;
+                        }
+                    }
+                    property <int> selected: root.storage-index;
+                    changed selected => {
+                        if (self.selected * 60px < -self.viewport-y) {
+                            self.viewport-y = 0px - self.selected * 60px;
+                        } else if ((self.selected + 1) * 60px > -self.viewport-y + self.height) {
+                            self.viewport-y = self.height - (self.selected + 1) * 60px;
+                        }
+                    }
+                }
+                Text {
+                    text: root.storage-busy ? "Aguarde: operação em andamento…" : root.storage-message;
+                    color: #38bdf8; font-size: 14px; wrap: word-wrap;
+                }
+                Text { text: "DISCO · " + root.disk-status; color: #94a3b8; font-size: 13px; overflow: elide; }
+            }
+        }
+        if root.ui-focus == 11 : Rectangle {
+            width: parent.width; height: parent.height; background: #000000d9;
+            Rectangle {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: min(660px, root.width - 32px); height: 300px;
+                background: #161a27; border-radius: 16px;
+                border-width: 2px; border-color: #f59e0b;
+                VerticalLayout {
+                    padding: 22px; spacing: 16px;
+                    Text { text: root.storage-confirm-action + "?"; color: #fbbf24; font-size: 22px; font-weight: 700; }
+                    Text { text: root.storage-confirm-title; color: #ffffff; font-size: 17px; wrap: word-wrap; }
+                    Text { text: "E/Q: Voltar · R/W: confirmar · O: executar"; color: #94a3b8; font-size: 14px; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle {
+                            background: root.storage-confirm-index == 0 ? #4338ca : #1e2438; border-radius: 8px;
+                            Text { text: "Voltar"; color: #ffffff; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            background: root.storage-confirm-index == 1 ? #b45309 : #1e2438; border-radius: 8px;
+                            Text { text: root.storage-confirm-action; color: #ffffff; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
                         }
                     }
                 }
