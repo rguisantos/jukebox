@@ -727,7 +727,6 @@ mod media_tests {
     // Both tests touch the bounded global frame mailbox.
     static MEDIA_TEST: Mutex<()> = Mutex::new(());
     #[test]
-<<<<<<< jukebox-app/src/media/player.rs
     fn removal_gate_prevents_new_purchase_but_allows_other_albums() {
         let _guard = MEDIA_TEST.lock().unwrap();
         gst::init().unwrap();
@@ -752,7 +751,7 @@ mod media_tests {
         assert_eq!(player.queue.len(), 1);
         std::fs::remove_dir_all(folder).unwrap();
     }
-=======
+    #[test]
     fn background_folder_finds_only_video_in_nested_directories() {
         let dir = std::env::temp_dir().join(format!("jukebox-fundos-{}", std::process::id()));
         let sub = dir.join("festa");
@@ -764,7 +763,6 @@ mod media_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
->>>>>>> /tmp/player-main-official.rs
     #[test]
     fn retries_failed_completion_and_refunds_exactly_once() {
         let _guard = MEDIA_TEST.lock().unwrap();
