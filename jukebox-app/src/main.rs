@@ -255,6 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui_handle = main_window.as_weak();
         let state_arc = state_arc.clone();
         let balance_tx = db_tx.clone();
+        let storage_covers = cover_cmd_tx.clone();
         thread::spawn(move || {
             while let Ok(event) = player_event_rx.recv() {
                 if matches!(event, PlayerEvent::CreditsChanged) {
@@ -263,12 +264,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let ui_handle = ui_handle.clone();
                 let state_arc = state_arc.clone();
+                let storage_covers = storage_covers.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     let ui = match ui_handle.upgrade() {
                         Some(ui) => ui,
                         None => return,
                     };
                     match event {
+                        PlayerEvent::Storage { rows, catalog, message, restore } => {
+                            {
+                                let mut st = lock_state(&state_arc);
+                                st.storage_albums = rows;
+                                let storage_options: Vec<slint::SharedString> = st.storage_albums.iter().map(|album| {
+                                    let status = if album.removed { "REMOVIDO · restaurar" } else if album.online { "ONLINE · remover" } else { "USB · remover" };
+                                    format!("{} / {} · {} · {:.1} MiB · {}", album.artist, album.title, album.genre,
+                                        album.size as f64 / 1_048_576.0, status).into()
+                                }).chain(["Atualizar lista".into(), "Voltar".into()]).collect();
+                                ui.set_storage_options(ModelRc::new(VecModel::from(storage_options)));
+                                st.storage_index = st.storage_index.min(st.storage_albums.len() + 1);
+                                st.storage_busy = false;
+                                st.storage_message = message;
+                                mirror_nav(&ui, &st);
+                            }
+                            if let Some(albums) = catalog {
+                                publish_albums(&ui_handle, &state_arc, &storage_covers, albums, true);
+                            }
+                            if restore {
+                                if let Some(tx) = ONLINE_TX.get() { let _ = tx.send(()); }
+                            }
+                        }
                         PlayerEvent::CreditsChanged => {}
                         PlayerEvent::Notice(message) => show_toast(&ui_handle, &message, 2),
                         PlayerEvent::Previous { title, artist } => {
@@ -794,6 +818,15 @@ pub(crate) fn lock_state(state_arc: &Arc<Mutex<AppState>>) -> std::sync::MutexGu
 /// Chamado após cada tecla/clique processado e a cada publicação de
 /// catálogo — o Slint é renderizador puro dessa única fonte de verdade.
 pub(crate) fn mirror_nav(ui: &MainWindow, st: &AppState) {
+    ui.set_storage_index(st.storage_index as i32);
+    ui.set_storage_busy(st.storage_busy);
+    ui.set_storage_message(st.storage_message.clone().into());
+    ui.set_storage_confirm_index(st.storage_confirm_action as i32);
+    if let Some(album) = st.storage_albums.get(st.storage_index) {
+        ui.set_storage_confirm_title(format!("{} / {}\n{} · {:.1} MiB", album.artist, album.title,
+            album.genre, album.size as f64 / 1_048_576.0).into());
+        ui.set_storage_confirm_action(if album.removed { "Restaurar" } else { "Remover desta máquina" }.into());
+    }
     ui.set_ui_focus(st.focus.as_i32());
     ui.set_selected_album(st.album_index as i32);
     ui.set_selected_track(st.track_index as i32);
@@ -859,6 +892,16 @@ fn handle_ui_action(
     usb_tx: &mpsc::Sender<UsbSyncCommand>,
 ) -> bool {
     let Some(action) = action else { return false };
+    if let Action::ManageStorage(operation) = action {
+        mirror_nav(ui, &lock_state(state_arc));
+        if let Err(error) = player_tx.send(PlayerCommand::Storage(operation)) {
+            let mut st = lock_state(state_arc);
+            st.storage_busy = false;
+            st.storage_message = format!("Player indisponível: {error}");
+            mirror_nav(ui, &st);
+        }
+        return true;
+    }
 
     // Primeiro espelha o estado pós-tecla (uma única fonte de verdade)
     {
@@ -867,6 +910,7 @@ fn handle_ui_action(
     }
 
     match action {
+        Action::ManageStorage(_) => unreachable!("storage action already handled"),
         Action::OpenWifi => {
             if !WIFI_OPEN.swap(true, Ordering::Relaxed) {
                 let weak = ui.as_weak();

@@ -126,8 +126,8 @@ pub const ALPHABET_ITEMS: &[&str] = &[
 // =============================================================================
 
 /// Total de linhas do menu principal do operador
-pub const OPERATOR_MENU_ITEMS: usize = 11;
-pub const OPERATOR_MENU_BACK: usize = 10;
+pub const OPERATOR_MENU_ITEMS: usize = 12;
+pub const OPERATOR_MENU_BACK: usize = 11;
 pub const SETTINGS_ITEMS: usize = 12;
 
 /// Índice da linha "Sincronizar Pendrive" no menu principal
@@ -173,6 +173,8 @@ pub enum FocusState {
     GenrePicker,
     /// Submenu de dias recém-adicionados (W/Q alteram, O/U salvam)
     OperatorRecentDaysMenu,
+    OperatorStorage,
+    OperatorStorageConfirm,
 }
 
 impl FocusState {
@@ -189,6 +191,8 @@ impl FocusState {
             FocusState::AlphabetPicker => 6,
             FocusState::GenrePicker => 8,
             FocusState::OperatorRecentDaysMenu => 7,
+            FocusState::OperatorStorage => 10,
+            FocusState::OperatorStorageConfirm => 11,
         }
     }
 
@@ -203,6 +207,8 @@ impl FocusState {
                 | FocusState::OperatorPriceMenu
                 | FocusState::OperatorGenreMenu
                 | FocusState::OperatorRecentDaysMenu
+                | FocusState::OperatorStorage
+                | FocusState::OperatorStorageConfirm
         )
     }
 }
@@ -211,6 +217,7 @@ impl FocusState {
 /// A máquina permanece pura: nenhum canal, banco ou UI é tocado aqui dentro.
 #[derive(Debug, Clone)]
 pub enum Action {
+    ManageStorage(crate::media::storage_management::StorageOperation),
     OpenGenrePicker,
     SelectGenre,
     OpenSettings,
@@ -308,6 +315,11 @@ pub struct AppState {
     pub active_genre: String,
     pub available_genres: Vec<String>,
     pub selected_genre: usize,
+    pub storage_albums: Vec<crate::media::storage_management::StorageAlbum>,
+    pub storage_index: usize,
+    pub storage_confirm_action: usize,
+    pub storage_busy: bool,
+    pub storage_message: String,
     pub last_navigation: std::time::Instant,
     pub last_overlay_interaction: std::time::Instant,
     pub fullscreen: bool,
@@ -355,6 +367,11 @@ impl AppState {
             active_genre: String::new(),
             available_genres: vec![String::new()],
             selected_genre: 0,
+            storage_albums: vec![],
+            storage_index: 0,
+            storage_confirm_action: 0,
+            storage_busy: false,
+            storage_message: String::new(),
             last_navigation: std::time::Instant::now(),
             last_overlay_interaction: std::time::Instant::now(),
             fullscreen: false,
@@ -485,6 +502,48 @@ impl AppState {
         }
 
         match self.focus {
+            FocusState::OperatorStorage if self.storage_busy => Some(Action::Noop),
+            FocusState::OperatorStorage => match key {
+                'w' | 'r' => {
+                    self.storage_index = (self.storage_index + 1).min(self.storage_albums.len() + 1);
+                    Some(Action::Noop)
+                },
+                'q' | 'e' => {
+                    self.storage_index = self.storage_index.saturating_sub(1);
+                    Some(Action::Noop)
+                },
+                'o' if self.storage_index == self.storage_albums.len() + 1 => {
+                    self.focus = FocusState::OperatorMainMenu;
+                    Some(Action::Noop)
+                },
+                'o' if self.storage_index == self.storage_albums.len() => {
+                    self.storage_busy = true;
+                    Some(Action::ManageStorage(crate::media::storage_management::StorageOperation::List))
+                },
+                'o' => {
+                    self.storage_confirm_action = 0;
+                    self.focus = FocusState::OperatorStorageConfirm;
+                    Some(Action::Noop)
+                },
+                _ => None,
+            },
+            FocusState::OperatorStorageConfirm => match key {
+                'q' | 'e' => { self.storage_confirm_action = 0; Some(Action::Noop) },
+                'w' | 'r' => { self.storage_confirm_action = 1; Some(Action::Noop) },
+                'o' => {
+                    self.focus = FocusState::OperatorStorage;
+                    if self.storage_confirm_action == 0 { return Some(Action::Noop); }
+                    let album = self.storage_albums.get(self.storage_index)?.clone();
+                    let operation = if album.removed {
+                        crate::media::storage_management::StorageOperation::Restore(album)
+                    } else {
+                        crate::media::storage_management::StorageOperation::Remove(album)
+                    };
+                    self.storage_busy = true;
+                    Some(Action::ManageStorage(operation))
+                },
+                _ => None,
+            },
             FocusState::OperatorSettings => match key {
                 'w' => { self.settings_index = (self.settings_index + 1).min(SETTINGS_ITEMS - 1); Some(Action::Noop) }
                 'q' => { self.settings_index = self.settings_index.saturating_sub(1); Some(Action::Noop) }
@@ -715,6 +774,12 @@ impl AppState {
                         self.focus = FocusState::OperatorSettings;
                         Some(Action::OpenSettings)
                     }
+                    10 => {
+                        self.focus = FocusState::OperatorStorage;
+                        self.storage_index = 0;
+                        self.storage_busy = true;
+                        Some(Action::ManageStorage(crate::media::storage_management::StorageOperation::List))
+                    }
                     OPERATOR_MENU_BACK => {
                         self.focus = self.previous;
                         Some(Action::CloseOperatorMenu)
@@ -847,6 +912,39 @@ pub fn album_initial(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_storage_requires_confirmation_and_has_explicit_back() {
+        use crate::media::storage_management::{StorageAlbum, StorageOperation};
+        let mut state = AppState::new(50, 1);
+        state.focus = FocusState::OperatorMainMenu;
+        state.menu_index = 10;
+        assert!(matches!(state.handle_key("o"), Some(Action::ManageStorage(StorageOperation::List))));
+        assert!(state.focus.is_operator());
+        assert!(state.storage_busy);
+        state.storage_albums = vec![StorageAlbum { id: "album-1".into(), path: "musicas/Rock/Ana/CD".into(),
+            artist: "Ana".into(), title: "CD".into(), genre: "Rock".into(), size: 100,
+            online: true, removed: false }];
+        state.storage_busy = false;
+        state.handle_key("o");
+        assert_eq!(state.focus, FocusState::OperatorStorageConfirm);
+        // O alone chooses Voltar, never deletes.
+        assert!(matches!(state.handle_key("o"), Some(Action::Noop)));
+        assert!(!state.storage_busy);
+        state.handle_key("o"); state.handle_key("r");
+        assert!(matches!(state.handle_key("o"), Some(Action::ManageStorage(StorageOperation::Remove(_)))));
+        assert!(state.storage_busy);
+        state.handle_key("w");
+        assert_eq!(state.storage_index, 0);
+        state.storage_busy = false;
+        state.storage_albums[0].removed = true;
+        state.handle_key("o"); state.handle_key("w");
+        assert!(matches!(state.handle_key("o"), Some(Action::ManageStorage(StorageOperation::Restore(_)))));
+        state.storage_busy = false;
+        state.storage_index = state.storage_albums.len() + 1;
+        state.handle_key("o");
+        assert_eq!(state.focus, FocusState::OperatorMainMenu);
+    }
 
     #[test]
     fn genre_picker_selects_and_goes_back_with_o() {

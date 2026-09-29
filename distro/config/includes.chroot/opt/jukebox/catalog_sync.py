@@ -74,6 +74,20 @@ def sync_dir(path):
         os.close(fd)
 
 
+def load_exclusions(root):
+    path = root / 'catalog-exclusions.json'
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    if data.get('schema') != 1 or not isinstance(data.get('albums'), dict):
+        raise ValueError('Lista de álbuns removidos inválida; sincronização adiada')
+    for aid, album in data['albums'].items():
+        component(aid)
+        if not isinstance(album, dict) or album.get('id') != aid:
+            raise ValueError('Lista de álbuns removidos inválida')
+    return data['albums']
+
+
 def digest(path):
     h = hashlib.sha256()
     with path.open('rb') as src:
@@ -187,6 +201,7 @@ def sync(root, url, kib=512):
         raise ValueError('Versão de protocolo desconhecida')
     state_path = root / 'catalog-state.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {'albums': {}}
+    exclusions = load_exclusions(root)
     changed = False
     seen = set()
     for entry in index['albums']:
@@ -195,6 +210,8 @@ def sync(root, url, kib=512):
         if aid in seen:
             raise ValueError('ID de álbum duplicado')
         seen.add(aid)
+        if aid in exclusions:
+            continue
         old = state['albums'].get(aid, {})
         if old.get('version') == version and album_complete(root / old.get('path', '') / '.jukebox-album.json', aid, version):
             continue
@@ -269,6 +286,7 @@ def sync(root, url, kib=512):
         token = hashlib.sha256(json.dumps(album, sort_keys=True).encode()).hexdigest()
         stage = root / '.downloads' / token
         stage.mkdir(parents=True, exist_ok=True)
+        atomic_json(stage / '.jukebox-download.json', {'id': aid, 'version': version})
         destination.parent.mkdir(parents=True, exist_ok=True)
         if stage.stat().st_dev != destination.parent.stat().st_dev:
             raise ValueError('Downloads e acervo precisam estar na mesma partição')

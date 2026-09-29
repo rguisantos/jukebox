@@ -32,6 +32,7 @@ fn clear_frame() {
 }
 
 pub enum PlayerCommand {
+    Storage(super::storage_management::StorageOperation),
     Enqueue(TrackInfo),
     SetVolume(f64),
     SkipTrack,
@@ -46,6 +47,12 @@ pub enum PlayerCommand {
 }
 
 pub enum PlayerEvent {
+    Storage {
+        rows: Vec<super::storage_management::StorageAlbum>,
+        catalog: Option<Vec<crate::state::models::AlbumInfo>>,
+        message: String,
+        restore: bool,
+    },
     CreditsChanged,
     TrackStarted {
         id: i64,
@@ -262,6 +269,10 @@ struct Player {
     backgrounds: Vec<PathBuf>,
     failed_backgrounds: Vec<PathBuf>,
     current_background: Option<PathBuf>,
+    storage_tx: Sender<PlayerEvent>,
+    storage_rx: Receiver<PlayerEvent>,
+    storage_pending: bool,
+    removal_path: Option<PathBuf>,
 }
 impl Player {
     fn new(tx: Sender<PlayerEvent>) -> Result<Self, String> {
@@ -280,6 +291,7 @@ impl Player {
         let effect = CreditArpeggio::new(fake)?;
         let settings = db.settings().map_err(|e| e.to_string())?;
         let queue = db.pending_tracks().map_err(|e| e.to_string())?.into();
+        let (storage_tx, storage_rx) = std::sync::mpsc::channel();
         let mut p = Self {
             music,
             background,
@@ -304,6 +316,10 @@ impl Player {
             backgrounds: vec![],
             failed_backgrounds: vec![],
             current_background: None,
+            storage_tx,
+            storage_rx,
+            storage_pending: false,
+            removal_path: None,
         };
         p.refresh_backgrounds();
         Ok(p)
@@ -365,6 +381,11 @@ impl Player {
     fn run(&mut self, rx: Receiver<PlayerCommand>) {
         self.emit_queue();
         loop {
+            while let Ok(event) = self.storage_rx.try_recv() {
+                self.storage_pending = false;
+                self.removal_path = None;
+                let _ = self.tx.send(event);
+            }
             match rx.recv_timeout(Duration::from_millis(25)) {
                 Ok(cmd) => self.command(cmd),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -454,8 +475,16 @@ impl Player {
     }
     fn command(&mut self, cmd: PlayerCommand) {
         match cmd {
+            PlayerCommand::Storage(operation) => self.manage_storage(operation),
             PlayerCommand::Enqueue(t) => {
                 self.last_activity = Instant::now();
+                if let Some(folder) = &self.removal_path {
+                    let path = std::env::current_dir().unwrap_or_default().join(&t.file_path);
+                    if path.starts_with(folder) {
+                        let _ = self.tx.send(PlayerEvent::Notice("Álbum em remoção; nenhum crédito debitado".into()));
+                        return;
+                    }
+                }
                 if !Path::new(&t.file_path).is_file() {
                     let _ = self.tx.send(PlayerEvent::Notice(
                         "Arquivo indisponível; nenhum crédito debitado".into(),
@@ -533,6 +562,66 @@ impl Player {
             }
             PlayerCommand::HideVideo | PlayerCommand::RestoreVideo => {}
         }
+    }
+    fn manage_storage(&mut self, operation: super::storage_management::StorageOperation) {
+        use super::storage_management::{self, StorageOperation};
+        // Install a reservation gate on the player thread, then do filesystem
+        // work off-thread so playback, EOS and credit effects keep progressing.
+        if self.storage_pending { return; }
+        if !self.operator {
+            let _ = self.tx.send(PlayerEvent::Storage {
+                rows: vec![], catalog: None, message: "Abra o menu do operador".into(), restore: false,
+            });
+            return;
+        }
+        let pending = match self.db.pending_tracks() {
+            Ok(tracks) => tracks,
+            Err(error) => {
+                let _ = self.tx.send(PlayerEvent::Storage { rows: vec![], catalog: None,
+                    message: format!("Não foi possível conferir a fila: {error}"), restore: false });
+                return;
+            }
+        };
+        let mut protected: Vec<String> = pending.into_iter().map(|(_, t)| t.file_path).collect();
+        protected.extend(self.current.iter().map(|t| t.file_path.clone()));
+        protected.extend(self.queue.iter().map(|(_, t)| t.file_path.clone()));
+        if let StorageOperation::Remove(album) = &operation {
+            if let Ok(cwd) = std::env::current_dir() {
+                let media = super::scanner::resolve_media_dir();
+                self.removal_path = Some(cwd.join(media.parent().unwrap()).join(&album.path));
+            } else {
+                let _ = self.tx.send(PlayerEvent::Storage { rows: vec![], catalog: None,
+                    message: "Não foi possível conferir o caminho do álbum".into(), restore: false });
+                return;
+            }
+        }
+        self.storage_pending = true;
+        let tx = self.storage_tx.clone();
+        let media = super::scanner::resolve_media_dir();
+        thread::spawn(move || {
+            let result = storage_management::run(&operation, &protected);
+            let (rows, message, restore, changed) = match result {
+                Ok(result) => (result.rows, result.message, result.restore, result.changed),
+                Err(error) => {
+                    let rows = storage_management::run(&StorageOperation::List, &protected)
+                        .map(|result| result.rows).unwrap_or_default();
+                    (rows, error, false, matches!(operation, StorageOperation::Remove(_)))
+                }
+            };
+            let catalog = if changed {
+                match super::catalog_lock::CatalogLock::acquire(media.parent().unwrap()) {
+                    Ok(_lock) => match Database::open() {
+                        Ok(mut db) => {
+                            super::scanner::scan_media_directory(&mut db);
+                            db.get_albums().ok()
+                        },
+                        Err(error) => { log::error!("Armazenamento: erro do catálogo: {error}"); None },
+                    }
+                    Err(error) => { log::error!("Armazenamento: não foi possível reler catálogo: {error}"); None }
+                }
+            } else { None };
+            let _ = tx.send(PlayerEvent::Storage { rows, catalog, message, restore });
+        });
     }
     fn start(&mut self, t: TrackInfo) {
         let _ = self.music.set_state(gst::State::Null);
@@ -637,6 +726,31 @@ mod media_tests {
     use super::*;
     // Both tests touch the bounded global frame mailbox.
     static MEDIA_TEST: Mutex<()> = Mutex::new(());
+    #[test]
+    fn removal_gate_prevents_new_purchase_but_allows_other_albums() {
+        let _guard = MEDIA_TEST.lock().unwrap();
+        gst::init().unwrap();
+        let folder = std::env::temp_dir().join(format!("jukebox-removal-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let album = folder.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("song.mp3"), b"audio").unwrap();
+        std::fs::write(folder.join("other.mp3"), b"audio").unwrap();
+        let mut db = Database::in_memory(); db.increment_credits(2).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut player = Player::with_database(db, tx, true).unwrap();
+        player.removal_path = Some(album.clone());
+        let mut track = TrackInfo { id: 1, title: "Test".into(), artist: "Ana".into(), album: "CD".into(),
+            file_path: album.join("song.mp3").to_string_lossy().into(), file_type: "mp3".into(), genre: "Rock".into() };
+        player.command(PlayerCommand::Enqueue(track.clone()));
+        assert_eq!(player.db.get_credits().unwrap(), 2);
+        assert!(player.db.pending_tracks().unwrap().is_empty());
+        track.file_path = folder.join("other.mp3").to_string_lossy().into();
+        player.command(PlayerCommand::Enqueue(track));
+        assert_eq!(player.db.get_credits().unwrap(), 1);
+        assert_eq!(player.queue.len(), 1);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
     #[test]
     fn background_folder_finds_only_video_in_nested_directories() {
         let dir = std::env::temp_dir().join(format!("jukebox-fundos-{}", std::process::id()));
