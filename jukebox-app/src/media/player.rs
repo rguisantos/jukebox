@@ -40,6 +40,7 @@ pub enum PlayerCommand {
     Activity,
     Operator(bool),
     ReloadSettings,
+    RefreshBackgrounds,
     // Older dialogs still emit these; Slint now handles visibility without stopping video.
     HideVideo,
     RestoreVideo,
@@ -206,6 +207,32 @@ impl Drop for CreditArpeggio {
     fn drop(&mut self) { self.stop(); }
 }
 
+/// Lista clipes completos em /dados/fundos, inclusive subpastas, sem seguir
+/// links simbólicos do pendrive. A ordem é estável; a escolha ocorre no player.
+fn background_files(dir: &Path) -> Vec<PathBuf> {
+    fn visit(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() { continue; }
+            let path = entry.path();
+            if kind.is_dir() {
+                visit(&path, files);
+            } else if kind.is_file()
+                && path.extension().and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mpeg" | "wmv"))
+                    .unwrap_or(false)
+            {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(dir, &mut files);
+    files.sort();
+    files
+}
+
 pub fn spawn(rx: Receiver<PlayerCommand>, tx: Sender<PlayerEvent>) {
     thread::Builder::new()
         .name("jukebox-player".into())
@@ -308,20 +335,17 @@ impl Player {
             .parent()
             .unwrap()
             .join("fundos");
-        self.backgrounds = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && matches!(
-                        p.extension().and_then(|s| s.to_str()),
-                        Some("mp4" | "mpeg" | "wmv")
-                    )
-            })
-            .collect();
+        self.backgrounds = background_files(&dir);
+        // Compatibilidade: versões anteriores do importador USB colocavam
+        // fundos dentro de musicas/fundos. Novos clipes vão para /dados/fundos.
+        let legacy_dir = super::scanner::resolve_media_dir().join("fundos");
+        self.backgrounds.extend(background_files(&legacy_dir).into_iter().filter(|path| {
+            path.strip_prefix(&legacy_dir).ok()
+                .map(|relative| !dir.join(relative).is_file())
+                .unwrap_or(false)
+        }));
         self.failed_backgrounds.clear();
+        log::info!("Vídeos de fundo disponíveis: {}", self.backgrounds.len());
     }
     fn background_next(&mut self) {
         let _ = self.background.set_state(gst::State::Null);
@@ -528,6 +552,14 @@ impl Player {
                 self.refresh_backgrounds();
                 self.last_auto = Instant::now();
             }
+            PlayerCommand::RefreshBackgrounds => {
+                self.refresh_backgrounds();
+                if self.current.as_ref().map(|track| !track.is_video()).unwrap_or(false)
+                    && SOURCE.load(Ordering::Relaxed) != 2
+                {
+                    self.background_next();
+                }
+            }
             PlayerCommand::HideVideo | PlayerCommand::RestoreVideo => {}
         }
     }
@@ -695,6 +727,7 @@ mod media_tests {
     // Both tests touch the bounded global frame mailbox.
     static MEDIA_TEST: Mutex<()> = Mutex::new(());
     #[test]
+<<<<<<< jukebox-app/src/media/player.rs
     fn removal_gate_prevents_new_purchase_but_allows_other_albums() {
         let _guard = MEDIA_TEST.lock().unwrap();
         gst::init().unwrap();
@@ -719,6 +752,19 @@ mod media_tests {
         assert_eq!(player.queue.len(), 1);
         std::fs::remove_dir_all(folder).unwrap();
     }
+=======
+    fn background_folder_finds_only_video_in_nested_directories() {
+        let dir = std::env::temp_dir().join(format!("jukebox-fundos-{}", std::process::id()));
+        let sub = dir.join("festa");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("loop.MP4"), b"video").unwrap();
+        std::fs::write(dir.join("01.mp3"), b"audio").unwrap();
+        std::fs::write(dir.join(".copiando.usb-part"), b"partial").unwrap();
+        assert_eq!(background_files(&dir), vec![sub.join("loop.MP4")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+>>>>>>> /tmp/player-main-official.rs
     #[test]
     fn retries_failed_completion_and_refunds_exactly_once() {
         let _guard = MEDIA_TEST.lock().unwrap();
