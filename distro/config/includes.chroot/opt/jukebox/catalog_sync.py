@@ -41,7 +41,11 @@ OPENER = urllib.request.build_opener(HTTPSOnly())
 def request(url, headers=None):
     if not isinstance(url, str) or not url.startswith('https://'):
         raise ValueError('O servidor deve usar HTTPS')
-    return OPENER.open(urllib.request.Request(url, headers=headers or {}), timeout=30)
+    # Cloudflare's public R2 endpoint may reject urllib's default Python-urllib
+    # User-Agent with HTTP 403 while serving the same public object to curl.
+    request_headers = {'User-Agent': 'jukebox-catalog/1.0'}
+    request_headers.update(headers or {})
+    return OPENER.open(urllib.request.Request(url, headers=request_headers), timeout=30)
 
 
 def fetch_json(url):
@@ -141,9 +145,10 @@ def download(item, target, kib):
                     raise ValueError('Arquivo maior que o manifesto')
                 out.write(chunk)
                 downloaded += len(chunk)
-                delay = downloaded / (kib * 1024) - (time.monotonic() - began)
-                if delay > 0:
-                    time.sleep(delay)
+                if kib > 0:
+                    delay = downloaded / (kib * 1024) - (time.monotonic() - began)
+                    if delay > 0:
+                        time.sleep(delay)
                 if time.monotonic() - last_progress >= 1:
                     emit(f'Baixando {target.name}: {total * 100 // size}%', downloaded=total, size=size)
                     last_progress = time.monotonic()
@@ -198,9 +203,8 @@ def sync(root, url, kib=512):
             raise ValueError('Manifesto do álbum não corresponde ao índice')
         parts = [component(album[k]) for k in ('genre', 'artist', 'title')]
         relative = Path('musicas', *parts)
-        if old and old.get('path') != str(relative):
-            raise ValueError('Renomeação de álbum exige migração; acervo local preservado')
         destination = root / relative
+        reuse_directory = destination
         if destination.exists():
             marker = destination / '.jukebox-album.json'
             if not marker.is_file() or json.loads(marker.read_text()).get('id') != aid:
@@ -218,6 +222,38 @@ def sync(root, url, kib=512):
             names.add(name)
         if not any(Path(name).suffix.lower() in {'.mp3', '.mp4', '.wav', '.wmv', '.mpeg'} for name in names):
             raise ValueError('Álbum deve conter ao menos uma faixa')
+        if old and old.get('path') != str(relative):
+            old_parts = Path(old['path']).parts
+            if len(old_parts) != 4 or old_parts[0] != 'musicas':
+                raise ValueError('Caminho anterior do álbum inválido')
+            source = root.joinpath(*(component(part) for part in old_parts))
+            # Recover if the process stopped after rename but before saving state.
+            if not source.exists() and destination.exists():
+                source = destination
+            marker = source / '.jukebox-album.json'
+            if source.is_symlink() or (source.exists() and
+                    (not marker.is_file() or json.loads(marker.read_text()).get('id') != aid)):
+                raise ValueError('Álbum anterior não encontrado; acervo local preservado')
+            reuse_directory = source
+            intact = all((source / item['path']).is_file()
+                         and (source / item['path']).stat().st_size == item['size']
+                         and digest(source / item['path']) == item['sha256'] for item in files)
+            if intact and (source == destination or not destination.exists()):
+                verified = [dict(path=item['path'], size=item['size'], sha256=item['sha256'],
+                                 mtime_ns=(source / item['path']).stat().st_mtime_ns) for item in files]
+                atomic_json(marker, {'id': aid, 'version': version, 'files': verified})
+                if source != destination:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(source, destination)
+                    sync_dir(source.parent)
+                    sync_dir(destination.parent)
+                state['albums'][aid] = {'version': version, 'path': str(relative)}
+                atomic_json(state_path, state)
+                changed = True
+                for cache in (root / 'capas').glob('*.jbc'):
+                    cache.unlink(missing_ok=True)
+                emit(f'Álbum reorganizado: {album["title"]}', changed=True)
+                continue
         # Upgrade markers from older installs without swapping thousands of intact albums.
         marker = destination / '.jukebox-album.json'
         if old.get('version') == version and marker.is_file():
@@ -241,17 +277,17 @@ def sync(root, url, kib=512):
             target = stage / name
             if target.is_file() and target.stat().st_size == item['size'] and digest(target) == item['sha256']:
                 continue
-            existing = destination / name
+            existing = reuse_directory / name
             if existing.is_file() and existing.stat().st_size == item['size'] and digest(existing) == item['sha256']:
                 if target.exists():
                     target.unlink()
                 os.link(existing, target)
             else:
                 emit(f'Atualizando {album["title"]}: {name}')
-                download(item, target, max(16, kib))
+                download(item, target, 0 if kib == 0 else max(16, kib))
         # An omitted track is not an instruction to delete local media.
-        if destination.exists():
-            for source in destination.iterdir():
+        if reuse_directory.exists():
+            for source in reuse_directory.iterdir():
                 if source.is_file() and not source.name.startswith('.') and source.name not in names:
                     target = stage / source.name
                     if not target.exists():
@@ -260,6 +296,11 @@ def sync(root, url, kib=512):
                                mtime_ns=(stage / item['path']).stat().st_mtime_ns) for item in files]
         atomic_json(stage / '.jukebox-album.json', {'id': aid, 'version': version, 'files': verified_files})
         publish(stage, destination)
+        if reuse_directory != destination and reuse_directory.exists():
+            retired = root / '.downloads' / f'retired-{aid}-{time.time_ns()}'
+            os.rename(reuse_directory, retired)
+            sync_dir(reuse_directory.parent)
+            sync_dir(retired.parent)
         state['albums'][aid] = {'version': version, 'path': str(relative)}
         atomic_json(state_path, state)
         changed = True
@@ -282,7 +323,7 @@ def main():
         # USB imports use the same lock. Wait so a skipped check does not delay
         # a new album until the next periodic poll.
         fcntl.flock(lock, fcntl.LOCK_EX)
-        sync(root, url, int(os.environ.get('JUKEBOX_DOWNLOAD_KIB', '512')))
+        sync(root, url, int(os.environ.get('JUKEBOX_DOWNLOAD_KIB', '0')))
 
 
 if __name__ == '__main__':

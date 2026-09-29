@@ -591,6 +591,24 @@ impl Database {
         rows.collect()
     }
 
+    pub fn catalog_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT file_path FROM tracks")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Remove only media catalog records; credits and the playback queue are separate.
+    pub fn remove_catalog_paths(&mut self, paths: &[String]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut removed = 0;
+        for path in paths {
+            tx.execute("DELETE FROM media_fingerprints WHERE file_path=?1", [path])?;
+            removed += tx.execute("DELETE FROM tracks WHERE file_path=?1", [path])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Metadata and fingerprint commit together; failed indexing is retried next scan.
     pub fn index_tracks(&mut self, tracks: &[(TrackInfo, String)]) -> Result<()> {
         let tx = self.conn.transaction()?;

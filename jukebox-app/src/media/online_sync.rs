@@ -42,6 +42,13 @@ pub fn spawn(events: mpsc::Sender<OnlineEvent>) -> mpsc::Sender<()> {
                             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                                 changed |= value["changed"].as_bool().unwrap_or(false);
                                 if let Some(message) = value["message"].as_str() {
+                                    if value["error"].as_bool().unwrap_or(false) {
+                                        log::warn!("Acervo online: {message}");
+                                    } else if value["complete"].as_bool().unwrap_or(false)
+                                        || value["changed"].as_bool().unwrap_or(false)
+                                    {
+                                        log::info!("Acervo online: {message}");
+                                    }
                                     let _ = events.send(OnlineEvent::Status(message.to_string()));
                                 }
                             }
@@ -50,14 +57,17 @@ pub fn spawn(events: mpsc::Sender<OnlineEvent>) -> mpsc::Sender<()> {
                     match child.wait() {
                         Ok(status) if status.success() => {}
                         Ok(status) => {
+                            log::warn!("Acervo online: processo finalizou com {status}");
                             let _ = events.send(OnlineEvent::Status(format!("Atualização falhou: {status}")));
                         }
                         Err(e) => {
+                            log::warn!("Acervo online: processo falhou: {e}");
                             let _ = events.send(OnlineEvent::Status(format!("Atualização falhou: {e}")));
                         }
                     }
                 }
                 Err(e) => {
+                    log::warn!("Acervo online: atualizador indisponível: {e}");
                     let _ = events.send(OnlineEvent::Status(format!(
                         "Atualizador indisponível: {}",
                         e

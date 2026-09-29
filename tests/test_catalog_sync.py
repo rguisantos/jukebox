@@ -66,6 +66,56 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.run_sync()
         self.assertFalse((self.root / 'musicas/Rock/Artista/Disco').exists())
 
+    def edit_metadata(self):
+        self.album.update(genre='Gospel', artist='Novo Artista', title='Novo Disco', version='v2')
+        self.index['albums'][0]['version'] = 'v2'
+
+    def test_metadata_edit_moves_album_without_download_or_duplicate(self):
+        self.run_sync()
+        old = self.root / 'musicas/Rock/Artista/Disco'
+        inode = (old / '01.mp3').stat().st_ino
+        self.edit_metadata()
+        with patch.object(sync, 'download', side_effect=AssertionError('No media download')):
+            self.assertTrue(self.run_sync())
+        new = self.root / 'musicas/Gospel/Novo Artista/Novo Disco'
+        self.assertFalse(old.exists())
+        self.assertEqual((new / '01.mp3').stat().st_ino, inode)
+        self.assertFalse(self.run_sync())
+
+    def test_metadata_edit_recovers_after_rename_before_state_save(self):
+        self.run_sync()
+        self.edit_metadata()
+        original = sync.atomic_json
+        def fail_state(path, data):
+            if path.name == 'catalog-state.json':
+                raise OSError('simulated shutdown')
+            original(path, data)
+        with patch.object(sync, 'atomic_json', side_effect=fail_state):
+            with self.assertRaises(OSError):
+                self.run_sync()
+        self.assertTrue(self.run_sync())
+        self.assertFalse(self.run_sync())
+        self.assertFalse((self.root / 'musicas/Rock/Artista/Disco').exists())
+
+    def test_metadata_edit_restores_missing_track(self):
+        self.run_sync()
+        (self.root / 'musicas/Rock/Artista/Disco/01.mp3').unlink()
+        self.edit_metadata()
+        self.assertTrue(self.run_sync())
+        self.assertEqual((self.root / 'musicas/Gospel/Novo Artista/Novo Disco/01.mp3').read_bytes(), self.data)
+        self.assertFalse((self.root / 'musicas/Rock/Artista/Disco').exists())
+
+    def test_metadata_edit_preserves_foreign_destination(self):
+        self.run_sync()
+        self.edit_metadata()
+        foreign = self.root / 'musicas/Gospel/Novo Artista/Novo Disco'
+        foreign.mkdir(parents=True)
+        (foreign / 'local.mp3').write_bytes(b'local')
+        with self.assertRaises(ValueError):
+            self.run_sync()
+        self.assertTrue((self.root / 'musicas/Rock/Artista/Disco/01.mp3').exists())
+        self.assertEqual((foreign / 'local.mp3').read_bytes(), b'local')
+
     def test_resume_valid_range(self):
         target = self.root / '01.mp3'
         target.with_name('01.mp3.part').write_bytes(self.data[:4])
@@ -80,6 +130,14 @@ class CatalogTests(unittest.TestCase):
         with patch.object(sync, 'request', return_value=Response(self.data)):
             sync.download(self.item, target, 1000000)
         self.assertEqual(target.read_bytes(), self.data)
+
+    def test_zero_download_limit_does_not_sleep(self):
+        target = self.root / 'unlimited.mp3'
+        with patch.object(sync, 'request', return_value=Response(self.data)), \
+                patch.object(sync.time, 'sleep') as sleep:
+            sync.download(self.item, target, 0)
+        self.assertEqual(target.read_bytes(), self.data)
+        sleep.assert_not_called()
 
     def test_bad_range_rejected(self):
         target = self.root / '01.mp3'
@@ -107,5 +165,10 @@ class CatalogTests(unittest.TestCase):
     def test_paths_rejected(self):
         for name in ('../escape', '/etc/passwd', '..', '.hidden', 'a\\b', 'a\x00b'):
             with self.subTest(name=name), self.assertRaises(ValueError): sync.component(name)
+
+    def test_request_identifies_catalog_client(self):
+        with patch.object(sync.OPENER, 'open', return_value=Response(b'{}')) as opened:
+            sync.request('https://example.test/index.json')
+        self.assertEqual(opened.call_args.args[0].get_header('User-agent'), 'jukebox-catalog/1.0')
 
 if __name__ == '__main__': unittest.main()

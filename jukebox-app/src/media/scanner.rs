@@ -35,6 +35,8 @@ pub fn scan_media_directory(db: &mut Database) -> Vec<TrackInfo> {
 
 fn scan_directory(db: &mut Database, media_dir: &Path) -> Vec<TrackInfo> {
     log::info!("Scanner: Iniciando varredura em {:?}...", media_dir);
+    // A missing/unreadable media root may be an unavailable disk. Do not prune it.
+    let reconcile = media_dir.is_dir() && fs::read_dir(media_dir).is_ok();
 
     // Garante que o diretório de mídia exista
     if !media_dir.exists() {
@@ -63,6 +65,12 @@ fn scan_directory(db: &mut Database, media_dir: &Path) -> Vec<TrackInfo> {
         if let Err(e) = db.index_tracks(&pending) { log::error!("Scanner: {e}"); }
     }
 
+    if reconcile && media_dir.is_dir() && fs::read_dir(media_dir).is_ok() {
+        if let Err(e) = prune_missing_catalog_tracks(db, media_dir) {
+            log::error!("Scanner: Falha ao reconciliar catálogo: {e}");
+        }
+    }
+
     // Retorna o catálogo completo atualizado para enviar à UI
     match db.get_all_tracks() {
         Ok(tracks) => {
@@ -77,6 +85,33 @@ fn scan_directory(db: &mut Database, media_dir: &Path) -> Vec<TrackInfo> {
             Vec::new()
         }
     }
+}
+
+fn prune_missing_catalog_tracks(db: &mut Database, media_dir: &Path) -> rusqlite::Result<()> {
+    let Ok(cwd) = std::env::current_dir() else { return Ok(()); };
+    let absolute = |path: &Path| {
+        let joined = cwd.join(path);
+        let mut normalized = PathBuf::new();
+        for part in joined.components() {
+            match part {
+                std::path::Component::CurDir => {},
+                std::path::Component::ParentDir => { normalized.pop(); },
+                _ => normalized.push(part.as_os_str()),
+            }
+        }
+        normalized
+    };
+    let root = absolute(media_dir);
+    let missing: Vec<String> = db.catalog_paths()?.into_iter().filter(|stored| {
+        let path = absolute(Path::new(stored));
+        path.starts_with(&root) && matches!(fs::metadata(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }).collect();
+    if !missing.is_empty() {
+        let removed = db.remove_catalog_paths(&missing)?;
+        log::info!("Scanner: Removidas {removed} faixas de arquivos ausentes do catálogo");
+    }
+    Ok(())
 }
 
 fn fingerprint(path: &Path) -> std::io::Result<String> {
@@ -294,6 +329,30 @@ fn filename_without_ext(path: &Path) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_album_removes_old_catalog_records() {
+        let dir = std::env::temp_dir().join(format!("jukebox-move-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let old = dir.join("Rock/Artista/Disco");
+        let new = dir.join("Gospel/Artista/Disco");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("01.mp3"), b"audio").unwrap();
+        let mut db = Database::in_memory();
+        assert_eq!(scan_directory(&mut db, &dir).len(), 1);
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::rename(&old, &new).unwrap();
+        let tracks = scan_directory(&mut db, &dir);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].file_path, new.join("01.mp3").to_string_lossy().to_string());
+        assert_eq!(db.media_fingerprints().unwrap().len(), 1);
+        assert_eq!(db.get_albums().unwrap().len(), 1);
+        assert_eq!(db.get_albums().unwrap()[0].genre, "Gospel");
+        // An unavailable media root must not clear the catalog.
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(scan_directory(&mut db, &dir).len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn reindexes_replaced_file_without_changing_track_id() {
