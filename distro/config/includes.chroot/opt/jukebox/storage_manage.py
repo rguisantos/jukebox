@@ -26,21 +26,26 @@ def marker_id(folder):
     return None
 
 
-def copies(root, aid):
+def download_copies(root):
     downloads = root / '.downloads'
     if downloads.is_symlink():
         raise ValueError('Pasta de downloads não pode ser um link')
     if not downloads.is_dir():
-        return []
-    result = []
+        return {}
+    result = {}
     for folder in downloads.iterdir():
         if folder.is_dir() and not folder.is_symlink():
             try:
-                if marker_id(folder) == aid:
-                    result.append(folder)
+                aid = marker_id(folder)
+                if aid:
+                    result.setdefault(aid, []).append(folder)
             except (ValueError, OSError):
                 continue  # Never infer ownership of unknown/old partial folders.
     return result
+
+
+def copies(root, aid):
+    return download_copies(root).get(aid, [])
 
 
 def size_of(folders):
@@ -64,6 +69,7 @@ def list_albums(root, exclusions):
     media = root / 'musicas'
     if not media.is_dir() or media.is_symlink():
         raise ValueError('Pasta de músicas indisponível')
+    backups = download_copies(root)
     rows = {}
     def walk_error(error):
         raise error
@@ -82,7 +88,7 @@ def list_albums(root, exclusions):
         parts = folder.relative_to(media).parts
         rows[aid] = dict(id=aid, path=str(relative), artist=parts[-2] if len(parts) >= 2 else 'Vários Artistas',
                          title=parts[-1], genre=parts[-3] if len(parts) >= 3 else 'Desconhecido',
-                         size=size_of([folder] + (copies(root, aid) if online else [])), online=online, removed=False)
+                         size=size_of([folder] + (backups.get(aid, []) if online else [])), online=online, removed=False)
     for aid, album in exclusions.items():
         if aid not in rows:
             rows[aid] = dict(album, removed=True)

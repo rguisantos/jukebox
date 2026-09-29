@@ -1565,11 +1565,11 @@ export component MainWindow inherits Window {
                 border-width: 2px; border-color: #f59e0b;
                 VerticalLayout {
                     padding: 22px; spacing: 16px;
-                    Text { text: root.storage-confirm-action + "?"; color: #fbbf24; font-size: 22px; font-weight: 700; }
-                    Text { text: root.storage-confirm-title; color: #ffffff; font-size: 17px; wrap: word-wrap; }
-                    Text { text: "E/Q: Voltar · R/W: confirmar · O: executar"; color: #94a3b8; font-size: 14px; }
+                    Text { text: root.storage-confirm-action + "?"; color: #fbbf24; font-size: 22px; font-weight: 700; overflow: elide; }
+                    Text { height: 90px; text: root.storage-confirm-title; color: #ffffff; font-size: 17px; wrap: word-wrap; overflow: elide; }
+                    Text { text: "E/Q: Voltar · R/W: confirmar · O: executar"; color: #94a3b8; font-size: 14px; overflow: elide; }
                     HorizontalLayout {
-                        spacing: 12px;
+                        height: 48px; spacing: 12px;
                         Rectangle {
                             background: root.storage-confirm-index == 0 ? #4338ca : #1e2438; border-radius: 8px;
                             Text { text: "Voltar"; color: #ffffff; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
