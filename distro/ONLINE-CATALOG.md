@@ -3,16 +3,20 @@
 O servidor existente deverá expor este contrato ou receber um adaptador.
 Nenhum servidor de produção foi configurado. O cliente fica desativado enquanto
 `JUKEBOX_CATALOG_URL` estiver vazio. Não há relação com o serviço de créditos/Pix.
+Para o piloto no R2 e a publicação em lote, veja `R2-PILOT.md` e
+`R2-MULTIPLOS-ALBUNS.md`. Para o aplicativo de escritório, veja
+`PUBLICADOR-ESCRITORIO.md`.
 
 Em `/dados/jukebox.env`:
 
 ```sh
 JUKEBOX_CATALOG_URL=https://servidor.exemplo/acervo/index.json
 JUKEBOX_CATALOG_INTERVAL=1800
-JUKEBOX_DOWNLOAD_KIB=512
+JUKEBOX_DOWNLOAD_KIB=0
 ```
 
-Intervalo mínimo de 60 segundos; um arquivo por vez, limite em KiB/s. O servidor
+Intervalo mínimo de 60 segundos; um arquivo por vez. Valor `0` não limita a
+velocidade no cliente; valores positivos definem o limite em KiB/s. O servidor
 pode usar URLs assinadas nos manifestos. HTTPS é obrigatório, inclusive em
 redirecionamentos. Nenhuma credencial é embutida no cliente. Não há autenticação
 por máquina implementada neste protocolo inicial.
@@ -47,7 +51,8 @@ Manifesto do álbum:
 ```
 
 Os exemplos são ilustrativos; tamanhos e hashes precisam corresponder aos arquivos.
-IDs e versões são strings. Mude a versão do álbum sempre que um arquivo mudar.
+IDs e versões são strings. Mude a versão do álbum sempre que um arquivo ou
+seus metadados de gênero/artista/título mudarem.
 Não altere o conteúdo de uma versão já publicada. Prefira capas reduzidas no
 servidor (256×256 ou próximas disso).
 
@@ -63,14 +68,18 @@ recuperação; a limpeza automática de versões antigas ainda não está implem
 Acompanhe o espaço livre e faça a limpeza em manutenção.
 
 Arquivos omitidos são preservados. IDs ausentes do índice não provocam exclusão.
-Mudanças de gênero/artista/título de um ID existente são recusadas até existir
-uma migração explícita. O cliente recusa sobrescrever uma pasta de origem USB
+Mudanças de gênero/artista/título de um ID existente movem o álbum para a nova
+pasta, reaproveitando arquivos íntegros. O estado acompanha a movimentação;
+interrupções após renomear são recuperadas na próxima consulta. Arquivos ausentes
+ou corrompidos são restaurados. O cliente recusa sobrescrever uma pasta de origem USB
 ou de outro ID. Mantenha um único ID por Gênero/Artista/Álbum.
 
 `catalog-state.json` guarda apenas o estado de sincronização. O SQLite operacional
 não é baixado nem substituído. Após publicar, o aplicativo indexa as novas faixas
-com suas rotinas locais. A atualização de metadados ID3 de faixas já indexadas
-não é reconciliada nesta versão; use nomes/pastas estáveis.
+com suas rotinas locais. Arquivos modificados são reindexados e registros de
+caminhos confirmados como ausentes são removidos do catálogo. Créditos, Pix e
+fila não são alterados por essa limpeza. Uma pasta de mídia indisponível ou
+erros de acesso não são interpretados como exclusão de toda a coleção.
 
 Testes do cliente sem acesso à rede:
 
