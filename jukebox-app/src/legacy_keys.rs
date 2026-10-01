@@ -114,6 +114,98 @@ impl LegacyKeys {
             _ => return None,
         })
     }
+
+    /// Mapa de remapeamento em tempo de execução desta máquina: texto
+    /// bruto entregue pelo Slint → tecla canônica do app. Instalado uma
+    /// vez no boot do perfil legacy (`OnceLock` em `main.rs`); vazio nos
+    /// demais perfis (remap = identidade).
+    ///
+    /// Ordem importa na colisão de textos: navegação/seleção primeiro,
+    /// crédito por último — diante de duas funções reclamando o mesmo
+    /// texto, vence a que não movimenta dinheiro (nunca há crédito
+    /// fantasma).
+    pub fn runtime_keymap(&self) -> RuntimeKeyMap {
+        let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
+        for (code, canonical) in [
+            (self.esquerda, "e"),
+            (self.direita, "r"),
+            (self.cima, "q"),
+            (self.baixo, "w"),
+            (self.disco, "i"),
+            (self.musica, "o"),
+            (self.volume, "p"),
+            (self.cancela, "u"),
+            // `sair` e `cancela` compartilham o canônico "u".
+            (self.sair, "u"),
+            (self.resetacreditos, "a"),
+            (self.fecharprograma, "l"),
+            // Crédito por último: colisão com navegação nunca gera crédito.
+            (self.credito, "z"),
+        ] {
+            for raw in slint_texts(code) {
+                pairs.push((raw, canonical));
+            }
+        }
+        RuntimeKeyMap { pairs }
+    }
+}
+
+/// Mapa tecla física → tecla canônica aplicado no callback de teclado.
+///
+/// O FocusScope do Slint canoniza setas/Esc (←/→/↑/↓ → e/r/q/w, Esc → u)
+/// antes de chamar `arcade-key-pressed`. No perfil legacy, a propriedade
+/// `pass-through-enter` faz o Enter chegar como "enter" literal — sem
+/// colidir com as teclas I/O físicas que o Slint entregaria no lugar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeKeyMap {
+    pairs: Vec<(&'static str, &'static str)>,
+}
+
+impl RuntimeKeyMap {
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Aplica o mapa a um texto de tecla bruto. Preserva o sufixo
+    /// `_long` (pressão longa, usada pela régua alfabética); teclas fora
+    /// do mapa passam inalteradas (identidade — teclado de serviço
+    /// continua navegando). Sem `trim`: o espaço é uma tecla válida.
+    pub fn remap(&self, raw: &str) -> String {
+        let (base, suffix) = match raw.strip_suffix("_long") {
+            Some(base) => (base, "_long"),
+            None => (raw, ""),
+        };
+        let base = base.to_lowercase();
+        if let Some((_, canonical)) = self.pairs.iter().find(|(raw, _)| *raw == base) {
+            return format!("{canonical}{suffix}");
+        }
+        raw.to_string()
+    }
+}
+
+/// Letras minúsculas para os códigos AWT VK_A..VK_Z.
+const LETTERS: [&str; 26] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+
+/// Textos que o app recebe (pós-canonização do Slint) quando a máquina
+/// pressiona a tecla física de um código AWT. No perfil legacy o Enter
+/// chega como "enter" literal (propriedade `pass-through-enter` do
+/// FocusScope — evita colidir com as teclas físicas I/O). Vetor vazio =
+/// código sem texto correspondente (F-keys etc.).
+fn slint_texts(awt: i32) -> Vec<&'static str> {
+    match awt {
+        awt::VK_LEFT => vec!["e"],
+        awt::VK_UP => vec!["q"],
+        awt::VK_RIGHT => vec!["r"],
+        awt::VK_DOWN => vec!["w"],
+        awt::VK_ESCAPE => vec!["u"],
+        awt::VK_ENTER => vec!["enter"],
+        32 => vec![" "], // VK_SPACE — event.text do espaço
+        65..=90 => vec![LETTERS[(awt - 65) as usize]],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +244,81 @@ mod tests {
         let keys = LegacyKeys::typical();
         assert_eq!(keys.translate(0), None);
         assert_eq!(keys.translate(112), None); // F1 sem papel configurado
+    }
+
+    #[test]
+    fn typical_machine_runtime_keymap_translates_physical_buttons() {
+        let map = LegacyKeys::typical().runtime_keymap();
+        // Botões físicos: A=esquerda, R=direita, W=cima, Q=baixo, Z=crédito.
+        assert_eq!(map.remap("a"), "e");
+        assert_eq!(map.remap("r"), "r");
+        assert_eq!(map.remap("w"), "q");
+        assert_eq!(map.remap("q"), "w");
+        assert_eq!(map.remap("z"), "z");
+        assert_eq!(map.remap("i"), "i");
+        assert_eq!(map.remap("o"), "o");
+        assert_eq!(map.remap("p"), "p");
+        // Máiusculas chegam pelo mesmo caminho (case-insensitive).
+        assert_eq!(map.remap("A"), "e");
+        // Esc chega canonizado como "u" e cancela/sair também mapeiam "u".
+        assert_eq!(map.remap("u"), "u");
+    }
+
+    #[test]
+    fn machine_with_credit_on_enter_keeps_letter_keys_intact() {
+        let mut keys = LegacyKeys::typical();
+        keys.credito = awt::VK_ENTER;
+        let map = keys.runtime_keymap();
+        // Com `pass-through-enter`, o Enter chega como "enter" literal —
+        // sem colidir com o I físico do botão de disco.
+        assert_eq!(map.remap("enter"), "z");
+        assert_eq!(map.remap("i"), "i");
+        assert_eq!(map.remap("o"), "o");
+        // Z deixa de ser crédito nesta máquina (vira tecla solta).
+        assert_eq!(map.remap("z"), "z");
+    }
+
+    #[test]
+    fn navigation_wins_text_collisions_over_credit() {
+        // Configuração degenerada: a MESMA tecla física (Z) reivindicada
+        // por disco e por crédito — vence a navegação; nunca há crédito
+        // fantasma por colisão de textos.
+        let mut keys = LegacyKeys::typical();
+        keys.disco = awt::VK_Z;
+        let map = keys.runtime_keymap();
+        assert_eq!(map.remap("z"), "i");
+        // O crédito desta máquina continua no Z do AWT, mas perde a
+        // disputa do texto "z" para o botão de disco.
+        assert_eq!(map.remap("enter"), "enter");
+    }
+
+    #[test]
+    fn long_press_suffix_survives_the_remap() {
+        let map = LegacyKeys::typical().runtime_keymap();
+        // Pressão longa do botão físico A (esquerda) abre a régua alfabética
+        // como se fosse o canônico "e" segurado.
+        assert_eq!(map.remap("a_long"), "e_long");
+        assert_eq!(map.remap("r_long"), "r_long");
+    }
+
+    #[test]
+    fn unlisted_keys_pass_through_unchanged() {
+        let map = LegacyKeys::typical().runtime_keymap();
+        // Teclado de serviço: teclas sem papel na placa não são traduzidas.
+        assert_eq!(map.remap("x"), "x");
+        assert_eq!(map.remap("F1"), "F1");
+        // Mapa vazio (perfil modern) = identidade total.
+        let empty = RuntimeKeyMap::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.remap("z"), "z");
+        assert_eq!(empty.remap("e_long"), "e_long");
+    }
+
+    #[test]
+    fn space_bar_can_be_a_machine_button() {
+        let mut keys = LegacyKeys::typical();
+        keys.credito = 32; // VK_SPACE
+        let map = keys.runtime_keymap();
+        assert_eq!(map.remap(" "), "z");
     }
 }

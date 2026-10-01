@@ -7,7 +7,7 @@ use std::{sync::mpsc::{self, Receiver, Sender}, thread, time::{Duration, SystemT
 const VOLUME_CONFIG_KEY: &str = "volume";
 
 #[derive(Debug)]
-enum DbCommand {
+pub(crate) enum DbCommand {
     RefreshCredits,
     CashPulse,
     AcceptPix { machine_id: String, txid: String, credits: u32 },
@@ -49,7 +49,7 @@ pub enum DbEvent {
 }
 
 #[derive(Clone)]
-pub struct DbHandle(Sender<DbCommand>);
+pub struct DbHandle(pub(crate) Sender<DbCommand>);
 impl DbHandle {
     fn send(&self, cmd: DbCommand) -> Result<(), String> {
         self.0.send(cmd).map_err(|e| e.to_string())

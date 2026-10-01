@@ -53,6 +53,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(feature = "legacy-pg")]
+use db::legacy_pg::client::LegacyDb;
+#[cfg(feature = "legacy-pg")]
+use db::legacy_pg::PgConfig;
+#[cfg(feature = "legacy-pg")]
+use storage::legacy_service;
+
 // Carrega as structs geradas a partir do arquivo ui/app_window.slint
 slint::include_modules!();
 
@@ -62,51 +69,123 @@ static ONLINE_TX: std::sync::OnceLock<mpsc::Sender<()>> = std::sync::OnceLock::n
 static TOAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 const VOLUME_CONFIG_KEY: &str = "volume";
 
+/// Mapa de teclas físicas da máquina (colunas `codtecla*` lidas do
+/// `sistema` no boot do perfil legacy). Vazio nos demais perfis — o
+/// callback de teclado aplica identidade.
+static LEGACY_KEYMAP: std::sync::OnceLock<legacy_keys::RuntimeKeyMap> =
+    std::sync::OnceLock::new();
+
+/// Perfil legacy (fase 1 — Jukebox TV na base antiga): o app assume o
+/// banco PostgreSQL `jukeboxtvdb` em vez do SQLite. Exige o binário
+/// construído com a feature `legacy-pg` e `JUKEBOX_PROFILE=legacy` no
+/// ambiente (launcher da distro antiga).
+fn legacy_profile_requested() -> bool {
+    #[cfg(feature = "legacy-pg")]
+    {
+        std::env::var("JUKEBOX_PROFILE").as_deref() == Ok("legacy")
+    }
+    #[cfg(not(feature = "legacy-pg"))]
+    {
+        false
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("Iniciando Jukebox Arcade OS...");
 
+    let legacy = legacy_profile_requested();
+    if legacy {
+        log::info!(
+            "Perfil LEGACY ativo (fase 1): PostgreSQL jukeboxtvdb + árvore de mídia original"
+        );
+    }
+
     // =========================================================================
     // 1. Banco de dados e estado inicial
     // =========================================================================
-    let db = match Database::open() {
-        Ok(database) => database,
-        Err(err) => {
-            log::error!("Erro crítico ao inicializar o banco de dados: {}", err);
-            return Err(Box::new(err));
+    // Perfil modern: SQLite em /dados. Perfil legacy: PostgreSQL
+    // `jukeboxtvdb` (conecta antes da janela — sem banco não há app, como
+    // no Java original) + serviço de capas do banco.
+    let mut sqlite: Option<Database> = None;
+    #[cfg(feature = "legacy-pg")]
+    let mut legacy_db: Option<LegacyDb> = None;
+    #[cfg(feature = "legacy-pg")]
+    if legacy {
+        let config = PgConfig::from_env();
+        legacy_db = Some(LegacyDb::connect(&config).map_err(|e| {
+            log::error!("Perfil legacy: {e}");
+            e
+        })?);
+        if let Err(e) = storage::legacy_covers::spawn(&config) {
+            // Não derruba o app: o pipeline cai para capa de pasta/APIC.
+            log::warn!("Capas do banco indisponíveis: {e}");
         }
-    };
+    }
 
-    let initial_settings = db.settings()?;
-    let initial_credits = db.get_credits().unwrap_or(0);
-    log::info!(
-        "Créditos persistentes carregados do banco: {}",
-        initial_credits
-    );
+    let (initial_settings, initial_credits, initial_price, initial_volume, initial_recent_days) =
+        if legacy {
+            #[cfg(feature = "legacy-pg")]
+            {
+                let boot = legacy_service::boot_state(legacy_db.as_mut().expect("conectado"))?;
+                LEGACY_KEYMAP.set(boot.keys.runtime_keymap()).ok();
+                log::info!(
+                    "Perfil legacy: saldo {} (preço {} crédito(s), volume {}%, \
+                     lançamentos {}d, teclas da máquina carregadas)",
+                    boot.credits,
+                    boot.price,
+                    boot.volume,
+                    boot.recent_days
+                );
+                (boot.settings, boot.credits, boot.price, boot.volume, boot.recent_days)
+            }
+            #[cfg(not(feature = "legacy-pg"))]
+            {
+                unreachable!("perfil legacy exige a feature legacy-pg")
+            }
+        } else {
+            let db = match Database::open() {
+                Ok(database) => database,
+                Err(err) => {
+                    log::error!("Erro crítico ao inicializar o banco de dados: {}", err);
+                    return Err(Box::new(err));
+                }
+            };
 
-    // MÓDULO 8 — Preço da música (créditos por reprodução), persistido no
-    // banco: o bar ajusta uma vez e sobrevive a todos os ciclos de energia
-    let initial_price = db.get_song_price().unwrap_or(1);
-    log::info!(
-        "Preço da música carregado do banco: {} crédito(s)",
-        initial_price
-    );
+            let initial_settings = db.settings()?;
+            let initial_credits = db.get_credits().unwrap_or(0);
+            log::info!(
+                "Créditos persistentes carregados do banco: {}",
+                initial_credits
+            );
 
-    // Volume persistido na tabela chave-valor (Módulo 7): o bar ajusta uma
-    // vez e o valor sobrevive a todos os ciclos de energia da máquina
-    let initial_volume = db
-        .get_config_i64(VOLUME_CONFIG_KEY)
-        .ok()
-        .flatten()
-        .map(|v| v.clamp(0, 100) as u32)
-        .unwrap_or(VOLUME_DEFAULT);
-    log::info!("Volume persistido carregado do banco: {}%", initial_volume);
+            // MÓDULO 8 — Preço da música (créditos por reprodução), persistido no
+            // banco: o bar ajusta uma vez e sobrevive a todos os ciclos de energia
+            let initial_price = db.get_song_price().unwrap_or(1);
+            log::info!(
+                "Preço da música carregado do banco: {} crédito(s)",
+                initial_price
+            );
 
-    let initial_recent_days = db.get_recent_days().unwrap_or(30);
-    log::info!(
-        "Dias recém-adicionados carregados do banco: {}",
-        initial_recent_days
-    );
+            // Volume persistido na tabela chave-valor (Módulo 7): o bar ajusta uma
+            // vez e o valor sobrevive a todos os ciclos de energia da máquina
+            let initial_volume = db
+                .get_config_i64(VOLUME_CONFIG_KEY)
+                .ok()
+                .flatten()
+                .map(|v| v.clamp(0, 100) as u32)
+                .unwrap_or(VOLUME_DEFAULT);
+            log::info!("Volume persistido carregado do banco: {}%", initial_volume);
+
+            let initial_recent_days = db.get_recent_days().unwrap_or(30);
+            log::info!(
+                "Dias recém-adicionados carregados do banco: {}",
+                initial_recent_days
+            );
+
+            sqlite = Some(db);
+            (initial_settings, initial_credits, initial_price, initial_volume, initial_recent_days)
+        };
 
     // =========================================================================
     // 2. Interface Slint + máquina de estados de foco (Módulo 7)
@@ -119,6 +198,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     main_window.set_op_song_price(initial_price as i32);
     main_window.set_op_recent_days(initial_recent_days as i32);
     main_window.set_scanning(true);
+    // Perfil legacy: o Enter chega cru para o remapeamento das teclas da
+    // máquina (evita colidir com as teclas I/O físicas).
+    if legacy {
+        main_window.set_pass_through_enter(true);
+    }
 
     // Estado de navegação compartilhado: callbacks da UI (event loop) e
     // bridges de publicação de catálogo — Arc<Mutex> atravessa as threads.
@@ -142,9 +226,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cover_event_tx, cover_event_rx) = mpsc::channel::<CoverEvent>();
 
     // =========================================================================
-    // 4. SQLite service and its UI/player event bridge
+    // 4. Serviço de persistência (SQLite no perfil modern, jukeboxtvdb no
+    //    legacy) e sua ponte de eventos → UI/player
     // =========================================================================
-    let (db_tx, db_events) = service::spawn(db);
+    #[cfg(feature = "legacy-pg")]
+    let (db_tx, db_events) = if let Some(db) = legacy_db {
+        legacy_service::spawn(db)
+    } else {
+        service::spawn(sqlite.expect("SQLite aberto na inicialização"))
+    };
+    #[cfg(not(feature = "legacy-pg"))]
+    let (db_tx, db_events) = service::spawn(sqlite.expect("SQLite aberto na inicialização"));
     {
         let weak = main_window.as_weak();
         let state = state_arc.clone();
@@ -211,8 +303,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // =========================================================================
     // 5. Thread do Scanner inicial (Módulo 2 + agrupamento por álbum do 7)
+    //    — perfil modern apenas: no legacy o catálogo vem do PostgreSQL
+    //    (publicado pelo serviço na inicialização).
     // =========================================================================
-    {
+    if !legacy {
         let ui_handle = main_window.as_weak();
         let state_arc = state_arc.clone();
         let cover_tx = cover_cmd_tx.clone();
@@ -244,8 +338,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // =========================================================================
-    // 6. Player GStreamer (Módulo 3) + bridge de eventos → UI
+    // 6. Player (Módulo 3) + bridge de eventos → UI
+    //    — perfil modern: GStreamer; perfil legacy: player de validação
+    //      (débito + fila no jukeboxtvdb; mídia chega com o libVLC).
     // =========================================================================
+    #[cfg(feature = "legacy-pg")]
+    if legacy {
+        media::legacy_player::spawn(player_cmd_rx, player_event_tx, PgConfig::from_env());
+    } else {
+        player::spawn(player_cmd_rx, player_event_tx);
+    }
+    #[cfg(not(feature = "legacy-pg"))]
     player::spawn(player_cmd_rx, player_event_tx);
 
     // Volume inicial aplicado assim que o player sobe (o playbin mantém o
@@ -344,16 +447,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // =========================================================================
     // 7. Sincronização USB (Módulo 4 + ForceSync do 7) + bridge → UI
+    //    — perfil modern apenas: no legacy o acervo vive na árvore
+    //    original, gerenciado pelo importador do operador.
     // =========================================================================
-    usb_sync::spawn(usb_cmd_rx, usb_event_tx);
+    if !legacy {
+        usb_sync::spawn(usb_cmd_rx, usb_event_tx);
 
-    {
-        let ui_handle = main_window.as_weak();
-        let player_tx = player_cmd_tx.clone();
-        let state_arc = state_arc.clone();
-        let cover_tx = cover_cmd_tx.clone();
+        {
+            let ui_handle = main_window.as_weak();
+            let player_tx = player_cmd_tx.clone();
+            let state_arc = state_arc.clone();
+            let cover_tx = cover_cmd_tx.clone();
 
-        thread::spawn(move || {
+            thread::spawn(move || {
             while let Ok(event) = usb_event_rx.recv() {
                 match event {
                     UsbSyncEvent::Started { total } => {
@@ -458,6 +564,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+        }
     }
 
     // =========================================================================
@@ -469,7 +576,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &main_window, &state_arc, cover_event_rx, cover_cmd_tx.clone()
     );
 
-    {
+    // Perfil modern apenas: sincronização online do acervo. No legacy o
+    // acervo é do importador original — ONLINE_TX fica desligado e o item
+    // de menu apenas avisa.
+    if !legacy {
         let (tx, rx) = mpsc::channel();
         let _ = ONLINE_TX.set(media::online_sync::spawn(tx));
         let ui_handle = main_window.as_weak();
@@ -609,6 +719,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         main_window.on_arcade_key_pressed(move |key: slint::SharedString| -> bool {
             let Some(ui) = ui_handle.upgrade() else {
                 return false;
+            };
+
+            // Perfil legacy: as teclas físicas desta máquina (codtecla*)
+            // viram as canônicas do app. Mapa vazio = identidade (os
+            // demais perfis não passam por aqui em nada).
+            let key = match LEGACY_KEYMAP.get() {
+                Some(keymap) => slint::SharedString::from(keymap.remap(key.as_str())),
+                None => key,
             };
 
             let _ = player_tx.send(PlayerCommand::Activity);
@@ -760,7 +878,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
     }
-    {
+    // Aviso de disco cheio (/dados) — perfil modern apenas: a base antiga
+    // não tem /dados e o acervo vive na árvore do importador.
+    if !legacy {
         let weak = main_window.as_weak();
         thread::spawn(move || loop {
             let directory = scanner::resolve_media_dir();
@@ -1005,6 +1125,14 @@ fn handle_ui_action(
             let _ = player_tx.send(PlayerCommand::RestoreVideo);
         }
         Action::ForceSync => {
+            if legacy_profile_requested() {
+                show_toast(
+                    &ui.as_weak(),
+                    "Perfil legacy: acervo gerenciado pelo importador original",
+                    2,
+                );
+                return true;
+            }
             // Sincroniza sem encerrar a sessão administrativa.
             let _ = player_tx.send(PlayerCommand::RestoreVideo);
             if let Err(e) = usb_tx.send(UsbSyncCommand::ForceSync) {
@@ -1065,15 +1193,20 @@ fn handle_ui_action(
             }
         }
         Action::PowerOff => {
-            // A distro concede sudo sem senha ao usuário jukebox
-            // (/etc/sudoers.d/jukebox) — o systemctl desliga a máquina de
-            // forma limpa (unmount do overlay, sync do disco)
+            // Perfil modern: a distro concede sudo sem senha ao usuário
+            // jukebox (/etc/sudoers.d/jukebox) — o systemctl desliga a
+            // máquina de forma limpa (unmount do overlay, sync do disco).
+            // Perfil legacy: base antiga sem systemd/sudo — o app roda como
+            // root na instalação original; poweroff direto.
             log::info!("Operador solicitou o desligamento da máquina.");
-            match std::process::Command::new("sudo")
-                .arg("systemctl")
-                .arg("poweroff")
-                .spawn()
-            {
+            let mut command = if legacy_profile_requested() {
+                std::process::Command::new("poweroff")
+            } else {
+                let mut command = std::process::Command::new("sudo");
+                command.arg("systemctl").arg("poweroff");
+                command
+            };
+            match command.spawn() {
                 Ok(child) => {
                     log::info!("Comando de poweroff disparado (pid {}).", child.id());
                     show_toast(&ui.as_weak(), "Desligando a máquina...", 0);

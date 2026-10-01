@@ -42,12 +42,13 @@ instalado e o estado persiste nas tabelas originais.
 O adaptador `db/legacy_pg.rs` (feature `legacy-pg`) está pronto e testado:
 leitura do catálogo com estilos habilitados, capas `bytea` sob demanda,
 linha `sistema` completa (teclas, créditos, incentivos, brinde, volume,
-grade), entradas de crédito em transação `FOR UPDATE` com histórico em
-`registro_creditos`, débito + reserva de fila atômicos em `filamidia`,
-histórico de execuções em `registro_musicas` e zeroing de caixa. Os tipos
-originais são respeitados (créditos `double precision`, `filamidia.midia`
-`bigint`, ids por `max(id)+1` sem sequências) e o caminho dos arquivos é
-resolvido pela convenção da árvore
+grade, janela de lançamentos), entradas de crédito em transação `FOR
+UPDATE` com histórico em `registro_creditos`, débito + reserva de fila
+atômicos em `filamidia`, histórico de execuções em `registro_musicas`,
+zeroing de caixa, bloqueio de estilos, números do operador e snapshot da
+fila. Os tipos originais são respeitados (créditos `double precision`,
+`filamidia.midia` `bigint`, ids por `max(id)+1` sem sequências) e o caminho
+dos arquivos é resolvido pela convenção da árvore
 `<raiz>/<estilo>/<artista>/<disco>/<nome>.<ext>`.
 
 **Pix e atualização online não existem no sistema Java em campo** — são
@@ -75,9 +76,8 @@ estilo 40, equalizer 18, tipo_disco 3, tipo_midia 2, gravadora 2, sistema 1.
 - `sistema(...)` — 70 colunas de configuração (teclas, preços, propaganda,
   brinde, equalizer, autoredução de volume, etc.)
 
-A camada de acesso a essas tabelas (já modelada no pacote `jukebox-rs` da
-análise anterior) será portada para `src/db/legacy_pg.rs` atrás da mesma
-interface de comandos usada pelo `storage/service.rs` atual.
+A camada de acesso a essas tabelas vive em `src/db/legacy_pg.rs` atrás da
+mesma interface de comandos usada pelo `storage/service.rs` atual.
 
 ## Entrada e pagamento (resolvido em campo)
 
@@ -102,17 +102,64 @@ interface de comandos usada pelo `storage/service.rs` atual.
   adaptação é gravar o crédito na tabela legacy (`registro_creditos` /
   contador do `sistema`) em vez do SQLite.
 
+## Wiring do perfil (implementado)
+
+O perfil é selecionado em tempo de execução: binário construído com a
+feature `legacy-pg` **e** `JUKEBOX_PROFILE=legacy` no ambiente (o launcher
+da base antiga define). Sem isso, o app sobe exatamente como hoje
+(SQLite/GStreamer) — o perfil modern não mudou de comportamento.
+
+Com o perfil legacy ativo:
+
+- **Boot**: conecta ao `jukeboxtvdb` antes da janela (sem banco não há app,
+  como no Java), lê a linha `sistema` → saldo, volume (clamp por
+  `maxvolume`, padrão 70 se vazio), janela de lançamentos
+  (`diaslancamento`) e teclas da máquina (`codtecla*` → mapa em
+  `LEGACY_KEYMAP`).
+- **Persistência**: `storage::legacy_service.rs` atende o mesmo protocolo
+  `DbCommand`/`DbEvent` do serviço SQLite — o `main.rs` não tem fluxo
+  próprio. Moeda/pix credita em transação `FOR UPDATE` + histórico;
+  catálogo e gêneros são publicados no boot (no lugar do scanner);
+  bloqueio de gênero grava `estilo.habilita`; zeroing abre novo período;
+  `resetacreditos` zera só o saldo. O que não existe no schema original
+  (pacotes, preço configurável) responde com toast informativo — o preço
+  por música é a constante do sistema original: **1 crédito**.
+- **Capas**: `storage::legacy_covers.rs` serve `disco.capa` (bytea) para o
+  pipeline existente de capas no *miss* do cache — decodificação sob
+  demanda (256 px), **sem** cache em disco (o JBC em RGB custaria ~700 MiB
+  no disco IDE da base).
+- **Player (modo validação)**: `media/legacy_player.rs` assume o canal
+  `PlayerCommand`/`PlayerEvent` sem GStreamer. O caminho do dinheiro é
+  real: `Enqueue` debita 1 crédito e grava `filamidia` na mesma transação,
+  `SkipTrack` descarta o início da fila, e o painel de fila mostra o
+  próprio banco (inclusive itens deixados pelo Java — um rollback toca a
+  fila intacta). Áudio/vídeo chegam com o player libVLC (pendência 2).
+- **Teclado**: o mapa `runtime_keymap()` aplica as `codtecla*` da máquina
+  a cada tecla, preservando o sufixo `_long`. Na colisão de textos vence a
+  navegação (nunca há crédito fantasma). A propriedade `pass-through-enter`
+  do FocusScope entrega o Enter como `"enter"` literal no perfil legacy,
+  eliminando a colisão com as teclas I/O físicas do mapeamento padrão.
+- **Fora do perfil**: scanner de arquivos, sincronização USB/online,
+  gerenciamento de armazenamento e o monitor de disco ficam desligados (o
+  acervo é do importador original); `PowerOff` usa `poweroff` direto
+  (base sem systemd/sudo).
+
 ## Pendências para fechar a fase 1
 
-1. **Wiring no main.rs**: ligar o serviço `legacy_pg::client::LegacyDb` ao
-   fluxo do app (catálogo → carrossel, entrada_moeda → Action::AddCredit,
-   enqueue/dequeue → player, sistema → legacy_keys e preços) atrás da
-   feature `legacy-pg`.
+1. ~~Wiring no main.rs~~ (implementado; validação de compilação completa a
+   cargo do CI — o sandbox não tem GStreamer/Slint dev).
 2. **Player libVLC**: backend alternativo ao GStreamer para o VLC 1.1 da
-   base (vídeo em janela X11 embutida, como o vlcj original).
+   base (vídeo em janela X11 embutida, como o vlcj original), incluindo
+   `registro_musicas` por execução, contador do brinde e modo aleatório
+   (`mininicioaleatorio`). O player de validação já cobre débito/fila.
 3. **Build musl**: job de CI cruzado `i686-unknown-linux-musl` (o runner
    atual já valida a feature `legacy-pg` em x86-64).
 4. **Validação de campo**: RAM/boot/latência de navegação na máquina real
    (P4, 1 GB) com o catálogo de 3.497 discos carregado do PostgreSQL, e
    conferência das premissas semânticas com o operador (incentivos por
-   cédula, preservação do contador do brinde no zeroing).
+   cédula, preservação do contador do brinde no zeroing). O modo
+   validação atual já permite bancada: moeda → saldo → seleção → débito →
+   `filamidia` conferíveis no banco (e o Java em rollback tocaria a fila).
+5. **Pendências menores**: `codteclamaisvolume`/`codteclamenosvolume` no
+   overlay de volume; idempotência PixLogic persistida (hoje vale por
+   sessão — o schema original não tem tabela para a pendência).

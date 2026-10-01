@@ -107,6 +107,15 @@ pub fn spawn(cmd_rx: Receiver<CoverCommand>, event_tx: Sender<CoverEvent>) {
                         break;
                     }
                     let art = load_from_cache(&cache_dir, &album.key).or_else(|| {
+                        // Perfil legacy: a capa canônica vive em
+                        // `disco.capa` (bytea) — consultada sob demanda e
+                        // NÃO cacheada (o JBC em RGB consumiria ~700 MiB
+                        // do disco IDE da base antiga). Chaves do perfil
+                        // modern ("artista|álbum") não passam daqui.
+                        #[cfg(feature = "legacy-pg")]
+                        if let Some(art) = crate::storage::legacy_covers::fetch(&album.key) {
+                            return Some(art);
+                        }
                         let art = extract_from_album(album);
                         if let Some(art) = &art {
                             save_to_cache(&cache_dir, &album.key, art);

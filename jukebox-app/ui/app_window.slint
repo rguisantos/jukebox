@@ -378,6 +378,10 @@ export component MainWindow inherits Window {
     in-out property <int> credits: 0;
     in-out property <bool> scanning: true;
     in-out property <int> ui-focus: 0;
+    // Perfil legacy: o Enter passa cru ("enter") para o remapeamento das
+    // teclas da máquina — evita colidir com as teclas I/O físicas que o
+    // mapeamento padrão entregaria no lugar.
+    in-out property <bool> pass-through-enter: false;
 
     in-out property <[AlbumData]> albums: [];
     in-out property <int> selected-album: 0;
@@ -548,6 +552,10 @@ export component MainWindow inherits Window {
                 return reject;
             }
             if (event.text == Key.Return) {
+                if (root.pass-through-enter) {
+                    if (root.arcade-key-pressed("enter")) { return accept; }
+                    return reject;
+                }
                 if (root.ui-focus == 0) {
                     if (root.arcade-key-pressed("i")) { return accept; }
                 } else {

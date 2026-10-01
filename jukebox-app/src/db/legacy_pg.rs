@@ -32,7 +32,7 @@
 //! **entradas de dinheiro** (o consumo só debita `sistema.creditos`).
 
 use crate::legacy_keys::LegacyKeys;
-use crate::state::models::{album_initial, fnv64, AlbumInfo, TrackInfo};
+use crate::state::models::{album_initial, fnv64, AlbumInfo, GenreInfo, TrackInfo};
 use std::path::{Path, PathBuf};
 
 /// Raiz padrão da árvore de mídia — a mesma que o importador Java criava.
@@ -85,7 +85,7 @@ pub const SISTEMA_COLUMNS: &str = "creditos, creditosparcial, relacaocredito, \
     txtbrinde, codteclaesquerda, codtecladireita, codteclacima, codteclabaixo, \
     codtecladisco, codteclamusica, codteclacredito, codteclavolume, codteclacancela, \
     codteclasair, codteclaresetacreditos, codteclamaisvolume, codteclamenosvolume, \
-    codteclafecharprograma";
+    codteclafecharprograma, diaslancamento";
 
 /// Linha `sistema` com leitura tolerante a nulo (a inspeção física mostrou
 /// **todas** as colunas nullable — o Java gravava o que existia).
@@ -120,6 +120,9 @@ pub struct SystemRow {
     pub txtbrinde: String,
     // ── teclas (códigos AWT) ──
     pub keys: LegacyKeys,
+    // ── catálogo / lançamentos ──
+    /// Janela (dias) em que um disco conta como lançamento.
+    pub diaslancamento: i64,
 }
 
 impl SystemRow {
@@ -179,6 +182,30 @@ pub fn creditos_por_cedula(reais: i32, relacaocredito: f64, bonus: i32) -> f64 {
 /// O brinde está pronto para o sorteio?
 pub fn brinde_pronto(habilitabrinde: bool, contbrinde: i32, minmusicasbrinde: i32) -> bool {
     habilitabrinde && minmusicasbrinde > 0 && contbrinde >= minmusicasbrinde
+}
+
+/// Saldo exibido na UI: créditos integrais (o saldo real continua
+/// `double precision` no banco — o brinde admite frações; a UI mostra
+/// quantas músicas inteiras o saldo paga).
+pub fn saldo_display(creditos: f64) -> u32 {
+    creditos.max(0.0).floor().min(u32::MAX as f64) as u32
+}
+
+/// Volume 0..=100 respeitando o teto da máquina (`maxvolume`).
+/// Teto ausente/inválido no banco = 100.
+pub fn volume_display(volume: i64, maxvolume: i32) -> u32 {
+    let ceiling = if (1..=100).contains(&maxvolume) {
+        maxvolume as i64
+    } else {
+        100
+    };
+    volume.clamp(0, ceiling) as u32
+}
+
+/// Janela de lançamento (dias) para a UI: negativo vira 0, acima de
+/// 10 anos vira 3650 (limita consultas `now() - interval` absurdas).
+pub fn dias_lancamento_display(dias: i64) -> u32 {
+    dias.clamp(0, 3650) as u32
 }
 
 // =============================================================================
@@ -346,6 +373,34 @@ mod tests {
         // Vídeo pela extensão, como no app modern.
         let video = track_from_midia(2, "Clipe", "Artista", "DVD", "Rock", "mpeg", Path::new("/dados"));
         assert!(video.is_video());
+    }
+
+    #[test]
+    fn display_helpers_floor_and_clamp() {
+        // Saldo: frações do brinde ficam no banco; a UI mostra músicas
+        // inteiras pagáveis.
+        assert_eq!(saldo_display(2.9), 2);
+        assert_eq!(saldo_display(0.5), 0);
+        assert_eq!(saldo_display(-3.0), 0);
+        assert_eq!(saldo_display(7.0), 7);
+        // Volume: respeita o teto da máquina; teto inválido = 100.
+        assert_eq!(volume_display(150, 80), 80);
+        assert_eq!(volume_display(90, 0), 90);
+        assert_eq!(volume_display(-5, 100), 0);
+        assert_eq!(volume_display(70, 85), 70);
+        // Janela de lançamento: negativo vira 0, absurdo vira 10 anos.
+        assert_eq!(dias_lancamento_display(-1), 0);
+        assert_eq!(dias_lancamento_display(30), 30);
+        assert_eq!(dias_lancamento_display(999_999), 3650);
+    }
+
+    #[test]
+    fn system_row_reads_the_release_window() {
+        let row = SystemRow { diaslancamento: 45, ..Default::default() };
+        assert_eq!(row.diaslancamento, 45);
+        // A leitura tolerante a nulo entrega 0 quando a coluna é NULL —
+        // a UI de lançamentos simplesmente fica sem destaque.
+        assert_eq!(SystemRow::default().diaslancamento, 0);
     }
 }
 
@@ -800,6 +855,139 @@ pub mod client {
             })?;
             Ok(novo)
         }
+
+        // ── operador / gêneros / fila ─────────────────────────────────
+
+        /// Zera apenas o saldo atual (tecla `resetacreditos` do original —
+        /// não toca no parcial do período).
+        pub fn resetar_saldo(&mut self) -> Result<(), String> {
+            self.runtime.block_on(async {
+                self.client
+                    .execute("UPDATE sistema SET creditos = 0", &[])
+                    .await
+                    .map_err(|e| format!("zerando saldo: {e}"))?;
+                Ok(())
+            })
+        }
+
+        /// Alterna um estilo (gênero) entre habilitado/bloqueado e devolve o
+        /// novo estado. O catálogo público filtra por `estilo.habilita`.
+        pub fn toggle_estilo(&mut self, nome: &str) -> Result<bool, String> {
+            self.runtime.block_on(async {
+                let row = self
+                    .client
+                    .query_opt(
+                        "UPDATE estilo SET habilita = NOT habilita WHERE nome = $1 \
+                         RETURNING habilita",
+                        &[&nome],
+                    )
+                    .await
+                    .map_err(|e| format!("alternando estilo: {e}"))?;
+                row.and_then(|r| r.try_get::<_, bool>(0).ok())
+                    .ok_or_else(|| format!("estilo desconhecido: {nome}"))
+            })
+        }
+
+        /// Estilos com estado de bloqueio e contagem de faixas (menu do
+        /// operador e seletor de gêneros).
+        pub fn estilos(&mut self) -> Result<Vec<GenreInfo>, String> {
+            self.runtime.block_on(async {
+                let rows = self
+                    .client
+                    .query(
+                        "SELECT e.nome, e.habilita, COUNT(m.id) FROM estilo e \
+                         LEFT JOIN artista a ON a.estilo = e.id \
+                         LEFT JOIN disco d ON d.artista = a.id \
+                         LEFT JOIN midia m ON m.disco = d.id \
+                         GROUP BY e.nome, e.habilita ORDER BY e.nome",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| format!("lendo estilos: {e}"))?;
+                Ok(rows
+                    .iter()
+                    .map(|r| GenreInfo {
+                        name: r.try_get::<_, String>(0).unwrap_or_default(),
+                        // `blocked` do app = NOT habilita do banco.
+                        blocked: !r.try_get::<_, bool>(1).unwrap_or(true),
+                        track_count: r.try_get::<_, i64>(2).unwrap_or(0),
+                    })
+                    .collect())
+            })
+        }
+
+        /// Números do operador: créditos acumulados no período corrente
+        /// (`sistema.creditosparcial`) e total histórico
+        /// (`SUM(registro_creditos.creditos)`).
+        pub fn operador_numeros(&mut self) -> Result<(f64, f64), String> {
+            self.runtime.block_on(async {
+                let parcial = self
+                    .client
+                    .query_opt("SELECT creditosparcial FROM sistema LIMIT 1", &[])
+                    .await
+                    .map_err(|e| format!("lendo parcial: {e}"))?
+                    .and_then(|r| r.try_get::<_, Option<f64>>(0).ok().flatten())
+                    .unwrap_or(0.0);
+                let absoluto = self
+                    .client
+                    .query_one(
+                        "SELECT COALESCE(SUM(creditos), 0) FROM registro_creditos",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| format!("somando registro_creditos: {e}"))?
+                    .try_get::<_, f64>(0)
+                    .map_err(|e| e.to_string())?;
+                Ok((parcial, absoluto))
+            })
+        }
+
+        /// Grava a janela de lançamento (`sistema.diaslancamento`).
+        pub fn set_dias_lancamento(&mut self, dias: i64) -> Result<(), String> {
+            self.runtime.block_on(async {
+                self.client
+                    .execute("UPDATE sistema SET diaslancamento = $1", &[&dias])
+                    .await
+                    .map_err(|e| format!("gravando diaslancamento: {e}"))?;
+                Ok(())
+            })
+        }
+
+        /// Fila atual completa (sem remover) para o painel da UI — inclui
+        /// itens enfileirados pelo Java antes de um rollback, por exemplo.
+        pub fn queue_snapshot(&mut self) -> Result<Vec<TrackInfo>, String> {
+            self.runtime.block_on(async {
+                let rows = self
+                    .client
+                    .query(
+                        "SELECT f.id, m.id, m.nome, m.extensao_conteudo, \
+                         d.nome, a.nome, e.nome \
+                         FROM filamidia f \
+                         JOIN midia m ON m.id = f.midia \
+                         JOIN disco d ON d.id = m.disco \
+                         JOIN artista a ON a.id = m.artista \
+                         JOIN estilo e ON e.id = a.estilo \
+                         ORDER BY f.id",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| format!("lendo fila: {e}"))?;
+                Ok(rows
+                    .iter()
+                    .map(|row| {
+                        track_from_midia(
+                            row.try_get(1).unwrap_or_default(),
+                            row.try_get::<_, String>(2).unwrap_or_default().as_str(),
+                            row.try_get::<_, String>(5).unwrap_or_default().as_str(),
+                            row.try_get::<_, String>(4).unwrap_or_default().as_str(),
+                            row.try_get::<_, String>(6).unwrap_or_default().as_str(),
+                            row.try_get::<_, String>(3).unwrap_or_default().as_str(),
+                            &self.media_root,
+                        )
+                    })
+                    .collect())
+            })
+        }
     }
 
     /// Leitura tolerante a nulo de uma coluna double precision.
@@ -849,6 +1037,8 @@ pub mod client {
             premiocredbrinde: opt_i32(row, 18),
             contbrinde: opt_i32(row, 19),
             txtbrinde: opt_string(row, 20),
+            // 35 = diaslancamento (janela de lançamentos)
+            diaslancamento: opt_i64(row, 35),
             keys: LegacyKeys {
                 esquerda: opt_i32(row, 21),
                 direita: opt_i32(row, 22),
