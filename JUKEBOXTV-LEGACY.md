@@ -25,7 +25,7 @@ instalado e o estado persiste nas tabelas originais.
 | RAM | ~991 MB + 2 GB swap | orçamento apertado; a JVM usava heap de 512 MB–2 GB |
 | Player | VLC 1.1.x (via vlcj 2.1.0) | GStreamer local é 0.10 → backend de vídeo por **libVLC (FFI)** |
 | Banco | PostgreSQL 9.1 local (JDBC 901) | protocolo v3 → `tokio-postgres` compatível |
-| Moedeiro | USB via javax.usb (jsr80) + JNA | ponto aberto: marca/modelo do aceitador (ver Pendências) |
+| Moedeiro | USB HID (teclado comum); pulso = tecla Z | `arcade-key-pressed` nativo + `legacy_keys.rs` |
 | Saída de vídeo | X11, janela embutida do VLC | mesma técnica: janela X11 posicionada sob a UI |
 
 ## Diferenças em relação ao perfil modern (main)
@@ -63,15 +63,37 @@ A camada de acesso a essas tabelas (já modelada no pacote `jukebox-rs` da
 análise anterior) será portada para `src/db/legacy_pg.rs` atrás da mesma
 interface de comandos usada pelo `storage/service.rs` atual.
 
+## Entrada e pagamento (resolvido em campo)
+
+- **Interface de botões + moedeiro = teclado USB comum (HID)**. Os pulsos
+  de crédito chegam como a tecla configurada (tipicamente **Z**) e os
+  botões como as demais teclas. O hardlock embutido na placa servia apenas
+  à verificação de licença do Java — o Rust não lê nem precisa dele.
+  Nenhum driver customizado: o kernel entrega os eventos pelo X11 e o app
+  os recebe em `arcade-key-pressed`; `z` dispara `Action::AddCredit` em
+  qualquer tela.
+- As teclas são configuráveis por máquina nas colunas `sistema.codtecla*`
+  (códigos AWT `java.awt.event.KeyEvent`). A camada `src/legacy_keys.rs`
+  traduz o código AWT de cada máquina para a tecla canônica do app
+  (e/r/q/w/i/o/u/p/z/a/l) — a placa não precisa ser reprogramada.
+  Pendência menor: `codteclamaisvolume`/`codteclamenosvolume` aguardam o
+  overlay de volume aceitar códigos dedicados de +/− (hoje W/Q).
+- **Pix = PixLogic** (firmware ESP8266 v2.2). O cliente Rust deste repo
+  (`finance/pixlogic.rs`) já fala o protocolo: consulta
+  `/api/machine/{uuid}/credit` a cada 3 s, aplica o crédito antes de
+  confirmar em `/confirm` com `X-Device-Token`, e retoma confirmações
+  pendentes após reinício. A fase 1 reutiliza o módulo como está; a única
+  adaptação é gravar o crédito na tabela legacy (`registro_creditos` /
+  contador do `sistema`) em vez do SQLite.
+
 ## Pendências para fechar a fase 1
 
-1. **Moedeiro**: marca/modelo do aceitador de moedas e como o pulso chega
-   (USB-HID teclado, USB cru, serial). Define `evdev` vs `rusb` vs serial.
-2. **Pix**: confirmar se o backend do sistema Java atual é o PixLogic (o
-   cliente Rust deste repo já fala com ele) ou outro serviço.
-3. **Jar em produção**: o que roda hoje tem pix e atualização online e não é
-   o v28/2013 analisado; enviar para mapear o canal de atualização.
-4. **Build musl**: adicionar job de CI cruzado `i686-unknown-linux-musl` com
-   player libVLC stubado em teste (fakesink equivalente).
-5. **Validação de campo**: RAM/boot/latência de navegação na máquina real
+1. **Build musl**: adicionar job de CI cruzado `i686-unknown-linux-musl`
+   com player libVLC stubado em teste (fakesink equivalente).
+2. **Jar em produção**: o que roda hoje tem pix e atualização online e não
+   é o v28/2013 analisado; enviar para mapear o canal de atualização.
+3. **Leitura da linha `sistema`**: conectar `legacy_keys.rs` ao PostgreSQL
+   (colunas codtecla*, preços, propaganda, brinde) quando o módulo
+   `db/legacy_pg.rs` existir.
+4. **Validação de campo**: RAM/boot/latência de navegação na máquina real
    (P4, 1 GB) com o catálogo de 3.497 discos carregado do PostgreSQL.

@@ -28,6 +28,7 @@
 mod catalog_ui;
 mod db;
 mod finance;
+mod legacy_keys;
 mod media;
 mod operator;
 mod settings;
