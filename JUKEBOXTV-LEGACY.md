@@ -35,9 +35,25 @@ instalado e o estado persiste nas tabelas originais.
 | Build | musl estático i686, sem glibc | x86-64, Debian 13 |
 | Player | libVLC 1.1 via FFI; vídeo em janela X11 | GStreamer + appsink (vídeo composto no Slint) |
 | Banco | PostgreSQL 9.1 `jukeboxtvdb` (schema original) | SQLite `/dados/jukebox.db` |
-| Catálogo | lido do banco (disco/artista/midia + capa bytea) | scanner de arquivos + fingerprints |
+| Catálogo | **`db/legacy_pg.rs`** — lido do banco (disco/artista/midia + capa bytea) | scanner de arquivos + fingerprints |
 | Grade | 5×2 (10 capas/página, layout Jukebox TV) | 5×2 (unificado neste branch) |
-| Sync de acervo | compatível com o canal de atualização atual | R2/HTTPS incremental |
+| Sync de acervo | sincronização HTTPS do próprio app Rust | R2/HTTPS incremental |
+
+O adaptador `db/legacy_pg.rs` (feature `legacy-pg`) está pronto e testado:
+leitura do catálogo com estilos habilitados, capas `bytea` sob demanda,
+linha `sistema` completa (teclas, créditos, incentivos, brinde, volume,
+grade), entradas de crédito em transação `FOR UPDATE` com histórico em
+`registro_creditos`, débito + reserva de fila atômicos em `filamidia`,
+histórico de execuções em `registro_musicas` e zeroing de caixa. Os tipos
+originais são respeitados (créditos `double precision`, `filamidia.midia`
+`bigint`, ids por `max(id)+1` sem sequências) e o caminho dos arquivos é
+resolvido pela convenção da árvore
+`<raiz>/<estilo>/<artista>/<disco>/<nome>.<ext>`.
+
+**Pix e atualização online não existem no sistema Java em campo** — são
+recursos que o app Rust traz como ganho novo na fase 1 (PixLogic já
+implementado; sincronização de acervo do próprio repo). Não há canal
+legado a migrar.
 
 A grade 5×2 e a navegação por linha (`GRID_COLUMNS` em `state/models.rs`) já
 foram unificadas neste branch: W/Q saltam uma linha inteira (5 capas), E/R
@@ -88,12 +104,15 @@ interface de comandos usada pelo `storage/service.rs` atual.
 
 ## Pendências para fechar a fase 1
 
-1. **Build musl**: adicionar job de CI cruzado `i686-unknown-linux-musl`
-   com player libVLC stubado em teste (fakesink equivalente).
-2. **Jar em produção**: o que roda hoje tem pix e atualização online e não
-   é o v28/2013 analisado; enviar para mapear o canal de atualização.
-3. **Leitura da linha `sistema`**: conectar `legacy_keys.rs` ao PostgreSQL
-   (colunas codtecla*, preços, propaganda, brinde) quando o módulo
-   `db/legacy_pg.rs` existir.
+1. **Wiring no main.rs**: ligar o serviço `legacy_pg::client::LegacyDb` ao
+   fluxo do app (catálogo → carrossel, entrada_moeda → Action::AddCredit,
+   enqueue/dequeue → player, sistema → legacy_keys e preços) atrás da
+   feature `legacy-pg`.
+2. **Player libVLC**: backend alternativo ao GStreamer para o VLC 1.1 da
+   base (vídeo em janela X11 embutida, como o vlcj original).
+3. **Build musl**: job de CI cruzado `i686-unknown-linux-musl` (o runner
+   atual já valida a feature `legacy-pg` em x86-64).
 4. **Validação de campo**: RAM/boot/latência de navegação na máquina real
-   (P4, 1 GB) com o catálogo de 3.497 discos carregado do PostgreSQL.
+   (P4, 1 GB) com o catálogo de 3.497 discos carregado do PostgreSQL, e
+   conferência das premissas semânticas com o operador (incentivos por
+   cédula, preservação do contador do brinde no zeroing).

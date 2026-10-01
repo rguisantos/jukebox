@@ -5,6 +5,14 @@ edition = "2021"
 authors = ["Jukebox Embedded Project"]
 description = "High-performance embedded Jukebox software optimized for legacy x86 hardware"
 
+[features]
+default = []
+# Perfil legacy (fase 1 — Jukebox TV na base antiga, ver JUKEBOXTV-LEGACY.md):
+# catálogo, créditos, fila e relatórios no PostgreSQL 9.1 `jukeboxtvdb`
+# original, em vez do SQLite local. Pix e sincronização online são recursos
+# do próprio app Rust e continuam disponíveis nos dois perfis.
+legacy-pg = ["dep:tokio-postgres"]
+
 [dependencies]
 ring = "0.17"
 gstreamer-app = "0.22"
@@ -25,6 +33,13 @@ tokio = { version = "1.40", default-features = false, features = ["rt", "sync", 
 
 # Banco de Dados SQLite embutido
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# =============================================================================
+# MÓDULO LEGACY — PostgreSQL 9.1 `jukeboxtvdb` (feature `legacy-pg`)
+# Cliente do protocolo v3, que o PG 9.1 fala sem ressalvas. Opcional: o
+# perfil modern (SQLite) não carrega esta dependência no binário.
+# =============================================================================
+tokio-postgres = { version = "0.7", optional = true }
 
 # Leitor de tags ID3 (metadados de arquivos MP3)
 id3 = "1.14"

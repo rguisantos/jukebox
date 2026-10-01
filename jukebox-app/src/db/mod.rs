@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// Perfil legacy (fase 1 — Jukebox TV na base antiga): adaptador do
+// PostgreSQL 9.1 `jukeboxtvdb`. Ver JUKEBOXTV-LEGACY.md.
+#[cfg(feature = "legacy-pg")]
+pub mod legacy_pg;
+
 /// Gerenciador do banco de dados persistente SQLite
 pub struct Database {
     conn: Connection,

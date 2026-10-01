@@ -51,7 +51,9 @@ pub mod awt {
 
 /// Mapa de teclas de uma máquina, lido da linha `sistema` do `jukeboxtvdb`.
 /// Campos com `0` estão desativados (o original usava 0 para "sem tecla").
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Default` = tudo 0 (todas desativadas) — coerente com a leitura
+/// tolerante a nulo da linha `sistema`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LegacyKeys {
     pub esquerda: i32,
     pub direita: i32,

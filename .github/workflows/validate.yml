@@ -28,5 +28,9 @@ jobs:
         run: rustup toolchain install 1.90.0 --profile minimal
       - name: Compile Slint and run Rust and GStreamer tests
         run: cargo +1.90.0 test --locked --manifest-path jukebox-app/Cargo.toml
+      - name: Test the legacy PostgreSQL profile
+        # Compila o adaptador jukeboxtvdb (tokio-postgres) e roda os testes
+        # do perfil legacy — mesmas suítes, mais a feature ativada.
+        run: cargo +1.90.0 test --locked --manifest-path jukebox-app/Cargo.toml --features legacy-pg
       - name: Test catalog synchronization
         run: python3 -m unittest discover -s tests -v
