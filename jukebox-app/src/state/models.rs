@@ -96,6 +96,10 @@ pub struct GenreInfo {
 //
 // =============================================================================
 
+/// Colunas do carrossel de capas. O layout do Jukebox TV original é uma
+/// grade 5×2 (10 discos por página); W/Q saltam uma linha inteira.
+pub const GRID_COLUMNS: usize = 5;
+
 /// Passo do volume por pressionamento de W/Q dentro do overlay (em %)
 pub const VOLUME_STEP: u32 = 5;
 
@@ -579,13 +583,13 @@ impl AppState {
                 }
                 'w' => {
                     if !self.albums.is_empty() {
-                        self.album_index = (self.album_index + 4).min(self.albums.len() - 1);
+                        self.album_index = (self.album_index + GRID_COLUMNS).min(self.albums.len() - 1);
                     }
                     Some(Action::Noop)
                 }
                 'q' => {
                     if !self.albums.is_empty() {
-                        self.album_index = self.album_index.saturating_sub(4);
+                        self.album_index = self.album_index.saturating_sub(GRID_COLUMNS);
                     }
                     Some(Action::Noop)
                 }
@@ -1010,6 +1014,33 @@ mod tests {
         state.jump_to_letter("Z");
         assert_eq!(state.album_index, 4999);
         assert_eq!(state.focus, FocusState::BrowsingAlbums);
+    }
+
+    #[test]
+    fn carousel_row_jump_follows_grid_columns() {
+        // Grade do Jukebox TV: 5×2. W/Q saltam uma linha inteira
+        // (GRID_COLUMNS capas); E/R movem uma única capa. O teste prende a
+        // navegação por linha à constante da grade — mudar uma mudará a outra.
+        let mut state = AppState::new(50, 1);
+        state.albums = (0..30).map(|i| AlbumInfo {
+            key: format!("cd-{i}"), title: format!("CD {i}"),
+            artist: "Ana".into(), genre: "Rock".into(),
+            initial: "C".into(), palette: 0, is_recent: false, tracks: vec![],
+        }).collect();
+        state.handle_key("w");
+        assert_eq!(state.album_index, GRID_COLUMNS);
+        state.handle_key("q");
+        assert_eq!(state.album_index, 0);
+        // Salto para trás nunca passa do início da grade.
+        state.handle_key("w");
+        state.handle_key("w");
+        state.handle_key("q");
+        assert_eq!(state.album_index, GRID_COLUMNS);
+        // Movimento horizontal continua sendo uma capa por toque.
+        state.handle_key("r");
+        assert_eq!(state.album_index, GRID_COLUMNS + 1);
+        state.handle_key("e");
+        assert_eq!(state.album_index, GRID_COLUMNS);
     }
 
     #[test]

@@ -594,10 +594,11 @@ export component MainWindow inherits Window {
                 }
 
                 // =============================================================
-                // CARROSSEL RESPONSIVO 4×2
+                // CARROSSEL RESPONSIVO 5×2
                 //
                 // Sem barra de cabeçalho — o grid ocupa toda a área.
-                // As capas crescem até o máximo que caiba 4×2 na tela.
+                // As capas crescem até o máximo que caiba 5×2 na tela
+                // (mesma grade do Jukebox TV original: 10 discos por página).
                 // =============================================================
                 if root.ui-focus != 1 && !root.scanning && root.albums.length > 0 : Rectangle {
                     VerticalLayout {
@@ -614,10 +615,10 @@ export component MainWindow inherits Window {
                             property <length> pad-x: 16px;
                             property <length> pad-y: 16px;
 
-                            // Tamanho máximo que caiba 4 colunas
+                            // Tamanho máximo que caiba 5 colunas
                             property <length> cap-by-w:
                                 max(80px,
-                                    (self.width - 2 * self.pad-x - 3 * self.gap) / 4);
+                                    (self.width - 2 * self.pad-x - 4 * self.gap) / 5);
                             // Tamanho máximo que caiba 2 linhas
                             property <length> cap-by-h:
                                 max(80px,
@@ -634,36 +635,36 @@ export component MainWindow inherits Window {
 
                             // Largura total do grid (centralizado horizontal)
                             property <length> grid-w:
-                                4 * self.cap-size + 3 * self.gap;
+                                5 * self.cap-size + 4 * self.gap;
                             property <length> margin-x:
                                 max(0px, (self.width - self.grid-w) / 2);
                             property <length> margin-y:
                                 max(self.pad-y,
                                     (self.height - (2 * self.cap-size + self.gap)) / 2);
 
-                            // Paginação: 2 linhas visíveis (8 discos por página)
+                            // Paginação: 2 linhas visíveis (10 discos por página)
                             property <int> selected-row:
-                                floor(root.selected-album / 4);
+                                floor(root.selected-album / 5);
                             property <int> current-page:
                                 floor(self.selected-row / 2);
-                            // Apenas as oito capas da página atual são instanciadas.
+                            // Apenas as dez capas da página atual são instanciadas.
                             for row in 2 : Rectangle {
-                                visible: (carousel.current-page * 2 + row) * 4 < root.albums.length;
+                                visible: (carousel.current-page * 2 + row) * 5 < root.albums.length;
                                 x: carousel.margin-x;
                                 y: carousel.margin-y + row * carousel.pitch-v;
                                 width: carousel.grid-w;
                                 height: carousel.cap-size;
                                 background: transparent;
 
-                                for col in 4 : AlbumCard {
-                                    visible: (carousel.current-page * 2 + row) * 4 + col < root.albums.length;
+                                for col in 5 : AlbumCard {
+                                    visible: (carousel.current-page * 2 + row) * 5 + col < root.albums.length;
                                     x: col * carousel.pitch-h;
                                     y: 0;
                                     size: carousel.cap-size;
-                                    index: (carousel.current-page * 2 + row) * 4 + col;
-                                    album: root.albums[(carousel.current-page * 2 + row) * 4 + col];
+                                    index: (carousel.current-page * 2 + row) * 5 + col;
+                                    album: root.albums[(carousel.current-page * 2 + row) * 5 + col];
                                     is-selected:
-                                        (carousel.current-page * 2 + row) * 4 + col == root.selected-album;
+                                        (carousel.current-page * 2 + row) * 5 + col == root.selected-album;
                                     activated(i) => { root.album-activated(i); }
                                 }
                             }
