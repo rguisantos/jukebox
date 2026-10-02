@@ -13,15 +13,20 @@
 //!   libVLC (regra de ouro do 1.1 — deadlock); ele só empurra um sinal
 //!   no canal e o loop do player decide.
 //!
-//! Dinheiro e histórico seguem o caminho real do sistema original:
-//! `Enqueue` debita e grava `filamidia` (transação); o **início** de cada
-//! execução grava `registro_musicas` e conta o brinde (`contbrinde`); o
-//! prêmio do brinde é creditado quando o contador bate o mínimo
-//! (`premiocredbrinde`, premissa portada do jukebox-rs). Com a fila vazia
-//! e o modo aleatório liberado (`modoaleatorio`/`modofesta` + saldo ≥
-//! `mininicioaleatorio`), o player sorteia uma faixa marcada
-//! `midia.aleatorio` — **sem débito** e sem gravar na fila (música da
-//! casa: um rollback para o Java não repassaria o que tocou de graça).
+//! Dinheiro e histórico seguem o caminho decifrado do **bytecode v28**
+//! (jjbox.res + disassemblagem das classes):
+//!
+//! - `Enqueue` debita, grava `registro_musicas` **na seleção**, snapshota
+//!   o saldo em `registro_creditos` e enfileira em `filamidia` — tudo numa
+//!   transação; `modofesta` libera seleção sem saldo (free play);
+//! - o **brinde** é contado no CRÉDITO (não por música): cada moeda
+//!   decrementa `1/relacaocredito` de `contbrinde`; ao cruzar zero o
+//!   prêmio é creditado e a linha vai para a tabela `brinde` (ver
+//!   `entrada_moeda` do cliente);
+//! - com a fila vazia e `modoaleatorio`, o player espera
+//!   `mininicioaleatorio` **minutos** de silêncio e sorteia uma
+//!   `midia.aleatorio` — sem débito, sem fila, sem histórico (música da
+//!   casa; um rollback para o Java não repassaria o que tocou de graça).
 //!
 //! Sem libVLC no sistema (ou sem X), o spawn degrada para o modo de
 //! validação (`legacy_player::run`): débito e fila reais, sem mídia.
@@ -29,7 +34,7 @@
 use super::legacy_x11::VideoOverlay;
 use super::player::{PlayerCommand, PlayerEvent};
 use crate::db::legacy_pg::client::LegacyDb;
-use crate::db::legacy_pg::{aleatorio_pode_iniciar, brinde_pronto, PgConfig, SystemRow};
+use crate::db::legacy_pg::{atraso_aleatorio, PgConfig, SystemRow};
 use crate::state::models::TrackInfo;
 use libloading::Library;
 use std::ffi::{CStr, CString};
@@ -86,13 +91,12 @@ pub fn vlc_volume(linear: f64) -> u8 {
 // =============================================================================
 
 /// Operações de banco que o player precisa — `LegacyDb` as implementa;
-/// os testes usam um banco roteirizado.
+/// os testes usam um banco roteirizado. (`registro_musicas` e o brinde
+/// ficam no `enqueue`/`entrada_moeda` do cliente — como o original, que
+/// registra na seleção e conta o brinde no crédito.)
 trait QueueDb {
     fn enqueue(&mut self, midia_id: i64, custo: f64) -> Result<(), String>;
     fn dequeue(&mut self) -> Result<Option<TrackInfo>, String>;
-    fn log_played(&mut self, midia_id: i64) -> Result<(), String>;
-    fn bump_brinde(&mut self) -> Result<(), String>;
-    fn premiar_brinde(&mut self) -> Result<f64, String>;
     fn sistema(&mut self) -> Result<SystemRow, String>;
     fn sortear_aleatoria(&mut self, aleatoriovideo: bool) -> Result<Option<TrackInfo>, String>;
     fn queue_snapshot(&mut self) -> Result<Vec<TrackInfo>, String>;
@@ -104,15 +108,6 @@ impl QueueDb for LegacyDb {
     }
     fn dequeue(&mut self) -> Result<Option<TrackInfo>, String> {
         LegacyDb::dequeue(self)
-    }
-    fn log_played(&mut self, midia_id: i64) -> Result<(), String> {
-        LegacyDb::log_played(self, midia_id)
-    }
-    fn bump_brinde(&mut self) -> Result<(), String> {
-        LegacyDb::bump_brinde(self)
-    }
-    fn premiar_brinde(&mut self) -> Result<f64, String> {
-        LegacyDb::premiar_brinde(self)
     }
     fn sistema(&mut self) -> Result<SystemRow, String> {
         LegacyDb::sistema(self)
@@ -630,10 +625,13 @@ struct Session<D: QueueDb, E: Engine> {
     /// Fim de faixa agendado por erro de banco (reprocessa a fila).
     retry_at: Option<Instant>,
     retry_delay: Duration,
+    /// Sorteio do modo aleatório agendado (`mininicioaleatorio` minutos
+    /// após a fila esvaziar — thread `jjbox/d` do original).
+    random_draw_at: Option<Instant>,
+    /// Sobrescrita de teste para o atraso do aleatório.
+    random_delay_override: Option<Duration>,
     /// Sinais do VLC ignorados até este instante (pós `stop()` manual).
     suppress_signals_until: Option<Instant>,
-    /// Brinde já tentado neste patamar do contador (evita spam de erro).
-    brinde_tried: bool,
     tick: Duration,
 }
 
@@ -648,8 +646,9 @@ impl<D: QueueDb, E: Engine> Session<D, E> {
             volume: 70,
             retry_at: None,
             retry_delay: RETRY_ADVANCE,
+            random_draw_at: None,
+            random_delay_override: None,
             suppress_signals_until: None,
-            brinde_tried: false,
             tick: TICK,
         }
     }
@@ -664,6 +663,14 @@ impl<D: QueueDb, E: Engine> Session<D, E> {
                 if Instant::now() >= when {
                     self.retry_at = None;
                     self.advance();
+                }
+            }
+            // Modo aleatório: silêncio cronometrado (mininicioaleatorio
+            // minutos) e nova conferência do modo antes de sortear.
+            if let Some(when) = self.random_draw_at {
+                if Instant::now() >= when {
+                    self.random_draw_at = None;
+                    self.draw_random_if_idle();
                 }
             }
             // Sinais do VLC primeiro: o fim da faixa não espera o próximo
@@ -781,9 +788,10 @@ impl<D: QueueDb, E: Engine> Session<D, E> {
         }
     }
 
-    /// Toca a próxima faixa da fila; vazia, sorteia (modo aleatório) ou
-    /// entra no modo ocioso. Iterativo: uma árvore com arquivos ausentes
-    /// não explode a pilha nem trava o player.
+    /// Toca a próxima faixa da fila; vazia, agenda o sorteio do modo
+    /// aleatório (após `mininicioaleatorio` minutos de silêncio) ou entra
+    /// no modo ocioso. Iterativo: uma árvore com arquivos ausentes não
+    /// explode a pilha nem trava o player.
     fn advance(&mut self) {
         for _ in 0..MAX_ADVANCE_ATTEMPTS {
             match self.db.dequeue() {
@@ -797,44 +805,23 @@ impl<D: QueueDb, E: Engine> Session<D, E> {
                     // execução — o crédito foi pago no enqueue.
                     continue;
                 }
-                Ok(None) => match self.db.sistema() {
-                    Ok(sys)
-                        if aleatorio_pode_iniciar(
-                            sys.modoaleatorio,
-                            sys.modofesta,
-                            sys.creditos,
-                            sys.mininicioaleatorio,
-                        ) =>
-                    {
-                        match self.db.sortear_aleatoria(sys.aleatoriovideo) {
-                            Ok(Some(track)) => {
-                                if self.try_start(&track) {
-                                    self.retry_at = None;
-                                    return;
-                                }
-                                continue;
-                            }
-                            Ok(None) => {
-                                self.idle();
-                                return;
-                            }
-                            Err(e) => {
-                                self.report_error("Modo aleatório", e);
-                                self.idle();
-                                return;
-                            }
+                Ok(None) => {
+                    // Fila vazia: o modo aleatório agenda o sorteio após o
+                    // silêncio de `mininicioaleatorio` minutos (o Java
+                    // espera na thread jjbox/d e re-confere o modo); sem
+                    // modo aleatório, fica ocioso mesmo.
+                    match self.db.sistema() {
+                        Ok(sys) if sys.modoaleatorio => {
+                            let delay = self.random_delay_override.unwrap_or_else(|| {
+                                atraso_aleatorio(sys.mininicioaleatorio)
+                            });
+                            self.random_draw_at = Some(Instant::now() + delay);
                         }
+                        _ => {}
                     }
-                    Ok(_) => {
-                        self.idle();
-                        return;
-                    }
-                    Err(e) => {
-                        self.report_error("Sistema", e);
-                        self.idle();
-                        return;
-                    }
-                },
+                    self.idle();
+                    return;
+                }
                 Err(e) => {
                     // Banco fora do ar no meio da fila: mantém o estado e
                     // re-tenta no próximo tick (a faixa não se perde).
@@ -847,17 +834,47 @@ impl<D: QueueDb, E: Engine> Session<D, E> {
         self.idle();
     }
 
-    /// Inicia a faixa: histórico, brinde, eventos e reprodução.
+    /// Sorteio do modo aleatório: só com a máquina parada (uma seleção
+    /// paga que chegue durante o silêncio adia o sorteio, não o cancela).
+    fn draw_random_if_idle(&mut self) {
+        if self.current.is_some() {
+            // Alguém pagou durante a espera: confere de novo em 5 s.
+            self.random_draw_at = Some(Instant::now() + Duration::from_secs(5));
+            return;
+        }
+        // Re-confere o modo (o operador pode ter desligado na espera) —
+        // como a thread original faz após o sleep.
+        let Ok(sys) = self.db.sistema() else { return };
+        if !sys.modoaleatorio {
+            return;
+        }
+        match self.db.sortear_aleatoria(sys.aleatoriovideo) {
+            Ok(Some(track)) => {
+                // Música da casa: sem débito, sem fila, sem histórico
+                // (o modo 1 do original não passa pelo filamidia).
+                if self.try_start(&track) {
+                    self.emit_snapshot();
+                } else {
+                    // Arquivo quebrado: tenta de novo no próximo tick.
+                    self.random_draw_at = Some(Instant::now() + self.tick);
+                }
+            }
+            Ok(None) => {
+                // Pool vazio: confere de novo em 1 min (catálogo pode
+                // mudar com o importador rodando).
+                self.random_draw_at = Some(Instant::now() + Duration::from_secs(60));
+            }
+            Err(e) => {
+                self.report_error("Modo aleatório", e);
+                self.random_draw_at = Some(Instant::now() + Duration::from_secs(60));
+            }
+        }
+    }
+
+    /// Inicia a faixa: eventos e reprodução (histórico e brinde ficam no
+    /// `enqueue`/`entrada_moeda` do banco — como o original).
     fn try_start(&mut self, track: &TrackInfo) -> bool {
         let is_video = track.is_video();
-        // A execução conta no INÍCIO (o crédito já foi consumido) — como
-        // o original, que registrava ao disparar a reprodução.
-        if let Err(e) = self.db.log_played(track.id) {
-            log::warn!("registro_musicas falhou para {}: {e}", track.id);
-        }
-        if self.db.bump_brinde().is_ok() {
-            self.award_brinde_if_ready();
-        }
         let _ = self.event_tx.send(PlayerEvent::TrackStarted {
             id: track.id,
             title: track.title.clone(),
@@ -880,34 +897,6 @@ impl<D: QueueDb, E: Engine> Session<D, E> {
                 });
                 overlay_set_active(false);
                 false
-            }
-        }
-    }
-
-    /// Sorteia o prêmio do brinde quando o contador bate o mínimo.
-    fn award_brinde_if_ready(&mut self) {
-        let Ok(sys) = self.db.sistema() else { return };
-        if !brinde_pronto(sys.habilitabrinde, sys.contbrinde, sys.minmusicasbrinde) {
-            self.brinde_tried = false;
-            return;
-        }
-        if self.brinde_tried {
-            return; // já tentou neste patamar — evita spam de erro/toast
-        }
-        match self.db.premiar_brinde() {
-            Ok(_) => {
-                self.brinde_tried = false;
-                let message = if sys.txtbrinde.trim().is_empty() {
-                    format!("Brinde: +{} crédito(s)!", sys.premiocredbrinde)
-                } else {
-                    sys.txtbrinde.trim().to_string()
-                };
-                let _ = self.event_tx.send(PlayerEvent::Notice(message));
-                let _ = self.event_tx.send(PlayerEvent::CreditsChanged);
-            }
-            Err(e) => {
-                self.brinde_tried = true;
-                log::warn!("Falha ao premiar brinde: {e}");
             }
         }
     }
@@ -1009,9 +998,6 @@ mod tests {
         sortear: VecDeque<Result<Option<TrackInfo>, String>>,
         sistema: VecDeque<SystemRow>,
         enqueued: Vec<(i64, f64)>,
-        logged: Vec<i64>,
-        bumps: usize,
-        premios: usize,
     }
 
     impl QueueDb for Arc<Mutex<ScriptedDb>> {
@@ -1021,28 +1007,6 @@ mod tests {
         }
         fn dequeue(&mut self) -> Result<Option<TrackInfo>, String> {
             self.lock().unwrap().dequeue.pop_front().unwrap_or(Ok(None))
-        }
-        fn log_played(&mut self, midia_id: i64) -> Result<(), String> {
-            self.lock().unwrap().logged.push(midia_id);
-            Ok(())
-        }
-        fn bump_brinde(&mut self) -> Result<(), String> {
-            let mut db = self.lock().unwrap();
-            db.bumps += 1;
-            // espelha o UPDATE sistema SET contbrinde = contbrinde + 1
-            if let Some(sys) = db.sistema.front_mut() {
-                sys.contbrinde += 1;
-            }
-            Ok(())
-        }
-        fn premiar_brinde(&mut self) -> Result<f64, String> {
-            let mut db = self.lock().unwrap();
-            db.premios += 1;
-            // espelha o UPDATE sistema SET contbrinde = 0
-            if let Some(sys) = db.sistema.front_mut() {
-                sys.contbrinde = 0;
-            }
-            Ok(3.0)
         }
         fn sistema(&mut self) -> Result<SystemRow, String> {
             Ok(self.lock().unwrap().sistema.front().cloned().unwrap_or_default())
@@ -1115,6 +1079,8 @@ mod tests {
             let mut session = Session::new(db.clone(), engine.clone(), signal_rx, event_tx);
             session.tick = Duration::from_millis(10);
             session.retry_delay = Duration::from_millis(40);
+            // Teste não espera minutos: o atraso vem sobrescrito.
+            session.random_delay_override = Some(Duration::from_millis(40));
             let join = thread::spawn(move || session.run(&cmd_rx));
             Self { cmd_tx, event_rx, signal_tx, db, engine, join: Some(join) }
         }
@@ -1157,11 +1123,24 @@ mod tests {
             }
             panic!("evento esperado não chegou");
         }
+
+        /// Consome eventos por um tempo garantindo que nada mais chega.
+        fn assert_quiet(&self, millis: u64) {
+            std::thread::sleep(Duration::from_millis(millis));
+            while let Ok(event) = self.event_rx.try_recv() {
+                if matches!(
+                    event,
+                    PlayerEvent::CreditsChanged | PlayerEvent::QueueUpdated { .. }
+                ) {
+                    continue;
+                }
+                panic!("evento inesperado durante o silêncio");
+            }
+        }
     }
 
     impl Drop for Harness {
         fn drop(&mut self) {
-            // Encerra a thread: sem remetente, o laço termina.
             let (tx, _rx) = std::sync::mpsc::channel();
             let _ = std::mem::replace(&mut self.cmd_tx, tx);
             if let Some(join) = self.join.take() {
@@ -1219,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn first_enqueue_debits_logs_and_plays() {
+    fn first_enqueue_debits_and_plays() {
         let h = Harness::new();
         h.db.lock().unwrap().dequeue =
             VecDeque::from(vec![Ok(Some(track(55230, "Faixa", "mp3")))]);
@@ -1228,11 +1207,9 @@ mod tests {
             PlayerEvent::TrackStarted { is_video, .. } => assert!(!is_video),
             _ => unreachable!("expect filtra pelo id"),
         }
-        let db = h.db.lock().unwrap();
-        assert_eq!(db.enqueued, vec![(55230, 1.0)]);
-        assert_eq!(db.logged, vec![55230]);
-        assert_eq!(db.bumps, 1);
-        drop(db);
+        // O débito (e o registro_musicas, no cliente real) acontecem no
+        // enqueue — a sessão só pede.
+        assert_eq!(h.db.lock().unwrap().enqueued, vec![(55230, 1.0)]);
         let engine = h.engine.lock().unwrap();
         assert_eq!(engine.plays.len(), 1);
         assert!(engine.plays[0].0.ends_with("Faixa.mp3"));
@@ -1286,6 +1263,7 @@ mod tests {
             _ => unreachable!("expect filtra Visual"),
         }
         h.expect(|event| matches!(event, PlayerEvent::QueueFinished));
+        h.assert_quiet(80);
     }
 
     #[test]
@@ -1305,12 +1283,10 @@ mod tests {
     }
 
     #[test]
-    fn random_mode_draws_when_queue_empty() {
+    fn random_mode_draws_after_the_silence_window() {
         let system = SystemRow {
             modoaleatorio: true,
-            modofesta: false,
-            creditos: 5.0,
-            mininicioaleatorio: 2.0,
+            mininicioaleatorio: 15.0, // minutos — ignorado: override de teste
             aleatoriovideo: true,
             ..SystemRow::default()
         };
@@ -1323,21 +1299,20 @@ mod tests {
         h.expect(started(1));
         h.end_reached();
         h.expect(previous_of("Paga"));
+        // Ocio imediato (painel limpa)...
+        h.expect(|event| matches!(event, PlayerEvent::QueueFinished));
+        // ...e o sorteio chega depois da janela de silêncio.
         h.expect(started(2));
         let db = h.db.lock().unwrap();
         // A sorteada não foi debitada (só a seleção paga passa pelo enqueue).
         assert_eq!(db.enqueued, vec![(1, 1.0)]);
-        // E mesmo assim entra no histórico (execução de máquina).
-        assert!(db.logged.contains(&2));
     }
 
     #[test]
-    fn random_mode_blocked_below_the_minimum_balance() {
+    fn random_mode_stays_idle_when_off() {
         let system = SystemRow {
-            modoaleatorio: true,
-            modofesta: false,
-            creditos: 1.0,
-            mininicioaleatorio: 2.0,
+            modoaleatorio: false,
+            mininicioaleatorio: 0.0,
             ..SystemRow::default()
         };
         let h = Harness::with_system(system);
@@ -1351,52 +1326,55 @@ mod tests {
             _ => unreachable!("expect filtra Visual"),
         }
         h.expect(|event| matches!(event, PlayerEvent::QueueFinished));
+        h.assert_quiet(120);
         assert_eq!(
             h.db.lock().unwrap().sortear.len(),
             1,
-            "o sorteio nem rodou: saldo abaixo do mínimo"
+            "o sorteio nem rodou: modo desligado"
         );
     }
 
     #[test]
-    fn party_mode_draws_even_without_balance() {
+    fn party_mode_does_not_trigger_the_random_draw() {
+        // modofesta = free play na SELEÇÃO (c() do original); não tem
+        // relação com o modo aleatório.
         let system = SystemRow {
             modoaleatorio: false,
             modofesta: true,
-            creditos: 0.0,
-            mininicioaleatorio: 99.0,
+            mininicioaleatorio: 0.0,
             ..SystemRow::default()
         };
         let h = Harness::with_system(system);
         h.db.lock().unwrap().dequeue = VecDeque::from(vec![Ok(None)]);
         h.db.lock().unwrap().sortear =
-            VecDeque::from(vec![Ok(Some(track(3, "Festa", "mp3")))]);
+            VecDeque::from(vec![Ok(Some(track(3, "Isca", "mp3")))]);
         h.enqueue(1);
-        h.expect(started(3));
+        h.expect(|event| matches!(event, PlayerEvent::QueueFinished));
+        h.assert_quiet(120);
+        assert_eq!(h.db.lock().unwrap().sortear.len(), 1, "festa não sorteia");
     }
 
     #[test]
-    fn brinde_prize_awarded_at_the_threshold() {
+    fn random_draw_rechecks_the_mode_after_the_window() {
+        // O operador desligou o modo durante o silêncio: nada toca.
         let system = SystemRow {
-            habilitabrinde: true,
-            minmusicasbrinde: 2,
-            premiocredbrinde: 3,
-            contbrinde: 1, // o bump desta execução leva a 2
-            txtbrinde: "PARABENS! Brinde liberado".into(),
+            modoaleatorio: true,
+            mininicioaleatorio: 0.0,
             ..SystemRow::default()
         };
         let h = Harness::with_system(system);
-        h.db.lock().unwrap().dequeue = VecDeque::from(vec![Ok(Some(track(1, "Faixa", "mp3")))]);
+        h.db.lock().unwrap().dequeue = VecDeque::from(vec![Ok(None)]);
+        h.db.lock().unwrap().sortear =
+            VecDeque::from(vec![Ok(Some(track(4, "Isca", "mp3")))]);
+        // ...mas a releitura devolve o modo DESLIGADO.
+        h.db.lock().unwrap().sistema = VecDeque::from(vec![SystemRow {
+            modoaleatorio: false,
+            ..SystemRow::default()
+        }]);
         h.enqueue(1);
-        // O brinde é premiado no início da execução (antes do TrackStarted).
-        match h.expect(|event| matches!(event, PlayerEvent::Notice(_))) {
-            PlayerEvent::Notice(message) => {
-                assert_eq!(message, "PARABENS! Brinde liberado")
-            }
-            _ => unreachable!("expect filtra Notice"),
-        }
-        h.expect(started(1));
-        assert_eq!(h.db.lock().unwrap().premios, 1);
+        h.expect(|event| matches!(event, PlayerEvent::QueueFinished));
+        h.assert_quiet(120);
+        assert_eq!(h.db.lock().unwrap().sortear.len(), 1, "re-conferiu e desistiu");
     }
 
     #[test]
@@ -1420,10 +1398,10 @@ mod tests {
         h.db.lock().unwrap().dequeue =
             VecDeque::from(vec![Ok(Some(track(1, "Descartada", "mp3")))]);
         h.cmd_tx.send(PlayerCommand::SkipTrack).unwrap();
-        // Nada toca: a cabeça foi descartada sem registrar execução.
-        std::thread::sleep(Duration::from_millis(60));
+        // Nada toca: a cabeça foi descartada (o histórico já contou na
+        // seleção — pular não "devolve" o registro, como no original).
+        h.assert_quiet(80);
         assert!(h.engine.lock().unwrap().plays.is_empty());
-        assert!(h.db.lock().unwrap().logged.is_empty());
     }
 
     #[test]
@@ -1456,8 +1434,8 @@ mod tests {
         let engine = h.engine.lock().unwrap();
         assert!(engine.plays.is_empty());
         drop(engine);
-        // As quebradas foram pagas: contam no histórico (como o original).
-        assert_eq!(h.db.lock().unwrap().logged, vec![1, 2]);
+        // As duas saíram da fila (pagas): o advance as consumiu.
+        assert!(h.db.lock().unwrap().dequeue.is_empty());
     }
 
     #[test]
@@ -1485,15 +1463,6 @@ mod tests {
             }
             fn dequeue(&mut self) -> Result<Option<TrackInfo>, String> {
                 Ok(None)
-            }
-            fn log_played(&mut self, _: i64) -> Result<(), String> {
-                Ok(())
-            }
-            fn bump_brinde(&mut self) -> Result<(), String> {
-                Ok(())
-            }
-            fn premiar_brinde(&mut self) -> Result<f64, String> {
-                Ok(0.0)
             }
             fn sistema(&mut self) -> Result<SystemRow, String> {
                 Ok(SystemRow::default())

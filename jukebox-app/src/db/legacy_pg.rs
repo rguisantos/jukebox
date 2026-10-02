@@ -186,20 +186,37 @@ pub fn brinde_pronto(habilitabrinde: bool, contbrinde: i32, minmusicasbrinde: i3
     habilitabrinde && minmusicasbrinde > 0 && contbrinde >= minmusicasbrinde
 }
 
-/// O modo aleatório (música da casa, sem débito) pode iniciar/manter?
-/// Modo festa sempre; senão, exige `modoaleatorio` e saldo ≥
-/// `mininicioaleatorio` (o piso evita máquina tocando de graça sem
-/// nenhuma moeda no período — premissa portada do jukebox-rs).
-pub fn aleatorio_pode_iniciar(
-    modoaleatorio: bool,
-    modofesta: bool,
-    saldo: f64,
-    mininicioaleatorio: f64,
-) -> bool {
-    if modofesta {
-        return true;
+/// Atraso do modo aleatório após a fila esvaziar: `mininicioaleatorio`
+/// **minutos** de silêncio (o Java multiplica por 60×1000 ms na thread
+/// `jjbox/controller/d` — decodificado do bytecode v28). Só vale com
+/// `modoaleatorio`; `modofesta` é outra coisa: seleção gratuita.
+pub fn atraso_aleatorio(mininicioaleatorio: f64) -> std::time::Duration {
+    let minutos = if mininicioaleatorio.is_finite() {
+        mininicioaleatorio.max(0.0)
+    } else {
+        0.0
+    };
+    std::time::Duration::from_secs((minutos * 60.0).round() as u64)
+}
+
+/// Contador do brinde após uma moeda: o Java mantém `contbrinde` em
+/// `int` e decrementa `1/relacaocredito` por pulso **com truncatura**
+/// (keyPressed do MainController). Com relação 1, cada moeda desconta 1.
+pub fn contbrinde_apos_moeda(contbrinde: i32, relacaocredito: f64) -> i32 {
+    let relacao = if relacaocredito > 0.0 { relacaocredito } else { 1.0 };
+    ((contbrinde as f64) - 1.0 / relacao) as i32
+}
+
+/// Rearma o contador do brinde após premiar: sorteio ∈ 0..10
+/// (`percentual.brinde.sorteio = 10` no jjbox.res); `sorteio > 0` dá um
+/// contador de `minmusicas × (1 + sorteio/100)` (jitter de até +9%);
+/// `sorteio == 0` zera — reprodução fiel do comportamento original em
+/// que ~10% dos prêmios rearmam na hora (brinde em cascata).
+pub fn proximo_contbrinde(minmusicasbrinde: i32, sorteio: i32) -> i32 {
+    if sorteio <= 0 {
+        return 0;
     }
-    modoaleatorio && saldo >= mininicioaleatorio
+    (minmusicasbrinde as f64 * (1.0 + sorteio as f64 / 100.0)) as i32
 }
 
 /// Saldo exibido na UI: créditos integrais (o saldo real continua
@@ -352,13 +369,37 @@ mod tests {
 
     #[test]
     fn random_mode_gates_follow_the_reference_port() {
-        // Modo festa sempre toca (mesmo sem saldo).
-        assert!(aleatorio_pode_iniciar(false, true, 0.0, 99.0));
-        // Modo aleatório exige saldo no mínimo configurado.
-        assert!(aleatorio_pode_iniciar(true, false, 2.0, 2.0));
-        assert!(!aleatorio_pode_iniciar(true, false, 1.9, 2.0));
-        // Desligado é desligado.
-        assert!(!aleatorio_pode_iniciar(false, false, 100.0, 0.0));
+        // O atraso é em MINUTOS de silêncio (bytecode v28: ×60×1000 ms).
+        assert_eq!(atraso_aleatorio(0.5), std::time::Duration::from_secs(30));
+        assert_eq!(atraso_aleatorio(2.0), std::time::Duration::from_secs(120));
+        assert_eq!(atraso_aleatorio(-5.0), std::time::Duration::from_secs(0));
+        assert_eq!(atraso_aleatorio(f64::NAN), std::time::Duration::from_secs(0));
+    }
+
+    #[test]
+    fn brinde_counter_decrements_like_the_original() {
+        // Relação 1: cada moeda desconta 1 (truncando).
+        assert_eq!(contbrinde_apos_moeda(10, 1.0), 9);
+        assert_eq!(contbrinde_apos_moeda(1, 1.0), 0);
+        assert_eq!(contbrinde_apos_moeda(0, 1.0), -1, "cruzou zero: prêmio!");
+        // Relação 2: meia unidade por moeda, com truncatura para zero.
+        assert_eq!(contbrinde_apos_moeda(5, 2.0), 4);
+        assert_eq!(contbrinde_apos_moeda(0, 2.0), 0, "(int)(-0.5) = 0 no Java");
+        assert_eq!(contbrinde_apos_moeda(-1, 2.0), -1);
+        // Relação inválida não divide por zero.
+        assert_eq!(contbrinde_apos_moeda(3, 0.0), 2);
+    }
+
+    #[test]
+    fn brinde_rearm_follows_the_percentual_jitter() {
+        // sorteio 1..9: minmusicas × (1 + r/100), truncado.
+        assert_eq!(proximo_contbrinde(10, 1), 10);
+        assert_eq!(proximo_contbrinde(10, 9), 10);
+        assert_eq!(proximo_contbrinde(50, 9), 54);
+        assert_eq!(proximo_contbrinde(33, 5), 34);
+        // sorteio 0 (10% dos casos): rearma em zero (cascata).
+        assert_eq!(proximo_contbrinde(10, 0), 0);
+        assert_eq!(proximo_contbrinde(10, -3), 0, "valor inválido também zera");
     }
 
     #[test]
@@ -616,7 +657,34 @@ pub mod client {
 
         /// Entrada de dinheiro: atualiza saldo/parcial e grava a linha em
         /// `registro_creditos` — tudo numa transação com `FOR UPDATE`.
+        ///
+        /// A linha do ledger guarda o **saldo após o evento** (snapshot),
+        /// como o Java (o boot dele lê `registro_creditos ORDER BY id DESC
+        /// LIMIT 1` — um delta enganaria o rollback); o id vem da
+        /// sequência original `seq_id_creditos` (o Java usa `NEXTVAL`).
         pub fn entrada(&mut self, valor: f64) -> Result<f64, String> {
+            self.entrada_interna(valor, false).map(|(saldo, _)| saldo)
+        }
+
+        /// Entrada com a contagem do brinde (só moeda física conta, como
+        /// o original — cédula/pix são recursos novos do app Rust).
+        ///
+        /// Decodificado do `keyPressed` do MainController v28: cada pulso
+        /// decrementa `1/relacaocredito` de `contbrinde` (truncando em
+        /// `int`); ao cruzar zero, **premia**: credita `premiocredbrinde`,
+        /// grava a linha em `brinde` (sorteado, agora, ativo) e rearma o
+        /// contador com o jitter de `percentual.brinde.sorteio` (10).
+        pub fn entrada_moeda(&mut self) -> Result<(f64, Option<String>), String> {
+            let relacao = self.sistema()?.relacaocredito;
+            self.entrada_interna(creditos_por_moeda(relacao), true)
+        }
+
+        /// Núcleo transacional das entradas (veja `entrada`/`entrada_moeda`).
+        fn entrada_interna(
+            &mut self,
+            valor: f64,
+            contar_brinde: bool,
+        ) -> Result<(f64, Option<String>), String> {
             if valor <= 0.0 {
                 return Err("valor de entrada deve ser positivo".into());
             }
@@ -628,47 +696,102 @@ pub mod client {
                     .map_err(|e| format!("abrindo transação de créditos: {e}"))?;
                 let row = tx
                     .query_one(
-                        "SELECT creditos, creditosparcial FROM sistema FOR UPDATE",
+                        "SELECT creditos, creditosparcial, contbrinde, habilitabrinde, \
+                         minmusicasbrinde, premiocredbrinde, txtbrinde, relacaocredito \
+                         FROM sistema FOR UPDATE",
                         &[],
                     )
                     .await
                     .map_err(|e| format!("travando sistema: {e}"))?;
                 let saldo = opt_f64(&row, 0);
                 let parcial = opt_f64(&row, 1);
-                let (novo, nova_parcial) = (saldo + valor, parcial + valor);
+                let mut novo = saldo + valor;
+                let nova_parcial = parcial + valor;
+
+                let mut brinde_msg = None;
+                let mut contbrinde = row.try_get::<_, Option<i32>>(2).ok().flatten().unwrap_or(0);
+                let habilitabrinde =
+                    row.try_get::<_, Option<bool>>(3).ok().flatten().unwrap_or(false);
+                if contar_brinde && habilitabrinde {
+                    let relacao = {
+                        let r = opt_f64(&row, 7);
+                        if r > 0.0 { r } else { 1.0 }
+                    };
+                    contbrinde = ((contbrinde as f64) - 1.0 / relacao) as i32;
+                    if contbrinde < 0 {
+                        let minmusicas =
+                            row.try_get::<_, Option<i32>>(4).ok().flatten().unwrap_or(0);
+                        let premio =
+                            row.try_get::<_, Option<i32>>(5).ok().flatten().unwrap_or(0);
+                        let txt = row
+                            .try_get::<_, Option<String>>(6)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        novo += premio as f64;
+                        // Linha do brinde sorteado (tabela do schema
+                        // original — 7 colunas, chaveada por seq_id_brinde).
+                        let id: i32 = match tx
+                            .query_opt("SELECT nextval('seq_id_brinde')", &[])
+                            .await
+                        {
+                            Ok(Some(r)) => r.get(0),
+                            // Base sem a sequência: max+1 (a inspeção não
+                            // listou sequências; o Java exige que exista).
+                            _ => tx
+                                .query_one(
+                                    "SELECT COALESCE(MAX(id), 0) + 1 FROM brinde",
+                                    &[],
+                                )
+                                .await
+                                .map_err(|e| format!("calculando id de brinde: {e}"))?
+                                .get(0),
+                        };
+                        tx.execute(
+                            "INSERT INTO brinde \
+                             (id, minmusicas, premiocred, txt, sorteado, dtsorteio, ativo) \
+                             VALUES ($1, $2, $3, $4, true, now(), true)",
+                            &[&id, &minmusicas, &premio, &txt],
+                        )
+                        .await
+                        .map_err(|e| format!("gravando brinde: {e}"))?;
+                        contbrinde = proximo_contbrinde(minmusicas, sorteio_brinde());
+                        brinde_msg = Some(if txt.trim().is_empty() {
+                            format!("Brinde: +{premio} crédito(s)!")
+                        } else {
+                            txt.trim().to_string()
+                        });
+                    }
+                } else if contar_brinde {
+                    // Sem brinde habilitado o Java zera o contador.
+                    contbrinde = 0;
+                }
+
                 tx.execute(
-                    "UPDATE sistema SET creditos = $1, creditosparcial = $2",
-                    &[&novo, &nova_parcial],
+                    "UPDATE sistema SET creditos = $1, creditosparcial = $2, contbrinde = $3",
+                    &[&novo, &nova_parcial, &contbrinde],
                 )
                 .await
                 .map_err(|e| format!("atualizando saldo: {e}"))?;
                 let id: i32 = tx
-                    .query_one(
-                        "SELECT COALESCE(MAX(id), 0) + 1 FROM registro_creditos",
-                        &[],
-                    )
+                    .query_one("SELECT nextval('seq_id_creditos')", &[])
                     .await
-                    .map_err(|e| format!("calculando id de registro_creditos: {e}"))?
+                    .map_err(|e| format!("chamando seq_id_creditos: {e}"))?
                     .get(0);
-                // datahorareset vem da própria linha sistema (período vigente).
+                // datahorareset vem da própria linha sistema (período vigente)
+                // e `creditos` guarda o SALDO APÓS o evento (snapshot).
                 tx.execute(
                     "INSERT INTO registro_creditos (creditos, datahora, datahorareset, id) \
                      SELECT $1, now(), resetcreditos, $2 FROM sistema",
-                    &[&valor, &id],
+                    &[&novo, &id],
                 )
                 .await
                 .map_err(|e| format!("gravando registro_creditos: {e}"))?;
                 tx.commit()
                     .await
                     .map_err(|e| format!("confirmando transação de créditos: {e}"))?;
-                Ok(novo)
+                Ok((novo, brinde_msg))
             })
-        }
-
-        /// Moeda/pulso do moedeiro (tecla Z): credita `relacaocredito`.
-        pub fn entrada_moeda(&mut self) -> Result<f64, String> {
-            let row = self.sistema()?;
-            self.entrada(creditos_por_moeda(row.relacaocredito))
         }
 
         /// Cédula de R$ 2/5/10/20/50 (com incentivo, se habilitado).
@@ -741,10 +864,16 @@ pub mod client {
 
         // ── fila e execuções ────────────────────────────────────────────
 
-        /// Reserva uma mídia: debita o custo e enfileira em `filamidia`
-        /// **na mesma transação** — a mesma garantia "reserva + débito"
-        /// do app modern. `custo = 0` enfileira sem debitar (Festa/Pix já
-        /// liquidado — o crédito concedido entra como `entrada`).
+        /// Seleção paga: debita, grava `registro_musicas` (na seleção,
+        /// como o `c()` do MainController v28), enfileira em `filamidia`
+        /// e snapshota o saldo no ledger — tudo numa transação.
+        ///
+        /// - **`modofesta`** permite selecionar sem saldo (o débito choca
+        ///   em zero — free play do original);
+        /// - o id da fila vem da sequência `seq_id_filamidia` (o Java usa
+        ///   `NEXTVAL`; `max+1` colidiria num rollback convivo);
+        /// - o snapshot pós-débito em `registro_creditos` reproduz o
+        ///   ledger do original (o boot do Java lê a última linha).
         pub fn enqueue(&mut self, midia_id: i64, custo: f64) -> Result<(), String> {
             self.runtime.block_on(async {
                 let tx = self
@@ -752,26 +881,55 @@ pub mod client {
                     .transaction()
                     .await
                     .map_err(|e| format!("abrindo transação da fila: {e}"))?;
-                if custo > 0.0 {
-                    let row = tx
-                        .query_one("SELECT creditos FROM sistema FOR UPDATE", &[])
-                        .await
-                        .map_err(|e| format!("travando sistema: {e}"))?;
-                    let saldo = opt_f64(&row, 0);
-                    if saldo < custo {
-                        tx.rollback().await.ok();
-                        return Err(format!(
-                            "saldo insuficiente: atual {saldo:.2}, custo {custo:.2}"
-                        ));
-                    }
-                    tx.execute("UPDATE sistema SET creditos = $1", &[&(saldo - custo)])
-                        .await
-                        .map_err(|e| format!("debitando: {e}"))?;
-                }
-                let id: i32 = tx
-                    .query_one("SELECT COALESCE(MAX(id), 0) + 1 FROM filamidia", &[])
+                let row = tx
+                    .query_one(
+                        "SELECT creditos, modofesta FROM sistema FOR UPDATE",
+                        &[],
+                    )
                     .await
-                    .map_err(|e| format!("calculando id de filamidia: {e}"))?
+                    .map_err(|e| format!("travando sistema: {e}"))?;
+                let saldo = opt_f64(&row, 0);
+                let modofesta = row
+                    .try_get::<_, Option<bool>>(1)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if custo > 0.0 && !modofesta && saldo < custo {
+                    tx.rollback().await.ok();
+                    return Err(format!(
+                        "saldo insuficiente: atual {saldo:.2}, custo {custo:.2}"
+                    ));
+                }
+                let novo = if modofesta { (saldo - custo).max(0.0) } else { saldo - custo };
+                tx.execute("UPDATE sistema SET creditos = $1", &[&novo])
+                    .await
+                    .map_err(|e| format!("debitando: {e}"))?;
+                // Histórico na seleção (o Java grava ANTES de enfileirar).
+                tx.execute(
+                    "INSERT INTO registro_musicas (midia, datahora, exportado) \
+                     VALUES ($1, now(), false)",
+                    &[&midia_id],
+                )
+                .await
+                .map_err(|e| format!("gravando registro_musicas: {e}"))?;
+                // Snapshot do saldo no ledger (o c() do original insere a
+                // linha após o débito, antes de enfileirar).
+                let id_credito: i32 = tx
+                    .query_one("SELECT nextval('seq_id_creditos')", &[])
+                    .await
+                    .map_err(|e| format!("chamando seq_id_creditos: {e}"))?
+                    .get(0);
+                tx.execute(
+                    "INSERT INTO registro_creditos (creditos, datahora, datahorareset, id) \
+                     SELECT $1, now(), resetcreditos, $2 FROM sistema",
+                    &[&novo, &id_credito],
+                )
+                .await
+                .map_err(|e| format!("gravando registro_creditos: {e}"))?;
+                let id: i32 = tx
+                    .query_one("SELECT nextval('seq_id_filamidia')", &[])
+                    .await
+                    .map_err(|e| format!("chamando seq_id_filamidia: {e}"))?
                     .get(0);
                 // filamidia.midia é bigint; midia_id já é i64.
                 tx.execute(
@@ -837,52 +995,30 @@ pub mod client {
             })
         }
 
-        /// Registra a execução no histórico de relatórios (tabela sem id —
-        /// a chave natural é `(midia, datahora)`).
-        pub fn log_played(&mut self, midia_id: i64) -> Result<(), String> {
-            self.runtime.block_on(async {
-                self.client
-                    .execute(
-                        "INSERT INTO registro_musicas (midia, datahora, exportado) \
-                         VALUES ($1, now(), false)",
-                        &[&midia_id],
-                    )
-                    .await
-                    .map_err(|e| format!("gravando registro_musicas: {e}"))?;
-                Ok(())
-            })
-        }
-
-        /// Sorteia uma mídia elegível ao modo aleatório: `midia.aleatorio`
-        /// com estilo habilitado. Com `aleatoriovideo = false` restringe ao
-        /// tipo "Música" (clipe/vídeo resolvidos por `comparetodescricao`,
-        /// sem ids fixos). **Não grava na fila** — a faixa toca como música
-        /// da casa, sem débito (o Java em rollback não repassaria o que
-        /// tocou de graça).
+        /// Sorteia uma mídia elegível ao modo aleatório — o SQL é o do
+        /// original (`database.dao.query.busca.midia.aleatoria` do
+        /// jjbox.res v28, decifrado): `midia.aleatorio` **e**
+        /// `estilo.aleatorio` **e** `estilo.habilita`. Com
+        /// `aleatoriovideo = true` restringe a `tipo_midia = 2` (o
+        /// original considera 2 = clipe/vídeo — hardcoded no CASE);
+        /// `false` aceita qualquer tipo. **Não grava na fila** nem no
+        /// histórico: música da casa, sem débito (a thread `jjbox/d`
+        /// chama o enqueue interno modo 1, sem `filamidia`).
         pub fn sortear_aleatoria(&mut self, aleatoriovideo: bool) -> Result<Option<TrackInfo>, String> {
             self.runtime.block_on(async {
-                let filtro_tipo = if aleatoriovideo {
-                    String::new()
-                } else {
-                    " AND m.tipo_midia NOT IN (
-                          SELECT id FROM tipo_midia
-                           WHERE comparetodescricao ILIKE '%clipe%'
-                              OR comparetodescricao ILIKE '%video%') "
-                        .to_string()
-                };
-                let sql = format!(
-                    "SELECT m.id, m.nome, m.extensao_conteudo, \
-                     d.nome, a.nome, e.nome \
-                     FROM midia m \
-                     JOIN disco d ON d.id = m.disco \
-                     JOIN artista a ON a.id = m.artista \
-                     JOIN estilo e ON e.id = a.estilo \
-                     WHERE m.aleatorio AND e.habilita{filtro_tipo} \
-                     ORDER BY random() LIMIT 1"
-                );
+                let sql = "\
+                    SELECT m.id, m.nome, m.extensao_conteudo, \
+                    d.nome, a.nome, e.nome \
+                    FROM midia m \
+                    JOIN disco d ON d.id = m.disco \
+                    JOIN artista a ON a.id = m.artista \
+                    JOIN estilo e ON a.estilo = e.id \
+                    WHERE m.aleatorio AND e.aleatorio AND e.habilita \
+                    AND 2 = (CASE WHEN $1 THEN m.tipo_midia ELSE 2 END) \
+                    ORDER BY random() LIMIT 1";
                 let row = match self
                     .client
-                    .query_opt(&sql, &[])
+                    .query_opt(sql, &[&aleatoriovideo])
                     .await
                     .map_err(|e| format!("sorteando mídia: {e}"))?
                 {
@@ -901,38 +1037,6 @@ pub mod client {
                     &self.media_root,
                 )))
             })
-        }
-
-        /// Conta uma execução para o sorteio do brinde.
-        pub fn bump_brinde(&mut self) -> Result<(), String> {
-            self.runtime.block_on(async {
-                self.client
-                    .execute(
-                        "UPDATE sistema SET contbrinde = COALESCE(contbrinde, 0) + 1",
-                        &[],
-                    )
-                    .await
-                    .map_err(|e| format!("contando brinde: {e}"))?;
-                Ok(())
-            })
-        }
-
-        /// Sorteia o prêmio do brinde: credita `premiocredbrinde` e zera o
-        /// contador. Erro se o brinde não estiver configurado.
-        pub fn premiar_brinde(&mut self) -> Result<f64, String> {
-            let row = self.sistema()?;
-            if !row.habilitabrinde || row.premiocredbrinde <= 0 {
-                return Err("brinde sem prêmio configurado".into());
-            }
-            let novo = self.entrada(row.premiocredbrinde as f64)?;
-            self.runtime.block_on(async {
-                self.client
-                    .execute("UPDATE sistema SET contbrinde = 0", &[])
-                    .await
-                    .map_err(|e| format!("zerando contador do brinde: {e}"))?;
-                Ok::<(), String>(())
-            })?;
-            Ok(novo)
         }
 
         // ── operador / gêneros / fila ─────────────────────────────────
@@ -1072,6 +1176,18 @@ pub mod client {
     /// Leitura tolerante a nulo de uma coluna double precision.
     fn opt_f64(row: &Row, idx: usize) -> f64 {
         row.try_get::<_, Option<f64>>(idx).ok().flatten().unwrap_or(0.0)
+    }
+
+    /// Sorteio do brinde: `percentual.brinde.sorteio` do jjbox.res
+    /// original (**10**) — uniforme em 0..10. Semeado pelo relógio como o
+    /// Java (`new Random(new Date().getTime())`).
+    fn sorteio_brinde() -> i32 {
+        const PERCENTUAL_BRINDE: u64 = 10;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+            .unwrap_or(0);
+        (nanos % PERCENTUAL_BRINDE) as i32
     }
 
     /// Leitura tolerante a nulo de uma coluna inteira.

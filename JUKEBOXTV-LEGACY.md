@@ -136,14 +136,12 @@ Com o perfil legacy ativo:
   (`media/legacy_x11.rs`), a técnica do vlcj original: o VLC renderiza
   direto (Xv/X11), zero cópia de pixels pela CPU no Pentium 4. O event
   loop sincroniza a geometria do overlay a cada tick (`overlay_sync`);
-  tela cheia = janela toda. Cada execução grava `registro_musicas` e
-  conta o brinde no **início** (`contbrinde`; ao bater
-  `minmusicasbrinde`, credita `premiocredbrinde` — premissa portada do
-  jukebox-rs). Fila vazia + modo aleatório liberado (`modoaleatorio` ou
-  `modofesta`, saldo ≥ `mininicioaleatorio`) sorteia uma `midia.aleatorio`
-  **sem débito** e sem gravar na fila (música da casa). Sem libVLC no
-  sistema, degrada para o modo de validação (`legacy_player::run`):
-  débito e fila reais, sem mídia.
+  tela cheia = janela toda. **Semânticas de dinheiro/histórico pelo
+  bytecode v28** (ver seção "Semânticas decifradas"): `registro_musicas`
+  na seleção, snapshot de saldo no ledger, brinde contado na moeda,
+  aleatório após minutos de silêncio. Sem libVLC no sistema, degrada
+  para o modo de validação (`legacy_player::run`): débito e fila reais,
+  sem mídia.
 - **Teclado**: o mapa `runtime_keymap()` aplica as `codtecla*` da máquina
   a cada tecla, preservando o sufixo `_long`. Na colisão de textos vence a
   navegação (nunca há crédito fantasma). A propriedade `pass-through-enter`
@@ -201,17 +199,27 @@ O alvo é Ubuntu 11.04 i686, **glibc 2.13** — e o binário precisa
 A escolha se decide na bancada com o binário real; o código do player
 já é agnóstico (dlopen por soname).
 
-## Premissas semânticas do player (conferir com o operador)
+## Semânticas decifradas do bytecode original (v28)
 
-- `registro_musicas` é gravado no **início** da execução (o crédito já
-  foi consumido no enqueue — arquivo quebrado conta como tocada, como
-  no original).
-- Brinde: ao bater `minmusicasbrinde` execuções, `premiocredbrinde`
-  créditos são creditados automaticamente e o contador zera
-  (`premiar_brinde`), com `txtbrinde` no toast.
-- Modo aleatório: `modofesta` sempre; `modoaleatorio` exige saldo ≥
-  `mininicioaleatorio`; a faixa sorteada (`midia.aleatorio`, estilos
-  habilitados; sem clipes quando `aleatoriovideo = false`) **não** vai
-  para `filamidia` — toca direto, sem débito.
-- Skip: a faixa atual conta como tocada (histórico no início) e o
-  player avança; fila parada descarta a cabeça sem registrar.
+O upload `jukeboxtv.tar` trouxe o sistema original + análise de bytecode.
+As strings SQL vivem cifradas em `jjbox.res`/`jjbox2.res` (AES-128-ECB,
+chave em `jjbox.key` — o loader `obfs/k/d` descreve o esquema) e a
+lógica de negócio nas classes `obfs.*`/`jjbox.*`, ofuscadas pelo
+ProGuard. Decifrado e disassemblado (jawa), o comportamento REAL:
+
+| Recurso | Comportamento confirmado |
+|---|---|
+| Seleção | `c()` do MainController: exige saldo > 0 **ou** `modofesta`; debita 1 (o getter `a()` faz `saldo-1` com `DecimalFormat`); grava `registro_musicas` **na seleção**; snapshota o saldo em `registro_creditos`; enfileira em `filamidia` (modo 3) |
+| `modofesta` | **Free play**: seleção sem saldo (o débito choca em zero). NÃO tem relação com o modo aleatório |
+| Moeda | `keyPressed` (tecla de crédito): +1 crédito e +1/relação no parcial via `altera.creditos` (que também grava `contbrinde`); ledger snapshot em `registro_creditos` |
+| Brinde | Contado **no crédito**: cada pulso decrementa `1/relacaocredito` de `contbrinde` (int, truncando); ao cruzar zero **premia**: credita `premiocredbrinde`, insere linha em `brinde` (id, minmusicas, premiocred, txt, sorteado=true, now(), ativo=true) e rearma com `minmusicas × (1 + nextInt(10)/100)` — sorteio 0 (10% dos casos) rearma em zero (cascata). `percentual.brinde.sorteio = 10` no jjbox.res |
+| Modo aleatório | Thread `jjbox/d`: espera a fila esvaziar (wait/notify), e com `modoaleatorio` dorme `mininicioaleatorio × 60 × 1000 ms` (**minutos de silêncio**), re-confere o modo e sorteia `midia.aleatorio AND estilo.aleatorio AND estilo.habilita` — toca **sem debitar, sem `filamidia`, sem histórico** (enqueue interno modo 1) |
+| `aleatoriovideo` | `true` → o sorteio só traz `tipo_midia = 2` (clipe/vídeo, hardcoded no CASE do SQL); `false` → qualquer tipo |
+| Ledger | `registro_creditos.creditos` guarda o **saldo após o evento** (snapshot); o boot do Java lê `ORDER BY id DESC LIMIT 1` |
+| Sequências | `seq_id_filamidia`, `seq_id_creditos`, `seq_id_brinde` — o Java chama `SELECT NEXTVAL(?)`; ids `max+1` colidiriam num rollback convivo |
+| Divergências corrigidas | `registro_musicas` na seleção (não no play); brinde no crédito (não por música); `mininicioaleatorio` é tempo, não saldo; `modofesta` é free play, não gatilho do aleatório; sorteio respeita `estilo.aleatorio`; `tipo_midia=2` quando `aleatoriovideo` (o inverso do que o port de referência supôs) |
+
+Premissas remanescentes (não visíveis no bytecode estático): economia de
+pulsos quando `relacaocredito ≠ 1` (a máquina em campo usa 1) e o
+significado exato de `creditosbrindenoreset` (créditos de brinde que
+sobrevivem ao zeroing — tratado como 0 no port).

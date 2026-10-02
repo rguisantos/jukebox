@@ -132,14 +132,20 @@ pub fn spawn(mut db: LegacyDb) -> (DbHandle, Receiver<DbEvent>) {
                     DbCommand::CashPulse => {
                         // O PostgreSQL local É a persistência — não existe
                         // a condição de armazenamento temporário do /dados.
+                        // (A moeda também conta o brinde — `entrada_moeda`
+                        // decifrou o keyPressed do v28: decrementa
+                        // contbrinde e premia ao cruzar zero.)
                         let before = db.balance().unwrap_or(0.0);
                         match db.entrada_moeda() {
-                            Ok(balance) => {
+                            Ok((balance, brinde)) => {
                                 let added = saldo_display((balance - before).max(0.0));
                                 let _ = events.send(DbEvent::CreditAccepted {
                                     balance: saldo_display(balance),
                                     added,
                                 });
+                                if let Some(message) = brinde {
+                                    toast(&events, message, 4);
+                                }
                             }
                             Err(e) => toast(&events, format!("Falha ao registrar moeda: {e}"), 2),
                         }
