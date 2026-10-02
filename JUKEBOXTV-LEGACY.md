@@ -128,12 +128,22 @@ Com o perfil legacy ativo:
   pipeline existente de capas no *miss* do cache — decodificação sob
   demanda (256 px), **sem** cache em disco (o JBC em RGB custaria ~700 MiB
   no disco IDE da base).
-- **Player (modo validação)**: `media/legacy_player.rs` assume o canal
-  `PlayerCommand`/`PlayerEvent` sem GStreamer. O caminho do dinheiro é
-  real: `Enqueue` debita 1 crédito e grava `filamidia` na mesma transação,
-  `SkipTrack` descarta o início da fila, e o painel de fila mostra o
-  próprio banco (inclusive itens deixados pelo Java — um rollback toca a
-  fila intacta). Áudio/vídeo chegam com o player libVLC (pendência 2).
+- **Player (libVLC — fase 2)**: `media/legacy_vlc.rs` assume o canal
+  `PlayerCommand`/`PlayerEvent` e reproduz com o **VLC 1.1 da própria
+  máquina**, carregado por soname (`libvlc.so.5`, ABI estável até o 3.x)
+  via `libloading` — o binário não linka VLC/X11 em tempo de build.
+  Vídeo embutido numa **janela X11 filha** da janela Slint
+  (`media/legacy_x11.rs`), a técnica do vlcj original: o VLC renderiza
+  direto (Xv/X11), zero cópia de pixels pela CPU no Pentium 4. O event
+  loop sincroniza a geometria do overlay a cada tick (`overlay_sync`);
+  tela cheia = janela toda. Cada execução grava `registro_musicas` e
+  conta o brinde no **início** (`contbrinde`; ao bater
+  `minmusicasbrinde`, credita `premiocredbrinde` — premissa portada do
+  jukebox-rs). Fila vazia + modo aleatório liberado (`modoaleatorio` ou
+  `modofesta`, saldo ≥ `mininicioaleatorio`) sorteia uma `midia.aleatorio`
+  **sem débito** e sem gravar na fila (música da casa). Sem libVLC no
+  sistema, degrada para o modo de validação (`legacy_player::run`):
+  débito e fila reais, sem mídia.
 - **Teclado**: o mapa `runtime_keymap()` aplica as `codtecla*` da máquina
   a cada tecla, preservando o sufixo `_long`. Na colisão de textos vence a
   navegação (nunca há crédito fantasma). A propriedade `pass-through-enter`
@@ -148,18 +158,60 @@ Com o perfil legacy ativo:
 
 1. ~~Wiring no main.rs~~ (implementado; validação de compilação completa a
    cargo do CI — o sandbox não tem GStreamer/Slint dev).
-2. **Player libVLC**: backend alternativo ao GStreamer para o VLC 1.1 da
-   base (vídeo em janela X11 embutida, como o vlcj original), incluindo
-   `registro_musicas` por execução, contador do brinde e modo aleatório
-   (`mininicioaleatorio`). O player de validação já cobre débito/fila.
-3. **Build musl**: job de CI cruzado `i686-unknown-linux-musl` (o runner
-   atual já valida a feature `legacy-pg` em x86-64).
+2. ~~Player libVLC~~ (implementado: `legacy_vlc.rs` + `legacy_x11.rs`,
+   28 testes no harness do sandbox; verificação em campo pendente).
+3. **Build para a base antiga**: job de CI cruzado (o runner atual valida
+   a feature `legacy-pg` em x86-64). Decisão de estratégia pendente de
+   bancada — ver "Build para a base antiga" abaixo.
 4. **Validação de campo**: RAM/boot/latência de navegação na máquina real
-   (P4, 1 GB) com o catálogo de 3.497 discos carregado do PostgreSQL, e
+   (P4, 1 GB) com o catálogo de 3.497 discos carregado do PostgreSQL,
    conferência das premissas semânticas com o operador (incentivos por
-   cédula, preservação do contador do brinde no zeroing). O modo
-   validação atual já permite bancada: moeda → saldo → seleção → débito →
-   `filamidia` conferíveis no banco (e o Java em rollback tocaria a fila).
+   cédula, brinde creditado ao bater o contador, registro de execução no
+   início) e do overlay X11 (posição/tela cheia/ocultação em clipe).
 5. **Pendências menores**: `codteclamaisvolume`/`codteclamenosvolume` no
    overlay de volume; idempotência PixLogic persistida (hoje vale por
-   sessão — o schema original não tem tabela para a pendência).
+   sessão — o schema original não tem tabela para a pendência);
+   autoredução de volume (`autoreducaovolume`/`horas`/`teto`) e
+   propaganda/clipes de fundo (`clipesobremusica`), que ficam de fora
+   até a validação de campo das premissas centrais.
+
+## Build para a base antiga (decisão de bancada)
+
+O alvo é Ubuntu 11.04 i686, **glibc 2.13** — e o binário precisa
+`dlopen`ar o VLC 1.1 e o X11 **do sistema** (glibc). As estratégias:
+
+1. **musl estático** (`i686-unknown-linux-musl`): binário indepentente de
+   libc, mas `dlopen` de DSOs ligados à glibc a partir de um binário
+   musl estático é cenário sabidamente quebrado (duas libcs num
+   processo). **Só funciona se** o plano B abaixo for inviável e o
+   fallback "processo VLC filho" (item 3) for aceito.
+2. **glibc dinâmico com piso 2.13** (preferível): cross-build com
+   `zig cc -target i686-linux-gnu.2.13` (cargo-zigbuild) ou um sysroot
+   do Natty (`old-releases.ubuntu.com`) + clang/lld. O binário fala a
+   glibc da máquina e `dlopen` funciona nativamente — igual ao Java
+   original. Ponto em aberto: o piso oficial do rustc é glibc 2.17; se
+   o link reclamar de símbolos mais novos (`__cxa_thread_atexit_impl`),
+   um shim fraco resolve (perder dtors de thread-local é aceitável
+   num jukebox de threads longas).
+3. **Fallback sem FFI**: subir o `vlc` da máquina como **processo filho**
+   (`vlc --drawable-xid <XID> --play-and-exit <arquivo>`) — isola as
+   libcs por processo, ao custo de ~200 ms por faixa e sem volume em
+   tempo real.
+
+A escolha se decide na bancada com o binário real; o código do player
+já é agnóstico (dlopen por soname).
+
+## Premissas semânticas do player (conferir com o operador)
+
+- `registro_musicas` é gravado no **início** da execução (o crédito já
+  foi consumido no enqueue — arquivo quebrado conta como tocada, como
+  no original).
+- Brinde: ao bater `minmusicasbrinde` execuções, `premiocredbrinde`
+  créditos são creditados automaticamente e o contador zera
+  (`premiar_brinde`), com `txtbrinde` no toast.
+- Modo aleatório: `modofesta` sempre; `modoaleatorio` exige saldo ≥
+  `mininicioaleatorio`; a faixa sorteada (`midia.aleatorio`, estilos
+  habilitados; sem clipes quando `aleatoriovideo = false`) **não** vai
+  para `filamidia` — toca direto, sem débito.
+- Skip: a faixa atual conta como tocada (histórico no início) e o
+  player avança; fila parada descarta a cabeça sem registrar.

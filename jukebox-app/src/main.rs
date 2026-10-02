@@ -339,12 +339,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // =========================================================================
     // 6. Player (Módulo 3) + bridge de eventos → UI
-    //    — perfil modern: GStreamer; perfil legacy: player de validação
-    //      (débito + fila no jukeboxtvdb; mídia chega com o libVLC).
+    //    — perfil modern: GStreamer; perfil legacy: libVLC via FFI
+    //      (dlopen por soname, vídeo numa janela X11 filha — como o vlcj
+    //      original). Sem a biblioteca no sistema, o legacy degrada para
+    //      o modo de validação (débito/fila no banco, sem mídia).
     // =========================================================================
     #[cfg(feature = "legacy-pg")]
     if legacy {
-        media::legacy_player::spawn(player_cmd_rx, player_event_tx, PgConfig::from_env());
+        // XID da janela Slint para o vídeo embutido do VLC (técnica do
+        // Java original: o VLC desenha numa janela filha da janela do app).
+        let parent_xid = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            main_window
+                .window()
+                .window_handle()
+                .ok()
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Xlib(x) => Some(x.window as u64),
+                    RawWindowHandle::Xcb(x) => Some(x.window.get() as u64),
+                    _ => None,
+                })
+        };
+        if parent_xid.is_none() {
+            log::warn!(
+                "Perfil legacy: sem handle X11 da janela — o vídeo tocará sem janela embutida"
+            );
+        }
+        media::legacy_vlc::spawn(player_cmd_rx, player_event_tx, PgConfig::from_env(), parent_xid);
     } else {
         player::spawn(player_cmd_rx, player_event_tx);
     }
@@ -842,11 +863,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = main_window.as_weak();
         let state = state_arc.clone();
         let db = db_tx.clone();
+        // Perfil legacy: o overlay X11 do VLC acompanha a área de vídeo
+        // (ou a janela toda, em tela cheia) a cada tick.
+        #[cfg(feature = "legacy-pg")]
+        let legacy_overlay = legacy;
         media_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(50),
             move || {
                 let Some(ui) = weak.upgrade() else { return };
+                #[cfg(feature = "legacy-pg")]
+                if legacy_overlay {
+                    let (x, y, w, h) = legacy_overlay_geometry(&ui);
+                    media::legacy_vlc::overlay_sync(x, y, w, h);
+                }
                 if let Some(frame) = player::take_frame() {
                     ui.set_video_frame(rgb_buffer_to_image(frame.rgb, frame.width, frame.height));
                 }
@@ -1300,6 +1330,24 @@ fn schedule_alphabet_auto_confirm(ui: &MainWindow, state_arc: &Arc<Mutex<AppStat
 fn volume_to_linear(volume: u32) -> f64 {
     let fraction = (volume.min(100) as f64) / 100.0;
     fraction * fraction * fraction
+}
+
+/// Geometria do overlay X11 do libVLC (pixels físicos, coordenadas da
+/// janela do app): a área de vídeo do painel esquerdo ou a janela
+/// inteira quando o vídeo está em tela cheia (perfil legacy).
+#[cfg(feature = "legacy-pg")]
+fn legacy_overlay_geometry(ui: &MainWindow) -> (i32, i32, u32, u32) {
+    let scale = ui.window().scale_factor();
+    if ui.get_video_fullscreen() {
+        let size = ui.window().size(); // PhysicalSize
+        (0, 0, size.width.max(1), size.height.max(1))
+    } else {
+        let x = (ui.get_video_area_x() * scale).round() as i32;
+        let y = (ui.get_video_area_y() * scale).round() as i32;
+        let w = ((ui.get_video_area_w() * scale).round() as u32).max(1);
+        let h = ((ui.get_video_area_h() * scale).round() as u32).max(1);
+        (x, y, w, h)
+    }
 }
 
 /// A failed financial query must never be displayed as a genuine zero.

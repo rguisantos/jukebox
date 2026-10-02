@@ -85,7 +85,7 @@ pub const SISTEMA_COLUMNS: &str = "creditos, creditosparcial, relacaocredito, \
     txtbrinde, codteclaesquerda, codtecladireita, codteclacima, codteclabaixo, \
     codtecladisco, codteclamusica, codteclacredito, codteclavolume, codteclacancela, \
     codteclasair, codteclaresetacreditos, codteclamaisvolume, codteclamenosvolume, \
-    codteclafecharprograma, diaslancamento";
+    codteclafecharprograma, diaslancamento, aleatoriovideo";
 
 /// Linha `sistema` com leitura tolerante a nulo (a inspeção física mostrou
 /// **todas** as colunas nullable — o Java gravava o que existia).
@@ -99,6 +99,8 @@ pub struct SystemRow {
     // ── modos ──
     pub modoaleatorio: bool,
     pub modofesta: bool,
+    /// O modo aleatório pode sortear clipes (`aleatoriovideo`).
+    pub aleatoriovideo: bool,
     // ── volume ──
     pub volume: i64,
     pub maxvolume: i32,
@@ -182,6 +184,22 @@ pub fn creditos_por_cedula(reais: i32, relacaocredito: f64, bonus: i32) -> f64 {
 /// O brinde está pronto para o sorteio?
 pub fn brinde_pronto(habilitabrinde: bool, contbrinde: i32, minmusicasbrinde: i32) -> bool {
     habilitabrinde && minmusicasbrinde > 0 && contbrinde >= minmusicasbrinde
+}
+
+/// O modo aleatório (música da casa, sem débito) pode iniciar/manter?
+/// Modo festa sempre; senão, exige `modoaleatorio` e saldo ≥
+/// `mininicioaleatorio` (o piso evita máquina tocando de graça sem
+/// nenhuma moeda no período — premissa portada do jukebox-rs).
+pub fn aleatorio_pode_iniciar(
+    modoaleatorio: bool,
+    modofesta: bool,
+    saldo: f64,
+    mininicioaleatorio: f64,
+) -> bool {
+    if modofesta {
+        return true;
+    }
+    modoaleatorio && saldo >= mininicioaleatorio
 }
 
 /// Saldo exibido na UI: créditos integrais (o saldo real continua
@@ -330,6 +348,17 @@ mod tests {
         assert!(brinde_pronto(true, 10, 10));
         assert!(!brinde_pronto(false, 99, 10), "brinde desabilitado nunca sorteia");
         assert!(!brinde_pronto(true, 99, 0), "mínimo 0 desativa");
+    }
+
+    #[test]
+    fn random_mode_gates_follow_the_reference_port() {
+        // Modo festa sempre toca (mesmo sem saldo).
+        assert!(aleatorio_pode_iniciar(false, true, 0.0, 99.0));
+        // Modo aleatório exige saldo no mínimo configurado.
+        assert!(aleatorio_pode_iniciar(true, false, 2.0, 2.0));
+        assert!(!aleatorio_pode_iniciar(true, false, 1.9, 2.0));
+        // Desligado é desligado.
+        assert!(!aleatorio_pode_iniciar(false, false, 100.0, 0.0));
     }
 
     #[test]
@@ -824,6 +853,56 @@ pub mod client {
             })
         }
 
+        /// Sorteia uma mídia elegível ao modo aleatório: `midia.aleatorio`
+        /// com estilo habilitado. Com `aleatoriovideo = false` restringe ao
+        /// tipo "Música" (clipe/vídeo resolvidos por `comparetodescricao`,
+        /// sem ids fixos). **Não grava na fila** — a faixa toca como música
+        /// da casa, sem débito (o Java em rollback não repassaria o que
+        /// tocou de graça).
+        pub fn sortear_aleatoria(&mut self, aleatoriovideo: bool) -> Result<Option<TrackInfo>, String> {
+            self.runtime.block_on(async {
+                let filtro_tipo = if aleatoriovideo {
+                    String::new()
+                } else {
+                    " AND m.tipo_midia NOT IN (
+                          SELECT id FROM tipo_midia
+                           WHERE comparetodescricao ILIKE '%clipe%'
+                              OR comparetodescricao ILIKE '%video%') "
+                        .to_string()
+                };
+                let sql = format!(
+                    "SELECT m.id, m.nome, m.extensao_conteudo, \
+                     d.nome, a.nome, e.nome \
+                     FROM midia m \
+                     JOIN disco d ON d.id = m.disco \
+                     JOIN artista a ON a.id = m.artista \
+                     JOIN estilo e ON e.id = a.estilo \
+                     WHERE m.aleatorio AND e.habilita{filtro_tipo} \
+                     ORDER BY random() LIMIT 1"
+                );
+                let row = match self
+                    .client
+                    .query_opt(&sql, &[])
+                    .await
+                    .map_err(|e| format!("sorteando mídia: {e}"))?
+                {
+                    Some(row) => row,
+                    None => return Ok(None),
+                };
+                Ok(Some(track_from_midia(
+                    row.try_get::<_, i32>(0).map_err(|e| e.to_string())?,
+                    row.try_get::<_, String>(1).map_err(|e| e.to_string())?.as_str(),
+                    // colunas: id(0), nome(1), extensao(2), disco(3),
+                    // artista(4), estilo(5)
+                    row.try_get::<_, String>(4).map_err(|e| e.to_string())?.as_str(),
+                    row.try_get::<_, String>(3).map_err(|e| e.to_string())?.as_str(),
+                    row.try_get::<_, String>(5).map_err(|e| e.to_string())?.as_str(),
+                    row.try_get::<_, String>(2).map_err(|e| e.to_string())?.as_str(),
+                    &self.media_root,
+                )))
+            })
+        }
+
         /// Conta uma execução para o sorteio do brinde.
         pub fn bump_brinde(&mut self) -> Result<(), String> {
             self.runtime.block_on(async {
@@ -1039,6 +1118,8 @@ pub mod client {
             txtbrinde: opt_string(row, 20),
             // 35 = diaslancamento (janela de lançamentos)
             diaslancamento: opt_i64(row, 35),
+            // 36 = aleatoriovideo (o sorteio pode incluir clipes)
+            aleatoriovideo: opt_bool(row, 36),
             keys: LegacyKeys {
                 esquerda: opt_i32(row, 21),
                 direita: opt_i32(row, 22),

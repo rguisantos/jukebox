@@ -454,6 +454,13 @@ export component MainWindow inherits Window {
     in property <image> video-frame;
     in property <bool> video-available: false;
     in property <bool> video-fullscreen: false;
+    // Geometria da área de vídeo (pixels lógicos, origem na janela) —
+    // o event loop lê e posiciona a janela X11 do libVLC (perfil
+    // legacy) a cada tick; em tela cheia o overlay cobre a janela toda.
+    out property <length> video-area-x: 0;
+    out property <length> video-area-y: 0;
+    out property <length> video-area-w: 0;
+    out property <length> video-area-h: 0;
     in property <bool> free-play: false;
     in property <string> active-genre: "Todos os gêneros";
     in property <bool> disk-low: false;
@@ -597,8 +604,19 @@ export component MainWindow inherits Window {
 
                 // Área de vídeo (fundo)
                 Rectangle {
+                    id: videoArea;
                     background: #000;
                     Image { source: root.video-frame; image-fit: contain; width:parent.width; height:parent.height; }
+
+                    // Geometria da área de vídeo para o overlay X11 do
+                    // libVLC (perfil legacy): o Rust posiciona a janela
+                    // filha do VLC sobre esta área a cada tick.
+                    changed absolute-position => {
+                        root.video-area-x = self.absolute-position.x;
+                        root.video-area-y = self.absolute-position.y;
+                    }
+                    changed width => { root.video-area-w = self.width; }
+                    changed height => { root.video-area-h = self.height; }
                 }
 
                 // =============================================================

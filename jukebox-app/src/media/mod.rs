@@ -1,9 +1,14 @@
 pub mod catalog_lock;
 pub mod covers;
-// Perfil legacy (fase 1): player de validação sem mídia — o débito e a
-// fila `filamidia` são reais; a reprodução chega com o libVLC (fase 2).
+// Perfil legacy (fase 1): player libVLC (mídia real na base antiga, com o
+// modo de validação `legacy_player` como fallback sem a biblioteca) e a
+// janela X11 do vídeo embutido.
 #[cfg(feature = "legacy-pg")]
 pub mod legacy_player;
+#[cfg(feature = "legacy-pg")]
+pub mod legacy_vlc;
+#[cfg(feature = "legacy-pg")]
+pub mod legacy_x11;
 pub mod player;
 pub mod scanner;
 pub mod storage_management;

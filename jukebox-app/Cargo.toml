@@ -9,9 +9,11 @@ description = "High-performance embedded Jukebox software optimized for legacy x
 default = []
 # Perfil legacy (fase 1 — Jukebox TV na base antiga, ver JUKEBOXTV-LEGACY.md):
 # catálogo, créditos, fila e relatórios no PostgreSQL 9.1 `jukeboxtvdb`
-# original, em vez do SQLite local. Pix e sincronização online são recursos
-# do próprio app Rust e continuam disponíveis nos dois perfis.
-legacy-pg = ["dep:tokio-postgres"]
+# original, em vez do SQLite local, e player libVLC carregado por soname
+# (dlopen) — o binário não linka VLC/X11 em tempo de build. Pix e
+# sincronização online são recursos do próprio app Rust e continuam
+# disponíveis nos dois perfis.
+legacy-pg = ["dep:tokio-postgres", "dep:libloading"]
 
 [dependencies]
 ring = "0.17"
@@ -40,6 +42,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # perfil modern (SQLite) não carrega esta dependência no binário.
 # =============================================================================
 tokio-postgres = { version = "0.7", optional = true }
+
+# libVLC 1.1 e libX11 carregadas por soname no perfil legacy (o VLC da
+# base antiga não tem -dev; o mesmo binário roda nas duas fases).
+libloading = { version = "0.8", optional = true }
 
 # Leitor de tags ID3 (metadados de arquivos MP3)
 id3 = "1.14"

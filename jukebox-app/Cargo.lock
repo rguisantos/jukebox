@@ -2430,6 +2430,7 @@ dependencies = [
  "id3",
  "image 0.25.10",
  "libc",
+ "libloading",
  "log",
  "qrcode",
  "raw-window-handle",
